@@ -22,7 +22,8 @@ use api::{
 
 use commands::{
     handle_agents_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
+    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
+    validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -5183,6 +5184,23 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
+    }
+
+    #[test]
+    fn direct_slash_commands_surface_shared_validation_errors() {
+        let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
+            .expect_err("invalid /compact shape should be rejected");
+        assert!(compact_error.contains("Unexpected arguments for /compact."));
+        assert!(compact_error.contains("Usage            /compact"));
+
+        let plugins_error = parse_args(&[
+            "/plugins".to_string(),
+            "list".to_string(),
+            "extra".to_string(),
+        ])
+        .expect_err("invalid /plugins list shape should be rejected");
+        assert!(plugins_error.contains("Usage: /plugin list"));
+        assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
     }
 
     #[test]

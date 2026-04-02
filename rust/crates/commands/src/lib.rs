@@ -221,14 +221,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "agents",
         aliases: &[],
         summary: "List configured agents",
-        argument_hint: None,
+        argument_hint: Some("[list|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "skills",
         aliases: &[],
         summary: "List available skills",
-        argument_hint: None,
+        argument_hint: Some("[list|help]"),
         resume_supported: true,
     },
 ];
@@ -1578,7 +1578,7 @@ fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
 fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
-        "  Usage            /agents".to_string(),
+        "  Usage            /agents [list|help]".to_string(),
         "  Direct CLI       claw agents".to_string(),
         "  Sources          .codex/agents, .claude/agents, $CODEX_HOME/agents".to_string(),
     ];
@@ -1591,7 +1591,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills".to_string(),
+        "  Usage            /skills [list|help]".to_string(),
         "  Direct CLI       claw skills".to_string(),
         "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
     ];
@@ -2056,8 +2056,8 @@ mod tests {
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents"));
-        assert!(help.contains("/skills"));
+        assert!(help.contains("/agents [list|help]"));
+        assert!(help.contains("/skills [list|help]"));
         assert_eq!(slash_command_specs().len(), 26);
         assert_eq!(resume_supported_slash_commands().len(), 14);
     }
@@ -2365,7 +2365,7 @@ mod tests {
 
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
-        assert!(agents_help.contains("Usage            /agents"));
+        assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       claw agents"));
 
         let agents_unexpected =
@@ -2374,7 +2374,7 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help.contains("Usage            /skills"));
+        assert!(skills_help.contains("Usage            /skills [list|help]"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
