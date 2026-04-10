@@ -4,6 +4,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod simplify;
+
+pub use simplify::build_simplify_prompt;
+
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
@@ -249,6 +253,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List, install, or invoke available skills",
         argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
         resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "simplify",
+        aliases: &[],
+        summary: "Review changed code for reuse, quality, and efficiency",
+        argument_hint: Some("[additional-focus]"),
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "doctor",
@@ -1114,6 +1125,9 @@ pub enum SlashCommand {
     Skills {
         args: Option<String>,
     },
+    Simplify {
+        args: Option<String>,
+    },
     Doctor,
     Login,
     Logout,
@@ -1253,6 +1267,7 @@ impl SlashCommand {
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
+            Self::Simplify { .. } => "/simplify",
             Self::Login => "/login",
             Self::Logout => "/logout",
             Self::Vim => "/vim",
@@ -1398,6 +1413,7 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
+        "simplify" => SlashCommand::Simplify { args: remainder },
         "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
@@ -1906,7 +1922,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "format" | "parallel" | "multi" | "macro" | "alias" | "templates" | "migrate"
         | "benchmark" | "cron" | "agent" | "subagent" | "agents" | "skills" | "team" | "plugin"
         | "mcp" | "hooks" | "tasks" | "advisor" | "insights" | "release-notes" | "chat"
-        | "approve" | "deny" | "allowed-tools" | "add-dir" => "Tools",
+        | "approve" | "deny" | "allowed-tools" | "add-dir" | "simplify" => "Tools",
         "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
         | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
@@ -4045,6 +4061,7 @@ pub fn handle_slash_command(
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
+        | SlashCommand::Simplify { .. }
         | SlashCommand::Doctor
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -4401,6 +4418,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_simplify_command_variants() {
+        // bare /simplify
+        assert_eq!(
+            SlashCommand::parse("/simplify"),
+            Ok(Some(SlashCommand::Simplify { args: None }))
+        );
+
+        // with trailing whitespace only → no args
+        assert_eq!(
+            SlashCommand::parse("/simplify   "),
+            Ok(Some(SlashCommand::Simplify { args: None }))
+        );
+
+        // with focus text
+        assert_eq!(
+            SlashCommand::parse("/simplify focus on duplication"),
+            Ok(Some(SlashCommand::Simplify {
+                args: Some("focus on duplication".to_string())
+            }))
+        );
+
+        // slash_name round-trip
+        let cmd = SlashCommand::Simplify { args: None };
+        assert_eq!(cmd.slash_name(), "/simplify");
+    }
+
+    #[test]
     fn parses_history_command_without_count() {
         // given
         let input = "/history";
@@ -4592,7 +4636,8 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert!(help.contains("/simplify [additional-focus]"));
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -4809,6 +4854,13 @@ mod tests {
         assert!(
             handle_slash_command("/plugins list", &session, CompactionConfig::default()).is_none()
         );
+        assert!(handle_slash_command("/simplify", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command(
+            "/simplify focus on duplication",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
     }
 
     #[test]

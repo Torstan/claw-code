@@ -316,7 +316,7 @@ cd rust
 ./target/debug/claw --resume latest /status /diff
 ```
 
-Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.
+Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, `/simplify`, and `/export`.
 
 ## Config file resolution order
 
