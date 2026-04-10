@@ -32,11 +32,12 @@ use api::{
 };
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    build_simplify_prompt, classify_skills_slash_command, handle_agents_slash_command,
+    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
+    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
+    SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -839,6 +840,20 @@ fn parse_direct_slash_cli_action(
                     output_format,
                 }),
             }
+        }
+        Ok(Some(SlashCommand::Simplify { args })) => {
+            let prompt = build_simplify_prompt(args.as_deref());
+            Ok(CliAction::Prompt {
+                prompt,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+            })
         }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
@@ -3007,6 +3022,7 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
+        | SlashCommand::Simplify { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -4059,6 +4075,11 @@ impl LiveCli {
                         Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
                 }
+                false
+            }
+            SlashCommand::Simplify { args } => {
+                let prompt = build_simplify_prompt(args.as_deref());
+                self.run_turn(&prompt)?;
                 false
             }
             SlashCommand::Doctor => {

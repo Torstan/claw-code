@@ -161,7 +161,7 @@ The REPL now exposes a much broader surface than the original minimal shell:
 - session / visibility: `/help`, `/status`, `/sandbox`, `/cost`, `/resume`, `/session`, `/version`, `/usage`, `/stats`
 - workspace / git: `/compact`, `/clear`, `/config`, `/memory`, `/init`, `/diff`, `/commit`, `/pr`, `/issue`, `/export`, `/hooks`, `/files`, `/branch`, `/release-notes`, `/add-dir`
 - discovery / debugging: `/mcp`, `/agents`, `/skills`, `/doctor`, `/tasks`, `/context`, `/desktop`, `/ide`
-- automation / analysis: `/review`, `/advisor`, `/insights`, `/security-review`, `/subagent`, `/team`, `/telemetry`, `/providers`, `/cron`, and more
+- automation / analysis: `/review`, `/advisor`, `/insights`, `/security-review`, `/simplify`, `/subagent`, `/team`, `/telemetry`, `/providers`, `/cron`, and more
 - plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
 
 Notable claw-first surfaces now available directly in slash form:
@@ -171,6 +171,7 @@ Notable claw-first surfaces now available directly in slash form:
 - `/doctor`
 - `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
 - `/subagent [list|steer <target> <msg>|kill <id>]`
+- `/simplify [additional-focus]` — launches three parallel review agents over the current diff to flag reuse, quality, and efficiency issues, then fixes them
 
 See [`../USAGE.md`](../USAGE.md) for usage examples and run `cargo run -p rusty-claude-cli -- --help` for the live canonical command list.
 
