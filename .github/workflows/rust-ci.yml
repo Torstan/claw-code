@@ -37,10 +37,6 @@ concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    working-directory: rust
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -57,7 +53,19 @@ jobs:
         with:
           python-version: "3.x"
       - name: Check docs and metadata for stale branding
-        run: python .github/scripts/check_doc_source_of_truth.py
+        run: ./scripts/run_all_tests.sh --suite docs-source-of-truth
+
+  claw-cli-smoke:
+    name: claw CLI smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Build and smoke-test claw
+        run: ./scripts/run_all_tests.sh --suite build-claw --suite claw-cli-smoke
 
   fmt:
     name: cargo fmt
@@ -71,7 +79,7 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: ./scripts/run_all_tests.sh --suite rust-fmt
 
   test-workspace:
     name: cargo test --workspace
@@ -83,7 +91,19 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: ./scripts/run_all_tests.sh --suite rust-test-workspace
+
+  mock-parity-harness:
+    name: mock parity harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run mock parity harness
+        run: ./scripts/run_all_tests.sh --suite mock-parity-harness
 
   clippy-workspace:
     name: cargo clippy --workspace
@@ -97,4 +117,4 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run workspace clippy
-        run: cargo clippy --workspace
+        run: ./scripts/run_all_tests.sh --suite rust-clippy

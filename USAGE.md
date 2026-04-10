@@ -347,6 +347,12 @@ cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ## Verification
 
 ```bash
+./scripts/run_all_tests.sh
+```
+
+To run only the Rust workspace tests directly:
+
+```bash
 cd rust
 cargo test --workspace
 ```
