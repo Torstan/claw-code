@@ -99,7 +99,13 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
-Run the workspace test suite:
+Run the full repository test suite:
+
+```bash
+./scripts/run_all_tests.sh
+```
+
+Run only the Rust workspace tests directly:
 
 ```bash
 cd rust
