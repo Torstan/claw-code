@@ -70,6 +70,11 @@ fn global_worker_registry() -> &'static WorkerRegistry {
     REGISTRY.get_or_init(WorkerRegistry::new)
 }
 
+#[track_caller]
+fn agent_debug_log(event: &str, detail: impl AsRef<str>) {
+    runtime::agent_debug_log(event, detail);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
     pub name: String,
@@ -1437,6 +1442,14 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
     let registry = global_task_registry();
+    let started_at = Instant::now();
+    agent_debug_log(
+        "task_output.begin",
+        format!(
+            "task_id={} block={} timeout_ms={}",
+            input.task_id, input.block, input.timeout
+        ),
+    );
     let task = if input.block {
         registry
             .wait_for_terminal(&input.task_id, Duration::from_millis(input.timeout))
@@ -1456,6 +1469,17 @@ fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
     } else {
         "success"
     };
+    agent_debug_log(
+        "task_output.done",
+        format!(
+            "task_id={} retrieval_status={} task_status={} output_len={} elapsed_ms={}",
+            task.task_id,
+            retrieval_status,
+            task.status,
+            task.output.len(),
+            started_at.elapsed().as_millis()
+        ),
+    );
     let task_payload = task_output_payload(task);
 
     to_pretty_json(json!({
@@ -3390,7 +3414,17 @@ const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
-    let input = maybe_normalize_simplify_review_agent(input)?;
+    agent_debug_log(
+        "agent.execute.begin",
+        format!(
+            "description={:?} subagent_type={:?} name={:?} background={} prompt_len={}",
+            input.description,
+            input.subagent_type,
+            input.name,
+            input.run_in_background.unwrap_or(false),
+            input.prompt.len()
+        ),
+    );
     if input.run_in_background.unwrap_or(false) {
         execute_agent_with_mode(input, spawn_agent_job)
     } else {
@@ -3398,181 +3432,24 @@ fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimplifyReviewKind {
-    CodeReuse,
-    CodeQuality,
-    Efficiency,
-}
-
-impl SimplifyReviewKind {
-    fn canonical_description(self) -> &'static str {
-        match self {
-            Self::CodeReuse => "Code reuse review for simplify command",
-            Self::CodeQuality => "Code quality review for simplify command",
-            Self::Efficiency => "Efficiency review for simplify command",
-        }
-    }
-
-    fn canonical_name(self) -> &'static str {
-        match self {
-            Self::CodeReuse => "code-reuse-review",
-            Self::CodeQuality => "code-quality-review",
-            Self::Efficiency => "efficiency-review",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SimplifyReviewContext {
-    codebase_path: String,
-    diff: String,
-}
-
-fn maybe_normalize_simplify_review_agent(mut input: AgentInput) -> Result<AgentInput, String> {
-    if prompt_already_contains_full_diff(&input.prompt) {
-        return Ok(input);
-    }
-
-    let Some(kind) = detect_simplify_review_kind(&input) else {
-        return Ok(input);
-    };
-    let Some(context) = load_simplify_review_context()? else {
-        return Ok(input);
-    };
-
-    input.description = kind.canonical_description().to_string();
-    if input.name.as_deref().is_none_or(str::is_empty) {
-        input.name = Some(kind.canonical_name().to_string());
-    }
-    input.prompt = render_simplify_review_prompt(kind, &context);
-    Ok(input)
-}
-
-fn prompt_already_contains_full_diff(prompt: &str) -> bool {
-    prompt.contains("```diff")
-        || prompt.contains("Here is the diff to review:")
-        || prompt.contains("Here is the full diff to review:")
-}
-
-fn detect_simplify_review_kind(input: &AgentInput) -> Option<SimplifyReviewKind> {
-    let combined = format!("{}\n{}", input.description, input.prompt).to_ascii_lowercase();
-    if !combined.contains("review") || !combined.contains("diff") {
-        return None;
-    }
-
-    if combined.contains("code reuse") || combined.contains("reuse opportunit") {
-        return Some(SimplifyReviewKind::CodeReuse);
-    }
-    if combined.contains("code quality") || combined.contains("hacky pattern") {
-        return Some(SimplifyReviewKind::CodeQuality);
-    }
-    if combined.contains("efficiency") || combined.contains("hot-path") {
-        return Some(SimplifyReviewKind::Efficiency);
-    }
-
-    None
-}
-
-fn load_simplify_review_context() -> Result<Option<SimplifyReviewContext>, String> {
-    let Some(repo_root) = current_git_repo_root()? else {
-        return Ok(None);
-    };
-    let diff = current_simplify_review_diff(&repo_root)?;
-    if diff.trim().is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(SimplifyReviewContext {
-        codebase_path: repo_root.display().to_string(),
-        diff,
-    }))
-}
-
-fn current_git_repo_root() -> Result<Option<PathBuf>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(PathBuf::from(root)))
-    }
-}
-
-fn current_simplify_review_diff(repo_root: &Path) -> Result<String, String> {
-    let staged = git_has_staged_changes(repo_root)?;
-    let diff_args = if staged {
-        vec!["diff", "HEAD"]
-    } else {
-        vec!["diff"]
-    };
-    let output = Command::new("git")
-        .args(diff_args)
-        .current_dir(repo_root)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed with status {}",
-            if staged { "diff HEAD" } else { "diff" },
-            output.status
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn git_has_staged_changes(repo_root: &Path) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(repo_root)
-        .status()
-        .map_err(|error| error.to_string())?;
-    match status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => Err(format!(
-            "git diff --cached --quiet failed with status {status}"
-        )),
-    }
-}
-
-fn render_simplify_review_prompt(
-    kind: SimplifyReviewKind,
-    context: &SimplifyReviewContext,
-) -> String {
-    match kind {
-        SimplifyReviewKind::CodeReuse => format!(
-            "Review the following git diff for code reuse opportunities. Search the codebase at {} for existing utilities and helpers that could replace newly written code.\n\nFor each change:\n1. Search for existing utilities and helpers that could replace newly written code. Look for similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nHere is the diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Keep your response under 300 words.",
-            context.codebase_path, context.diff
-        ),
-        SimplifyReviewKind::CodeQuality => format!(
-            "Review the following git diff for code quality issues. The codebase is at {}.\n\nLook for:\n1. Redundant state: state that duplicates existing state, cached values that could be derived\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified\n4. Leaky abstractions: exposing internal details that should be encapsulated\n5. Stringly-typed code: using raw strings where constants, enums, or typed values already exist\n6. Unnecessary comments: comments explaining WHAT the code does rather than WHY\n7. Any other quality issues\n\nHere is the full diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Under 300 words.",
-            context.codebase_path, context.diff
-        ),
-        SimplifyReviewKind::Efficiency => format!(
-            "Review the following git diff for efficiency issues. The codebase is at {}.\n\nLook for:\n1. Unnecessary work: redundant computations, repeated operations\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request hot paths\n4. Memory: unbounded data structures, missing cleanup\n5. Unnecessary existence checks (TOCTOU anti-pattern)\n6. Overly broad operations\n\nHere is the full diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Under 300 words.",
-            context.codebase_path, context.diff
-        ),
-    }
-}
-
 fn execute_agent_with_mode<F>(input: AgentInput, spawn_fn: F) -> Result<AgentToolOutput, String>
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
+    let started_at = Instant::now();
     let background = input.run_in_background.unwrap_or(false);
     let prompt = input.prompt.clone();
     let manifest = execute_agent_with_spawn(input, spawn_fn)?;
+    agent_debug_log(
+        "agent.execute.spawned",
+        format!(
+            "agent_id={} description={:?} background={} elapsed_ms={}",
+            manifest.agent_id,
+            manifest.description,
+            background,
+            started_at.elapsed().as_millis()
+        ),
+    );
     if background {
         Ok(AgentToolOutput::AsyncLaunched(
             build_async_agent_launch_output(&manifest, &prompt),
@@ -3609,6 +3486,18 @@ where
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    agent_debug_log(
+        "agent.spawn.prepare",
+        format!(
+            "agent_id={} description={:?} subagent_type={} model={} allowed_tools={} prompt_len={}",
+            agent_id,
+            input.description,
+            normalized_subagent_type,
+            model,
+            allowed_tools.len(),
+            input.prompt.len()
+        ),
+    );
 
     let output_contents = format!(
         "# Agent Task
@@ -3646,6 +3535,13 @@ where
         result: None,
     };
     write_agent_manifest(&manifest)?;
+    agent_debug_log(
+        "agent.spawn.manifest_written",
+        format!(
+            "agent_id={} manifest_file={} output_file={}",
+            manifest.agent_id, manifest.manifest_file, manifest.output_file
+        ),
+    );
 
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
@@ -3657,9 +3553,20 @@ where
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
+        agent_debug_log(
+            "agent.spawn.error",
+            format!("agent_id={} error={error}", manifest.agent_id),
+        );
         persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
         return Err(error);
     }
+    agent_debug_log(
+        "agent.spawn.dispatched",
+        format!(
+            "agent_id={} background_status={}",
+            manifest.agent_id, manifest.status
+        ),
+    );
 
     // If spawn_fn ran synchronously (e.g. run_agent_job inline), the manifest
     // on disk has been updated to its terminal state by persist_agent_terminal_state.
@@ -3681,6 +3588,18 @@ fn build_async_agent_launch_output(manifest: &AgentOutput, prompt: &str) -> Asyn
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+    let started_at = Instant::now();
+    let spawned_agent_id = job.manifest.agent_id.clone();
+    agent_debug_log(
+        "agent.background.register.begin",
+        format!(
+            "agent_id={} description={:?} parent_session_id={:?} prompt_len={}",
+            job.manifest.agent_id,
+            job.manifest.description,
+            job.parent_session_id,
+            job.prompt.len()
+        ),
+    );
     // Register in the task registry so TaskGet/TaskOutput can find this agent.
     let registry = global_task_registry();
     let agent_id = job.manifest.agent_id.clone();
@@ -3692,16 +3611,40 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     registry
         .set_status(&agent_id, TaskStatus::Running)
         .map_err(|e| e.to_string())?;
+    agent_debug_log(
+        "agent.background.register.done",
+        format!(
+            "agent_id={} elapsed_ms={}",
+            agent_id,
+            started_at.elapsed().as_millis()
+        ),
+    );
 
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            agent_debug_log(
+                "agent.background.thread.begin",
+                format!(
+                    "agent_id={} description={:?}",
+                    job.manifest.agent_id, job.manifest.description
+                ),
+            );
             let registry = global_task_registry();
+            let started_at = Instant::now();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
             match result {
                 Ok(Ok(())) => {
+                    agent_debug_log(
+                        "agent.background.thread.completed",
+                        format!(
+                            "agent_id={} elapsed_ms={}",
+                            job.manifest.agent_id,
+                            started_at.elapsed().as_millis()
+                        ),
+                    );
                     let output = read_agent_manifest(&job.manifest.manifest_file)
                         .ok()
                         .and_then(|m| m.result)
@@ -3711,6 +3654,14 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     enqueue_background_agent_notification(&job, "completed", &output);
                 }
                 Ok(Err(error)) => {
+                    agent_debug_log(
+                        "agent.background.thread.failed",
+                        format!(
+                            "agent_id={} elapsed_ms={} error={error}",
+                            job.manifest.agent_id,
+                            started_at.elapsed().as_millis()
+                        ),
+                    );
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
@@ -3723,6 +3674,14 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 }
                 Err(_) => {
                     let msg = String::from("sub-agent thread panicked");
+                    agent_debug_log(
+                        "agent.background.thread.panicked",
+                        format!(
+                            "agent_id={} elapsed_ms={}",
+                            job.manifest.agent_id,
+                            started_at.elapsed().as_millis()
+                        ),
+                    );
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
@@ -3735,8 +3694,19 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 }
             }
         })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map(|_| {
+            agent_debug_log(
+                "agent.background.thread.spawned",
+                format!("agent_id={spawned_agent_id}"),
+            );
+        })
+        .map_err(|error| {
+            agent_debug_log(
+                "agent.background.thread.spawn_error",
+                format!("agent_id={spawned_agent_id} error={error}"),
+            );
+            error.to_string()
+        })
 }
 
 fn enqueue_background_agent_notification(job: &AgentJob, status: &str, body: &str) {
@@ -3759,11 +3729,63 @@ fn enqueue_background_agent_notification(job: &AgentJob, status: &str, body: &st
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    agent_debug_log(
+        "agent.job.begin",
+        format!(
+            "agent_id={} model={:?} description={:?} prompt_len={}",
+            job.manifest.agent_id,
+            job.manifest.model,
+            job.manifest.description,
+            job.prompt.len()
+        ),
+    );
+    let total_started_at = Instant::now();
+    let runtime_started_at = Instant::now();
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    agent_debug_log(
+        "agent.job.runtime_ready",
+        format!(
+            "agent_id={} elapsed_ms={}",
+            job.manifest.agent_id,
+            runtime_started_at.elapsed().as_millis()
+        ),
+    );
+    let run_turn_started_at = Instant::now();
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            let rendered = error.to_string();
+            agent_debug_log(
+                "agent.job.run_turn_error",
+                format!(
+                    "agent_id={} elapsed_ms={} error={rendered}",
+                    job.manifest.agent_id,
+                    run_turn_started_at.elapsed().as_millis()
+                ),
+            );
+            rendered
+        })?;
+    agent_debug_log(
+        "agent.job.run_turn_done",
+        format!(
+            "agent_id={} elapsed_ms={} total_elapsed_ms={} assistant_messages={} tool_results={}",
+            job.manifest.agent_id,
+            run_turn_started_at.elapsed().as_millis(),
+            total_started_at.elapsed().as_millis(),
+            summary.assistant_messages.len(),
+            summary.tool_results.len()
+        ),
+    );
     let final_text = final_assistant_text(&summary);
+    agent_debug_log(
+        "agent.job.persist_terminal_state",
+        format!(
+            "agent_id={} final_text_len={} total_elapsed_ms={}",
+            job.manifest.agent_id,
+            final_text.len(),
+            total_started_at.elapsed().as_millis()
+        ),
+    );
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
 
@@ -3776,6 +3798,16 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
+    agent_debug_log(
+        "agent.runtime.build.begin",
+        format!(
+            "agent_id={} model={} allowed_tools={} system_prompt_parts={}",
+            job.manifest.agent_id,
+            model,
+            allowed_tools.len(),
+            job.system_prompt.len()
+        ),
+    );
     let api_client = ProviderRuntimeClient::new_for_session(
         model,
         allowed_tools.clone(),
@@ -4146,6 +4178,7 @@ impl ProviderRuntimeClient {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::needless_pass_by_value)]
     fn new_with_fallback_config(
         model: String,
@@ -4271,6 +4304,19 @@ impl ApiClient for ProviderRuntimeClient {
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
+            let attempt_started_at = Instant::now();
+            agent_debug_log(
+                "agent.provider.stream.begin",
+                format!(
+                    "model={} attempt={} chain_len={} messages={} tools={} system_prompt_parts={}",
+                    entry.model,
+                    index + 1,
+                    chain.len(),
+                    request.messages.len(),
+                    tools.len(),
+                    request.system_prompt.len()
+                ),
+            );
             let message_request = MessageRequest {
                 model: entry.model.clone(),
                 max_tokens: max_tokens_for_model(&entry.model),
@@ -4284,8 +4330,29 @@ impl ApiClient for ProviderRuntimeClient {
 
             let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
             match attempt {
-                Ok(events) => return Ok(events),
+                Ok(events) => {
+                    agent_debug_log(
+                        "agent.provider.stream.success",
+                        format!(
+                            "model={} attempt={} elapsed_ms={} events={}",
+                            entry.model,
+                            index + 1,
+                            attempt_started_at.elapsed().as_millis(),
+                            events.len()
+                        ),
+                    );
+                    return Ok(events);
+                }
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                    agent_debug_log(
+                        "agent.provider.stream.retryable_error",
+                        format!(
+                            "model={} attempt={} elapsed_ms={} error={error}",
+                            entry.model,
+                            index + 1,
+                            attempt_started_at.elapsed().as_millis()
+                        ),
+                    );
                     eprintln!(
                         "provider {} failed with retryable error, falling back: {error}",
                         entry.model
@@ -4293,7 +4360,18 @@ impl ApiClient for ProviderRuntimeClient {
                     last_error = Some(error);
                     continue;
                 }
-                Err(error) => return Err(RuntimeError::new(error.to_string())),
+                Err(error) => {
+                    agent_debug_log(
+                        "agent.provider.stream.error",
+                        format!(
+                            "model={} attempt={} elapsed_ms={} error={error}",
+                            entry.model,
+                            index + 1,
+                            attempt_started_at.elapsed().as_millis()
+                        ),
+                    );
+                    return Err(RuntimeError::new(error.to_string()));
+                }
             }
         }
 
@@ -5821,11 +5899,10 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
         execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
-        maybe_commit_provenance, maybe_normalize_simplify_review_agent, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_output, run_task_packet, AgentInput, AgentJob, AgentToolOutput,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor, TaskOutputInput,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
+        AgentInput, AgentJob, AgentToolOutput, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, TaskOutputInput,
     };
     use api::{AuthSource, OutputContentBlock, ProviderClient};
     use runtime::ProviderFallbackConfig;
@@ -7480,80 +7557,6 @@ mod tests {
         .expect("Agent should normalize explicit names");
         assert_eq!(named.name, "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn simplify_review_agents_are_normalized_to_full_diff_prompts() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("simplify-review-normalize");
-        init_git_repo(&root);
-        std::fs::create_dir_all(root.join("src")).expect("src dir");
-        commit_file(
-            &root,
-            "src/lib.rs",
-            "pub fn value() -> i32 { 1 }\n",
-            "add lib",
-        );
-        std::fs::write(root.join("src/lib.rs"), "pub fn value() -> i32 { 2 }\n")
-            .expect("write modified file");
-
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let normalized = maybe_normalize_simplify_review_agent(AgentInput {
-            description:
-                "Review the diff for code reuse opportunities — find existing utilities/helpers that could replace newly written code"
-                    .to_string(),
-            prompt: "You are reviewing a Rust codebase diff for code reuse opportunities. The diff spans these files:\n\n- src/lib.rs\n\nThe working directory is current. Start by reading the diff with `git diff HEAD`."
-                .to_string(),
-            subagent_type: None,
-            name: None,
-            model: None,
-            run_in_background: Some(true),
-        })
-        .expect("normalize simplify review prompt");
-
-        assert_eq!(
-            normalized.description,
-            "Code reuse review for simplify command"
-        );
-        assert_eq!(normalized.name.as_deref(), Some("code-reuse-review"));
-        assert!(normalized
-            .prompt
-            .contains(&format!("Search the codebase at {}", root.display())));
-        assert!(normalized.prompt.contains("Here is the diff to review:"));
-        assert!(normalized.prompt.contains("```diff"));
-        assert!(normalized
-            .prompt
-            .contains("diff --git a/src/lib.rs b/src/lib.rs"));
-        assert!(normalized.prompt.contains("+pub fn value() -> i32 { 2 }"));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn simplify_review_agents_keep_existing_full_diff_prompts() {
-        let original_prompt = "Review the following git diff for efficiency issues.\n\nHere is the full diff to review:\n\n```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n```"
-            .to_string();
-        let input = AgentInput {
-            description: "Review the diff for efficiency issues".to_string(),
-            prompt: original_prompt.clone(),
-            subagent_type: None,
-            name: None,
-            model: None,
-            run_in_background: Some(true),
-        };
-
-        let normalized =
-            maybe_normalize_simplify_review_agent(input).expect("keep existing full diff prompt");
-        assert_eq!(normalized.prompt, original_prompt);
-        assert_eq!(
-            normalized.description,
-            "Review the diff for efficiency issues"
-        );
     }
 
     #[test]
