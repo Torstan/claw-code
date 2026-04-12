@@ -842,7 +842,7 @@ fn parse_direct_slash_cli_action(
             }
         }
         Ok(Some(SlashCommand::Simplify { args })) => {
-            let prompt = build_simplify_prompt(args.as_deref());
+            let prompt = build_simplify_prompt(args.as_deref()).into_owned();
             Ok(CliAction::Prompt {
                 prompt,
                 model,
