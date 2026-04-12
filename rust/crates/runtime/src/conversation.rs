@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
+use crate::agent_debug::agent_debug_log;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -376,9 +377,35 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
+            agent_debug_log(
+                "llm.request",
+                format!(
+                    "session_id={}\niteration={iterations}\nsystem_prompt_parts={}\nmessage_count={}\nrequest={request:#?}",
+                    self.session.session_id,
+                    request.system_prompt.len(),
+                    request.messages.len()
+                ),
+            );
             let events = match self.api_client.stream(request) {
-                Ok(events) => events,
+                Ok(events) => {
+                    agent_debug_log(
+                        "llm.response",
+                        format!(
+                            "session_id={}\niteration={iterations}\nevent_count={}\nresponse={events:#?}",
+                            self.session.session_id,
+                            events.len()
+                        ),
+                    );
+                    events
+                }
                 Err(error) => {
+                    agent_debug_log(
+                        "llm.response.error",
+                        format!(
+                            "session_id={}\niteration={iterations}\nerror={error}",
+                            self.session.session_id
+                        ),
+                    );
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }

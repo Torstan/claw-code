@@ -44,15 +44,16 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    active_tool_session_id, check_base_commit, clear_oauth_credentials, format_stale_base_warning,
-    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials, with_active_tool_session, ApiClient,
-    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, ToolInvocation, UsageTracker,
+    active_tool_session_id, agent_debug_log, check_base_commit, clear_oauth_credentials,
+    format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
+    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
+    pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
+    with_active_tool_session, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
+    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, ToolInvocation, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -109,11 +110,16 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<cwd-error:{error}>"));
+    agent_debug_log("process.start", format!("cwd={cwd} argv={argv:?}"));
+
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
-        let argv: Vec<String> = std::env::args().collect();
         let json_output = argv
             .windows(2)
             .any(|w| w[0] == "--output-format" && w[1] == "json")
@@ -889,6 +895,62 @@ fn format_prompt_slash_command_metadata(command_name: &str, args: Option<&str>) 
         lines.push(format!("<command-args>{args}</command-args>"));
     }
     lines.join("\n")
+}
+
+fn format_prompt_slash_skill_listing(skills_listing: &Value) -> Option<String> {
+    let skills = skills_listing.get("skills")?.as_array()?;
+    let entries = skills
+        .iter()
+        .filter(|skill| {
+            skill
+                .get("active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|skill| {
+            let name = skill.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            Some(match description {
+                Some(description) => format!("- {name}: {description}"),
+                None => format!("- {name}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n{}\n</system-reminder>",
+        entries.join("\n")
+    ))
+}
+
+fn build_prompt_slash_command_initial_messages(
+    command_name: &str,
+    args: Option<&str>,
+    prompt: &str,
+    cwd: &Path,
+) -> Vec<ConversationMessage> {
+    let mut messages = vec![
+        ConversationMessage::user_text(format_prompt_slash_command_metadata(command_name, args)),
+        ConversationMessage::user_text(prompt),
+    ];
+
+    if let Ok(skills_listing) = handle_skills_slash_command_json(None, cwd) {
+        if let Some(skill_listing) = format_prompt_slash_skill_listing(&skills_listing) {
+            messages.push(ConversationMessage::user_text(skill_listing));
+        }
+    }
+
+    messages
 }
 
 fn format_unknown_option(option: &str) -> String {
@@ -3933,13 +3995,19 @@ impl LiveCli {
         let slash_input = format_prompt_slash_command_input(command_name, args);
         self.record_prompt_history(&slash_input);
 
-        let initial_messages = vec![
-            ConversationMessage::user_text(format_prompt_slash_command_metadata(
-                command_name,
-                args,
-            )),
-            ConversationMessage::user_text(prompt),
-        ];
+        let initial_messages = std::env::current_dir()
+            .map(|cwd| {
+                build_prompt_slash_command_initial_messages(command_name, args, prompt, &cwd)
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    ConversationMessage::user_text(format_prompt_slash_command_metadata(
+                        command_name,
+                        args,
+                    )),
+                    ConversationMessage::user_text(prompt),
+                ]
+            });
 
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -7126,33 +7194,106 @@ impl ApiClient for AnthropicRuntimeClient {
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
+        let tool_count = message_request.tools.as_ref().map_or(0, Vec::len);
+        let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+        let total_started_at = Instant::now();
+        agent_debug_log(
+            "cli.provider.stream.begin",
+            format!(
+                "session_id={}\nmodel={}\nmessage_count={}\ntool_count={}\nsystem_prompt_parts={}\npost_tool={}\nmax_attempts={}\nreasoning_effort={:?}",
+                self.session_id,
+                self.model,
+                request.messages.len(),
+                tool_count,
+                request.system_prompt.len(),
+                is_post_tool,
+                max_attempts,
+                self.reasoning_effort
+            ),
+        );
 
         self.runtime.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
-
             for attempt in 1..=max_attempts {
+                let attempt_started_at = Instant::now();
+                let apply_stall_timeout = is_post_tool && attempt == 1;
+                agent_debug_log(
+                    "cli.provider.stream.attempt.begin",
+                    format!(
+                        "session_id={}\nmodel={}\nattempt={}\nmax_attempts={}\napply_stall_timeout={}",
+                        self.session_id, self.model, attempt, max_attempts, apply_stall_timeout
+                    ),
+                );
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(&message_request, apply_stall_timeout)
                     .await;
                 match result {
-                    Ok(events) => return Ok(events),
+                    Ok(events) => {
+                        agent_debug_log(
+                            "cli.provider.stream.success",
+                            format!(
+                                "session_id={}\nmodel={}\nattempt={}\nevent_count={}\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}",
+                                self.session_id,
+                                self.model,
+                                attempt,
+                                events.len(),
+                                attempt_started_at.elapsed().as_millis(),
+                                total_started_at.elapsed().as_millis()
+                            ),
+                        );
+                        return Ok(events);
+                    }
                     Err(error)
                         if error.to_string().contains("post-tool stall")
                             && attempt < max_attempts =>
                     {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
+                        agent_debug_log(
+                            "cli.provider.stream.retry",
+                            format!(
+                                "session_id={}\nmodel={}\nattempt={}\nreason=post_tool_stall\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}\nerror={error}",
+                                self.session_id,
+                                self.model,
+                                attempt,
+                                attempt_started_at.elapsed().as_millis(),
+                                total_started_at.elapsed().as_millis()
+                            ),
+                        );
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        agent_debug_log(
+                            "cli.provider.stream.error",
+                            format!(
+                                "session_id={}\nmodel={}\nattempt={}\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}\nerror={error}",
+                                self.session_id,
+                                self.model,
+                                attempt,
+                                attempt_started_at.elapsed().as_millis(),
+                                total_started_at.elapsed().as_millis()
+                            ),
+                        );
+                        return Err(error);
+                    }
                 }
             }
 
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            let error = RuntimeError::new("post-tool continuation nudge exhausted");
+            agent_debug_log(
+                "cli.provider.stream.error",
+                format!(
+                    "session_id={}\nmodel={}\nattempt={}\ntotal_elapsed_ms={}\nerror={error}",
+                    self.session_id,
+                    self.model,
+                    max_attempts,
+                    total_started_at.elapsed().as_millis()
+                ),
+            );
+            Err(error)
         })
     }
 }
@@ -7166,6 +7307,7 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let consume_started_at = Instant::now();
         let mut stream = self
             .client
             .stream_message(message_request)
@@ -7195,6 +7337,15 @@ impl AnthropicRuntimeClient {
                         RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
                     Err(_elapsed) => {
+                        agent_debug_log(
+                            "cli.provider.stream.stall_timeout",
+                            format!(
+                                "session_id={}\nmodel={}\ntimeout_ms={}",
+                                self.session_id,
+                                self.model,
+                                POST_TOOL_STALL_TIMEOUT.as_millis()
+                            ),
+                        );
                         return Err(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
                         ));
@@ -7209,6 +7360,25 @@ impl AnthropicRuntimeClient {
             let Some(event) = next else {
                 break;
             };
+            if !received_any_event {
+                let event_name = match &event {
+                    ApiStreamEvent::MessageStart(_) => "message_start",
+                    ApiStreamEvent::MessageDelta(_) => "message_delta",
+                    ApiStreamEvent::ContentBlockStart(_) => "content_block_start",
+                    ApiStreamEvent::ContentBlockDelta(_) => "content_block_delta",
+                    ApiStreamEvent::ContentBlockStop(_) => "content_block_stop",
+                    ApiStreamEvent::MessageStop(_) => "message_stop",
+                };
+                agent_debug_log(
+                    "cli.provider.stream.first_event",
+                    format!(
+                        "session_id={}\nmodel={}\nelapsed_ms={}\nevent={event_name}",
+                        self.session_id,
+                        self.model,
+                        consume_started_at.elapsed().as_millis()
+                    ),
+                );
+            }
             received_any_event = true;
 
             match event {
@@ -8331,18 +8501,43 @@ impl CliToolExecutor {
     }
 
     fn execute_raw(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let started_at = Instant::now();
+        cli_agent_debug_log(
+            "tool.execute.begin",
+            format!("tool_name={tool_name}\ninput={input}"),
+        );
         if self
             .allowed_tools
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(tool_name))
         {
-            return Err(ToolError::new(format!(
+            let error = ToolError::new(format!(
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
+            ));
+            cli_agent_debug_log(
+                "tool.execute.done",
+                format!(
+                    "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
+                    started_at.elapsed().as_micros()
+                ),
+            );
+            return Err(error);
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        if tool_name == "ToolSearch" {
+        let value = match serde_json::from_str(input) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = ToolError::new(format!("invalid tool input JSON: {error}"));
+                cli_agent_debug_log(
+                    "tool.execute.done",
+                    format!(
+                        "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
+                        started_at.elapsed().as_micros()
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -8350,7 +8545,24 @@ impl CliToolExecutor {
             self.tool_registry
                 .execute(tool_name, &value)
                 .map_err(ToolError::new)
+        };
+        match &result {
+            Ok(output) => cli_agent_debug_log(
+                "tool.execute.done",
+                format!(
+                    "tool_name={tool_name}\nok=true\nelapsed_us={}\noutput={output}",
+                    started_at.elapsed().as_micros()
+                ),
+            ),
+            Err(error) => cli_agent_debug_log(
+                "tool.execute.done",
+                format!(
+                    "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
+                    started_at.elapsed().as_micros()
+                ),
+            ),
         }
+        result
     }
 
     fn render_result(
@@ -8381,6 +8593,35 @@ impl CliToolExecutor {
     }
 }
 
+#[track_caller]
+fn cli_agent_debug_log(event: &str, detail: impl AsRef<str>) {
+    runtime::agent_debug_log(event, detail);
+}
+
+fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
+    if invocation.tool_name != "Agent" {
+        return format!("tool={}", invocation.tool_name);
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(&invocation.input) else {
+        return format!("tool={} input_parse_error", invocation.tool_name);
+    };
+    format!(
+        "tool={} description={:?} name={:?} background={} prompt_len={}",
+        invocation.tool_name,
+        value.get("description").and_then(Value::as_str),
+        value.get("name").and_then(Value::as_str),
+        value
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        value
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map_or(0, str::len)
+    )
+}
+
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let result = self.execute_raw(tool_name, input);
@@ -8400,6 +8641,20 @@ impl ToolExecutor for CliToolExecutor {
                 .collect();
         }
 
+        let batch_started_at = Instant::now();
+        cli_agent_debug_log(
+            "tool.execute_many.parallel.begin",
+            format!(
+                "invocations={} session_id={:?} summary={}",
+                invocations.len(),
+                active_tool_session_id(),
+                invocations
+                    .iter()
+                    .map(describe_parallel_invocation)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+        );
         let session_id = active_tool_session_id();
         let allowed_tools = self.allowed_tools.clone();
         let tool_registry = self.tool_registry.clone();
@@ -8415,6 +8670,15 @@ impl ToolExecutor for CliToolExecutor {
                 let mcp_state = mcp_state.clone();
                 let session_id = session_id.clone();
                 std::thread::spawn(move || {
+                    let invocation_started_at = Instant::now();
+                    cli_agent_debug_log(
+                        "tool.execute_many.worker.begin",
+                        format!(
+                            "tool_name={} description={}",
+                            invocation.tool_name,
+                            describe_parallel_invocation(&invocation)
+                        ),
+                    );
                     let worker = CliToolExecutor {
                         renderer: TerminalRenderer::new(),
                         emit_output: false,
@@ -8422,9 +8686,20 @@ impl ToolExecutor for CliToolExecutor {
                         tool_registry,
                         mcp_state,
                     };
-                    with_active_tool_session(session_id.as_deref(), || {
+                    let result = with_active_tool_session(session_id.as_deref(), || {
                         worker.execute_raw(&invocation.tool_name, &invocation.input)
-                    })
+                    });
+                    cli_agent_debug_log(
+                        "tool.execute_many.worker.done",
+                        format!(
+                            "tool_name={} description={} ok={} elapsed_us={}",
+                            invocation.tool_name,
+                            describe_parallel_invocation(&invocation),
+                            result.is_ok(),
+                            invocation_started_at.elapsed().as_micros()
+                        ),
+                    );
+                    result
                 })
             })
             .collect::<Vec<_>>();
@@ -8436,6 +8711,17 @@ impl ToolExecutor for CliToolExecutor {
                 Err(_) => Err(ToolError::new("tool execution thread panicked")),
             })
             .collect::<Vec<_>>();
+
+        cli_agent_debug_log(
+            "tool.execute_many.parallel.done",
+            format!(
+                "invocations={} ok_count={} err_count={} elapsed_us={}",
+                invocations.len(),
+                results.iter().filter(|result| result.is_ok()).count(),
+                results.iter().filter(|result| result.is_err()).count(),
+                batch_started_at.elapsed().as_micros()
+            ),
+        );
 
         if emit_output {
             for (index, (invocation, result)) in invocations.iter().zip(results.iter()).enumerate()
@@ -8681,22 +8967,22 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_prompt_slash_command_input, format_prompt_slash_command_metadata,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        build_prompt_slash_command_initial_messages, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_prompt_slash_command_input, format_prompt_slash_command_metadata,
+        format_prompt_slash_skill_listing, format_resume_report, format_status_report,
+        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
@@ -10138,6 +10424,87 @@ mod tests {
             format_prompt_slash_command_input("simplify", Some("focus on duplication")),
             "/simplify focus on duplication"
         );
+    }
+
+    #[test]
+    fn formats_prompt_slash_skill_listing_like_claude_attachment_normalization() {
+        let listing = json!({
+            "skills": [
+                {
+                    "name": "update-config",
+                    "description": "Configure the Claude Code harness via settings.json",
+                    "active": true,
+                },
+                {
+                    "name": "shadowed-skill",
+                    "description": "Should not be surfaced",
+                    "active": false,
+                },
+                {
+                    "name": "simplify",
+                    "description": "Review changed code for reuse, quality, and efficiency",
+                    "active": true,
+                }
+            ]
+        });
+
+        assert_eq!(
+            format_prompt_slash_skill_listing(&listing),
+            Some(
+                "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- update-config: Configure the Claude Code harness via settings.json\n- simplify: Review changed code for reuse, quality, and efficiency\n</system-reminder>"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn builds_prompt_slash_initial_messages_without_skill_listing_when_none_are_available() {
+        let _guard = env_lock();
+        let cwd = temp_dir();
+        let home = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd should exist");
+        fs::create_dir_all(&home).expect("home should exist");
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_claw_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CLAW_CONFIG_HOME", home.join(".claw-config"));
+        std::env::set_var("CODEX_HOME", home.join(".codex-home"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude-config"));
+
+        let messages =
+            build_prompt_slash_command_initial_messages("simplify", None, "# Simplify", &cwd);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0],
+            ConversationMessage::user_text(
+                "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>"
+            )
+        );
+        assert_eq!(messages[1], ConversationMessage::user_text("# Simplify"));
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_claw_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match previous_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match previous_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        let _ = fs::remove_dir_all(cwd);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

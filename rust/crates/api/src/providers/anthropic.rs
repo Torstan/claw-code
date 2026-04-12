@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use runtime::format_usd;
+use runtime::{agent_debug_log, format_usd};
 use runtime::{
     load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
     OAuthTokenExchangeRequest,
@@ -340,10 +340,38 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        let started_at = Instant::now();
+        agent_debug_log(
+            "anthropic.stream_message.begin",
+            format!(
+                "model={}\nmessages={}\nmax_tokens={}\nstream={}",
+                request.model,
+                request.messages.len(),
+                request.max_tokens,
+                request.stream
+            ),
+        );
         self.preflight_message_request(request).await?;
+        agent_debug_log(
+            "anthropic.stream_message.preflight_done",
+            format!(
+                "model={}\nelapsed_ms={}",
+                request.model,
+                started_at.elapsed().as_millis()
+            ),
+        );
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
+        agent_debug_log(
+            "anthropic.stream_message.response_ready",
+            format!(
+                "model={}\nelapsed_ms={}\nrequest_id={:?}",
+                request.model,
+                started_at.elapsed().as_millis(),
+                request_id_from_headers(response.headers())
+            ),
+        );
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -402,11 +430,20 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let started_at = Instant::now();
         let mut attempts = 0;
         let mut last_error: Option<ApiError>;
 
         loop {
             attempts += 1;
+            let attempt_started_at = Instant::now();
+            agent_debug_log(
+                "anthropic.send_with_retry.attempt.begin",
+                format!(
+                    "model={}\nattempt={}\nmax_retries={}\nstream={}",
+                    request.model, attempts, self.max_retries, request.stream
+                ),
+            );
             if let Some(session_tracer) = &self.session_tracer {
                 session_tracer.record_http_request_started(
                     attempts,
@@ -418,6 +455,18 @@ impl AnthropicClient {
             match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
+                        agent_debug_log(
+                            "anthropic.send_with_retry.attempt.success",
+                            format!(
+                                "model={}\nattempt={}\nstatus={}\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}\nrequest_id={:?}",
+                                request.model,
+                                attempts,
+                                response.status().as_u16(),
+                                attempt_started_at.elapsed().as_millis(),
+                                started_at.elapsed().as_millis(),
+                                request_id_from_headers(response.headers())
+                            ),
+                        );
                         if let Some(session_tracer) = &self.session_tracer {
                             session_tracer.record_http_request_succeeded(
                                 attempts,
@@ -431,32 +480,93 @@ impl AnthropicClient {
                         return Ok(response);
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                        let backoff = self.jittered_backoff_for_attempt(attempts)?;
+                        agent_debug_log(
+                            "anthropic.send_with_retry.attempt.retry",
+                            format!(
+                                "model={}\nattempt={}\nkind=response_error\nretryable=true\nattempt_elapsed_ms={}\nbackoff_ms={}\nerror={error}",
+                                request.model,
+                                attempts,
+                                attempt_started_at.elapsed().as_millis(),
+                                backoff.as_millis()
+                            ),
+                        );
                         self.record_request_failure(attempts, &error);
                         last_error = Some(error);
+                        if attempts > self.max_retries {
+                            break;
+                        }
+                        tokio::time::sleep(backoff).await;
+                        continue;
                     }
                     Err(error) => {
                         let error = enrich_bearer_auth_error(error, &self.auth);
+                        agent_debug_log(
+                            "anthropic.send_with_retry.attempt.error",
+                            format!(
+                                "model={}\nattempt={}\nkind=response_error\nretryable={}\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}\nerror={error}",
+                                request.model,
+                                attempts,
+                                error.is_retryable(),
+                                attempt_started_at.elapsed().as_millis(),
+                                started_at.elapsed().as_millis()
+                            ),
+                        );
                         self.record_request_failure(attempts, &error);
                         return Err(error);
                     }
                 },
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                    let backoff = self.jittered_backoff_for_attempt(attempts)?;
+                    agent_debug_log(
+                        "anthropic.send_with_retry.attempt.retry",
+                        format!(
+                            "model={}\nattempt={}\nkind=request_error\nretryable=true\nattempt_elapsed_ms={}\nbackoff_ms={}\nerror={error}",
+                            request.model,
+                            attempts,
+                            attempt_started_at.elapsed().as_millis(),
+                            backoff.as_millis()
+                        ),
+                    );
                     self.record_request_failure(attempts, &error);
                     last_error = Some(error);
+                    if attempts > self.max_retries {
+                        break;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    continue;
                 }
                 Err(error) => {
+                    agent_debug_log(
+                        "anthropic.send_with_retry.attempt.error",
+                        format!(
+                            "model={}\nattempt={}\nkind=request_error\nretryable={}\nattempt_elapsed_ms={}\ntotal_elapsed_ms={}\nerror={error}",
+                            request.model,
+                            attempts,
+                            error.is_retryable(),
+                            attempt_started_at.elapsed().as_millis(),
+                            started_at.elapsed().as_millis()
+                        ),
+                    );
                     self.record_request_failure(attempts, &error);
                     return Err(error);
                 }
             }
-
-            if attempts > self.max_retries {
-                break;
-            }
-
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         }
 
+        agent_debug_log(
+            "anthropic.send_with_retry.exhausted",
+            format!(
+                "model={}\nattempts={}\ntotal_elapsed_ms={}\nlast_error={}",
+                request.model,
+                attempts,
+                started_at.elapsed().as_millis(),
+                last_error
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| String::from("<missing>"))
+            ),
+        );
         Err(ApiError::RetriesExhausted {
             attempts,
             last_error: Box::new(last_error.expect("retry loop must capture an error")),
@@ -467,11 +577,47 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let started_at = Instant::now();
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        agent_debug_log(
+            "anthropic.send_raw_request.begin",
+            format!(
+                "model={}\nurl={request_url}\nstream={}\nmessages={}\nmax_tokens={}",
+                request.model,
+                request.stream,
+                request.messages.len(),
+                request.max_tokens
+            ),
+        );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
-        request_builder.send().await.map_err(ApiError::from)
+        match request_builder.send().await {
+            Ok(response) => {
+                agent_debug_log(
+                    "anthropic.send_raw_request.sent",
+                    format!(
+                        "model={}\nurl={request_url}\nstatus={}\nelapsed_ms={}\nrequest_id={:?}",
+                        request.model,
+                        response.status().as_u16(),
+                        started_at.elapsed().as_millis(),
+                        request_id_from_headers(response.headers())
+                    ),
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                agent_debug_log(
+                    "anthropic.send_raw_request.error",
+                    format!(
+                        "model={}\nurl={request_url}\nelapsed_ms={}\nerror={error}",
+                        request.model,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                Err(ApiError::from(error))
+            }
+        }
     }
 
     fn build_request(&self, request_url: &str) -> reqwest::RequestBuilder {
@@ -487,6 +633,16 @@ impl AnthropicClient {
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
+        let started_at = Instant::now();
+        agent_debug_log(
+            "anthropic.preflight.begin",
+            format!(
+                "model={}\nmessages={}\nmax_tokens={}",
+                request.model,
+                request.messages.len(),
+                request.max_tokens
+            ),
+        );
         // Always run the local byte-estimate guard first. This catches
         // oversized requests even if the remote count_tokens endpoint is
         // unreachable, misconfigured, or unimplemented (e.g., third-party
@@ -496,6 +652,14 @@ impl AnthropicClient {
         super::preflight_message_request(request)?;
 
         let Some(limit) = model_token_limit(&request.model) else {
+            agent_debug_log(
+                "anthropic.preflight.skip_remote_count",
+                format!(
+                    "model={}\nreason=no_model_limit\nelapsed_ms={}",
+                    request.model,
+                    started_at.elapsed().as_millis()
+                ),
+            );
             return Ok(());
         };
 
@@ -504,10 +668,32 @@ impl AnthropicClient {
         // byte-estimate result which already passed above.
         let counted_input_tokens = match self.count_tokens(request).await {
             Ok(count) => count,
-            Err(_) => return Ok(()),
+            Err(error) => {
+                agent_debug_log(
+                    "anthropic.preflight.count_tokens_fallback",
+                    format!(
+                        "model={}\nelapsed_ms={}\nerror={error}",
+                        request.model,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                return Ok(());
+            }
         };
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
         if estimated_total_tokens > limit.context_window_tokens {
+            agent_debug_log(
+                "anthropic.preflight.context_window_exceeded",
+                format!(
+                    "model={}\ncounted_input_tokens={}\nrequested_output_tokens={}\nestimated_total_tokens={}\ncontext_window_tokens={}\nelapsed_ms={}",
+                    request.model,
+                    counted_input_tokens,
+                    request.max_tokens,
+                    estimated_total_tokens,
+                    limit.context_window_tokens,
+                    started_at.elapsed().as_millis()
+                ),
+            );
             return Err(ApiError::ContextWindowExceeded {
                 model: resolve_model_alias(&request.model),
                 estimated_input_tokens: counted_input_tokens,
@@ -517,6 +703,17 @@ impl AnthropicClient {
             });
         }
 
+        agent_debug_log(
+            "anthropic.preflight.done",
+            format!(
+                "model={}\ncounted_input_tokens={}\nestimated_total_tokens={}\ncontext_window_tokens={}\nelapsed_ms={}",
+                request.model,
+                counted_input_tokens,
+                estimated_total_tokens,
+                limit.context_window_tokens,
+                started_at.elapsed().as_millis()
+            ),
+        );
         Ok(())
     }
 
@@ -530,6 +727,16 @@ impl AnthropicClient {
             "{}/v1/messages/count_tokens",
             self.base_url.trim_end_matches('/')
         );
+        let started_at = Instant::now();
+        agent_debug_log(
+            "anthropic.count_tokens.begin",
+            format!(
+                "model={}\nurl={request_url}\nmessages={}\nmax_tokens={}",
+                request.model,
+                request.messages.len(),
+                request.max_tokens
+            ),
+        );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
@@ -538,12 +745,31 @@ impl AnthropicClient {
             .send()
             .await
             .map_err(ApiError::from)?;
+        agent_debug_log(
+            "anthropic.count_tokens.response",
+            format!(
+                "model={}\nurl={request_url}\nstatus={}\nelapsed_ms={}\nrequest_id={:?}",
+                request.model,
+                response.status().as_u16(),
+                started_at.elapsed().as_millis(),
+                request_id_from_headers(response.headers())
+            ),
+        );
 
         let response = expect_success(response).await?;
         let body = response.text().await.map_err(ApiError::from)?;
         let parsed = serde_json::from_str::<CountTokensResponse>(&body).map_err(|error| {
             ApiError::json_deserialize("Anthropic count_tokens", &request.model, &body, error)
         })?;
+        agent_debug_log(
+            "anthropic.count_tokens.success",
+            format!(
+                "model={}\ninput_tokens={}\nelapsed_ms={}",
+                request.model,
+                parsed.input_tokens,
+                started_at.elapsed().as_millis()
+            ),
+        );
         Ok(parsed.input_tokens)
     }
 
