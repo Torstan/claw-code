@@ -4,9 +4,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, max_tokens_for_model, read_base_url, resolve_model_alias,
+    resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -24,7 +26,7 @@ use runtime::{
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
     ToolError, ToolExecutor,
 };
@@ -3388,10 +3390,179 @@ const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
+    let input = maybe_normalize_simplify_review_agent(input)?;
     if input.run_in_background.unwrap_or(false) {
         execute_agent_with_mode(input, spawn_agent_job)
     } else {
         execute_agent_with_mode(input, |job| run_agent_job(&job))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimplifyReviewKind {
+    CodeReuse,
+    CodeQuality,
+    Efficiency,
+}
+
+impl SimplifyReviewKind {
+    fn canonical_description(self) -> &'static str {
+        match self {
+            Self::CodeReuse => "Code reuse review for simplify command",
+            Self::CodeQuality => "Code quality review for simplify command",
+            Self::Efficiency => "Efficiency review for simplify command",
+        }
+    }
+
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::CodeReuse => "code-reuse-review",
+            Self::CodeQuality => "code-quality-review",
+            Self::Efficiency => "efficiency-review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimplifyReviewContext {
+    codebase_path: String,
+    diff: String,
+}
+
+fn maybe_normalize_simplify_review_agent(mut input: AgentInput) -> Result<AgentInput, String> {
+    if prompt_already_contains_full_diff(&input.prompt) {
+        return Ok(input);
+    }
+
+    let Some(kind) = detect_simplify_review_kind(&input) else {
+        return Ok(input);
+    };
+    let Some(context) = load_simplify_review_context()? else {
+        return Ok(input);
+    };
+
+    input.description = kind.canonical_description().to_string();
+    if input.name.as_deref().is_none_or(str::is_empty) {
+        input.name = Some(kind.canonical_name().to_string());
+    }
+    input.prompt = render_simplify_review_prompt(kind, &context);
+    Ok(input)
+}
+
+fn prompt_already_contains_full_diff(prompt: &str) -> bool {
+    prompt.contains("```diff")
+        || prompt.contains("Here is the diff to review:")
+        || prompt.contains("Here is the full diff to review:")
+}
+
+fn detect_simplify_review_kind(input: &AgentInput) -> Option<SimplifyReviewKind> {
+    let combined = format!("{}\n{}", input.description, input.prompt).to_ascii_lowercase();
+    if !combined.contains("review") || !combined.contains("diff") {
+        return None;
+    }
+
+    if combined.contains("code reuse") || combined.contains("reuse opportunit") {
+        return Some(SimplifyReviewKind::CodeReuse);
+    }
+    if combined.contains("code quality") || combined.contains("hacky pattern") {
+        return Some(SimplifyReviewKind::CodeQuality);
+    }
+    if combined.contains("efficiency") || combined.contains("hot-path") {
+        return Some(SimplifyReviewKind::Efficiency);
+    }
+
+    None
+}
+
+fn load_simplify_review_context() -> Result<Option<SimplifyReviewContext>, String> {
+    let Some(repo_root) = current_git_repo_root()? else {
+        return Ok(None);
+    };
+    let diff = current_simplify_review_diff(&repo_root)?;
+    if diff.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(SimplifyReviewContext {
+        codebase_path: repo_root.display().to_string(),
+        diff,
+    }))
+}
+
+fn current_git_repo_root() -> Result<Option<PathBuf>, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(root)))
+    }
+}
+
+fn current_simplify_review_diff(repo_root: &Path) -> Result<String, String> {
+    let staged = git_has_staged_changes(repo_root)?;
+    let diff_args = if staged {
+        vec!["diff", "HEAD"]
+    } else {
+        vec!["diff"]
+    };
+    let output = Command::new("git")
+        .args(diff_args)
+        .current_dir(repo_root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed with status {}",
+            if staged { "diff HEAD" } else { "diff" },
+            output.status
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_has_staged_changes(repo_root: &Path) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(repo_root)
+        .status()
+        .map_err(|error| error.to_string())?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(format!(
+            "git diff --cached --quiet failed with status {status}"
+        )),
+    }
+}
+
+fn render_simplify_review_prompt(
+    kind: SimplifyReviewKind,
+    context: &SimplifyReviewContext,
+) -> String {
+    match kind {
+        SimplifyReviewKind::CodeReuse => format!(
+            "Review the following git diff for code reuse opportunities. Search the codebase at {} for existing utilities and helpers that could replace newly written code.\n\nFor each change:\n1. Search for existing utilities and helpers that could replace newly written code. Look for similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nHere is the diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Keep your response under 300 words.",
+            context.codebase_path, context.diff
+        ),
+        SimplifyReviewKind::CodeQuality => format!(
+            "Review the following git diff for code quality issues. The codebase is at {}.\n\nLook for:\n1. Redundant state: state that duplicates existing state, cached values that could be derived\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified\n4. Leaky abstractions: exposing internal details that should be encapsulated\n5. Stringly-typed code: using raw strings where constants, enums, or typed values already exist\n6. Unnecessary comments: comments explaining WHAT the code does rather than WHY\n7. Any other quality issues\n\nHere is the full diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Under 300 words.",
+            context.codebase_path, context.diff
+        ),
+        SimplifyReviewKind::Efficiency => format!(
+            "Review the following git diff for efficiency issues. The codebase is at {}.\n\nLook for:\n1. Unnecessary work: redundant computations, repeated operations\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request hot paths\n4. Memory: unbounded data structures, missing cleanup\n5. Unnecessary existence checks (TOCTOU anti-pattern)\n6. Overly broad operations\n\nHere is the full diff to review:\n\n```diff\n{}\n```\n\nReport only real issues with specific file:line references. Under 300 words.",
+            context.codebase_path, context.diff
+        ),
     }
 }
 
@@ -3605,7 +3776,11 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let api_client = ProviderRuntimeClient::new_for_session(
+        model,
+        allowed_tools.clone(),
+        &job.manifest.agent_id,
+    )?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
@@ -3957,9 +4132,18 @@ struct ProviderRuntimeClient {
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+    fn new_for_session(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        session_id: &str,
+    ) -> Result<Self, String> {
         let fallback_config = load_provider_fallback_config();
-        Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
+        Self::new_with_fallback_config_for_session(
+            model,
+            allowed_tools,
+            &fallback_config,
+            session_id,
+        )
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -3968,14 +4152,29 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
+        Self::new_with_fallback_config_for_session(
+            model,
+            allowed_tools,
+            fallback_config,
+            "subagent-runtime",
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_fallback_config_for_session(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        fallback_config: &ProviderFallbackConfig,
+        session_id: &str,
+    ) -> Result<Self, String> {
         let primary_model = fallback_config
             .primary()
             .map(str::to_string)
             .unwrap_or(model);
-        let primary = build_provider_entry(&primary_model)?;
+        let primary = build_provider_entry(&primary_model, session_id)?;
         let mut chain = vec![primary];
         for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
+            match build_provider_entry(fallback_model, session_id) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
                     eprintln!(
@@ -3992,13 +4191,56 @@ impl ProviderRuntimeClient {
     }
 }
 
-fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
+fn build_provider_entry(model: &str, session_id: &str) -> Result<ProviderEntry, String> {
     let resolved = resolve_model_alias(model).clone();
-    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
+    let client = match detect_provider_kind(&resolved) {
+        ProviderKind::Anthropic => {
+            let auth = resolve_subagent_auth_source()?;
+            let client = AnthropicClient::from_auth(auth)
+                .with_base_url(read_base_url())
+                .with_prompt_cache(PromptCache::new(session_id));
+            ProviderClient::Anthropic(client)
+        }
+        ProviderKind::Xai | ProviderKind::OpenAi => {
+            ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?
+        }
+    };
     Ok(ProviderEntry {
         model: resolved,
         client,
     })
+}
+
+fn resolve_subagent_auth_source() -> Result<AuthSource, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    resolve_startup_auth_source(|| {
+        Ok(Some(
+            load_subagent_oauth_config_for(&cwd)?.unwrap_or_else(default_subagent_oauth_config),
+        ))
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn load_subagent_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, ApiError> {
+    let config = ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| ApiError::Auth(format!("failed to load runtime OAuth config: {error}")))?;
+    Ok(config.oauth().cloned())
+}
+
+fn default_subagent_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: String::from("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+        authorize_url: String::from("https://platform.claude.com/oauth/authorize"),
+        token_url: String::from("https://platform.claude.com/v1/oauth/token"),
+        callback_port: None,
+        manual_redirect_url: None,
+        scopes: vec![
+            String::from("user:profile"),
+            String::from("user:inference"),
+            String::from("user:sessions:claude_code"),
+        ],
+    }
 }
 
 fn load_provider_fallback_config() -> ProviderFallbackConfig {
@@ -5579,12 +5821,13 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
         execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
-        AgentInput, AgentJob, AgentToolOutput, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor, TaskOutputInput,
+        maybe_commit_provenance, maybe_normalize_simplify_review_agent, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_output, run_task_packet, AgentInput, AgentJob, AgentToolOutput,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor, TaskOutputInput,
     };
-    use api::OutputContentBlock;
+    use api::{AuthSource, OutputContentBlock, ProviderClient};
     use runtime::ProviderFallbackConfig;
     use runtime::{
         drain_session_notifications, permission_enforcer::PermissionEnforcer,
@@ -7237,6 +7480,80 @@ mod tests {
         .expect("Agent should normalize explicit names");
         assert_eq!(named.name, "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn simplify_review_agents_are_normalized_to_full_diff_prompts() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("simplify-review-normalize");
+        init_git_repo(&root);
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        commit_file(
+            &root,
+            "src/lib.rs",
+            "pub fn value() -> i32 { 1 }\n",
+            "add lib",
+        );
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() -> i32 { 2 }\n")
+            .expect("write modified file");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let normalized = maybe_normalize_simplify_review_agent(AgentInput {
+            description:
+                "Review the diff for code reuse opportunities — find existing utilities/helpers that could replace newly written code"
+                    .to_string(),
+            prompt: "You are reviewing a Rust codebase diff for code reuse opportunities. The diff spans these files:\n\n- src/lib.rs\n\nThe working directory is current. Start by reading the diff with `git diff HEAD`."
+                .to_string(),
+            subagent_type: None,
+            name: None,
+            model: None,
+            run_in_background: Some(true),
+        })
+        .expect("normalize simplify review prompt");
+
+        assert_eq!(
+            normalized.description,
+            "Code reuse review for simplify command"
+        );
+        assert_eq!(normalized.name.as_deref(), Some("code-reuse-review"));
+        assert!(normalized
+            .prompt
+            .contains(&format!("Search the codebase at {}", root.display())));
+        assert!(normalized.prompt.contains("Here is the diff to review:"));
+        assert!(normalized.prompt.contains("```diff"));
+        assert!(normalized
+            .prompt
+            .contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(normalized.prompt.contains("+pub fn value() -> i32 { 2 }"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn simplify_review_agents_keep_existing_full_diff_prompts() {
+        let original_prompt = "Review the following git diff for efficiency issues.\n\nHere is the full diff to review:\n\n```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n```"
+            .to_string();
+        let input = AgentInput {
+            description: "Review the diff for efficiency issues".to_string(),
+            prompt: original_prompt.clone(),
+            subagent_type: None,
+            name: None,
+            model: None,
+            run_in_background: Some(true),
+        };
+
+        let normalized =
+            maybe_normalize_simplify_review_agent(input).expect("keep existing full diff prompt");
+        assert_eq!(normalized.prompt, original_prompt);
+        assert_eq!(
+            normalized.description,
+            "Review the diff for efficiency issues"
+        );
     }
 
     #[test]
@@ -8926,6 +9243,45 @@ printf 'pwsh:%s' "$1"
         }
         if let Some(value) = original_xai {
             std::env::set_var("XAI_API_KEY", value);
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_anthropic_entries_use_prompt_cache_and_cli_auth_path() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_api_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_auth_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "test-bearer-token");
+
+        let client = ProviderRuntimeClient::new_for_session(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            "agent-session-123",
+        )
+        .expect("anthropic client should construct from CLI-style auth");
+
+        assert_eq!(client.chain.len(), 1);
+        match &client.chain[0].client {
+            ProviderClient::Anthropic(inner) => {
+                assert!(inner.prompt_cache().is_some());
+                assert_eq!(
+                    inner.auth_source(),
+                    &AuthSource::BearerToken("test-bearer-token".to_string())
+                );
+            }
+            other => panic!("expected anthropic provider entry, got {other:?}"),
+        }
+
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
         }
     }
 
