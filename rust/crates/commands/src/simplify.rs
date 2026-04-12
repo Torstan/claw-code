@@ -82,4 +82,14 @@ mod tests {
         assert!(prompt.starts_with(SIMPLIFY_PROMPT));
         assert!(prompt.ends_with("## Additional Focus\n\nfocus on duplication"));
     }
+
+    #[test]
+    fn simplify_prompt_matches_upstream_parallel_review_flow() {
+        assert!(SIMPLIFY_PROMPT.contains("## Phase 2: Launch Three Review Agents in Parallel"));
+        assert!(SIMPLIFY_PROMPT.contains(
+            "Use the Agent tool to launch all three agents concurrently in a single message."
+        ));
+        assert!(SIMPLIFY_PROMPT.contains("Wait for all three agents to complete."));
+        assert!(!SIMPLIFY_PROMPT.contains("run_in_background"));
+    }
 }

@@ -11,8 +11,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    active_tool_session_id, check_freshness, dedupe_superseded_commit_events, edit_file,
+    enqueue_session_notification, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -846,7 +846,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "task_id": { "type": "string" },
+                    "block": { "type": "boolean" },
+                    "timeout": { "type": "integer", "minimum": 0 }
                 },
                 "required": ["task_id"],
                 "additionalProperties": false
@@ -1232,7 +1234,7 @@ fn execute_tool_with_enforcer(
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
-        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TaskOutput" => from_value::<TaskOutputInput>(input).and_then(run_task_output),
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
         "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
@@ -1431,15 +1433,63 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
     let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
-            "output": output,
-            "has_output": !output.is_empty()
-        })),
-        Err(e) => Err(e),
+    let task = if input.block {
+        registry
+            .wait_for_terminal(&input.task_id, Duration::from_millis(input.timeout))
+            .map_err(|error| error.to_string())?
+    } else {
+        registry
+            .get(&input.task_id)
+            .ok_or_else(|| format!("task not found: {}", input.task_id))?
+    };
+
+    let retrieval_status = if matches!(task.status, TaskStatus::Created | TaskStatus::Running) {
+        if input.block {
+            "timeout"
+        } else {
+            "not_ready"
+        }
+    } else {
+        "success"
+    };
+    let task_payload = task_output_payload(task);
+
+    to_pretty_json(json!({
+        "task_id": task_payload.task_id,
+        "output": task_payload.output,
+        "has_output": task_payload.has_output,
+        "retrieval_status": retrieval_status,
+        "task": task_payload
+    }))
+}
+
+fn task_output_payload(task: runtime::task_registry::Task) -> TaskOutputPayload {
+    let runtime::task_registry::Task {
+        task_id,
+        prompt,
+        description,
+        status,
+        created_at,
+        updated_at,
+        messages,
+        output,
+        team_id,
+        ..
+    } = task;
+    let has_output = !output.is_empty();
+    TaskOutputPayload {
+        task_id,
+        status: status.to_string(),
+        prompt,
+        description,
+        created_at,
+        updated_at,
+        messages,
+        output,
+        has_output,
+        team_id,
     }
 }
 
@@ -2234,6 +2284,15 @@ struct TaskIdInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct TaskOutputInput {
+    task_id: String,
+    #[serde(default = "default_task_output_block")]
+    block: bool,
+    #[serde(default = "default_task_output_timeout_ms")]
+    timeout: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
     task_id: String,
     message: String,
@@ -2275,6 +2334,14 @@ struct WorkerSendPromptInput {
 
 const fn default_auto_recover_prompt_misdelivery() -> bool {
     true
+}
+
+const fn default_task_output_block() -> bool {
+    true
+}
+
+const fn default_task_output_timeout_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -2422,12 +2489,45 @@ struct AgentOutput {
     result: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AsyncAgentLaunchOutput {
+    status: &'static str,
+    #[serde(rename = "agentId")]
+    agent_id: String,
+    description: String,
+    prompt: String,
+    #[serde(rename = "outputFile")]
+    output_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum AgentToolOutput {
+    Completed(AgentOutput),
+    AsyncLaunched(AsyncAgentLaunchOutput),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskOutputPayload {
+    task_id: String,
+    status: String,
+    prompt: String,
+    description: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    messages: Vec<runtime::task_registry::TaskMessage>,
+    output: String,
+    has_output: bool,
+    team_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3287,12 +3387,27 @@ const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    let background = input.run_in_background.unwrap_or(false);
-    if background {
-        execute_agent_with_spawn(input, spawn_agent_job)
+fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
+    if input.run_in_background.unwrap_or(false) {
+        execute_agent_with_mode(input, spawn_agent_job)
     } else {
-        execute_agent_with_spawn(input, |job| run_agent_job(&job))
+        execute_agent_with_mode(input, |job| run_agent_job(&job))
+    }
+}
+
+fn execute_agent_with_mode<F>(input: AgentInput, spawn_fn: F) -> Result<AgentToolOutput, String>
+where
+    F: FnOnce(AgentJob) -> Result<(), String>,
+{
+    let background = input.run_in_background.unwrap_or(false);
+    let prompt = input.prompt.clone();
+    let manifest = execute_agent_with_spawn(input, spawn_fn)?;
+    if background {
+        Ok(AgentToolOutput::AsyncLaunched(
+            build_async_agent_launch_output(&manifest, &prompt),
+        ))
+    } else {
+        Ok(AgentToolOutput::Completed(manifest))
     }
 }
 
@@ -3367,6 +3482,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        parent_session_id: active_tool_session_id(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -3381,6 +3497,16 @@ where
     // (e.g. spawn_fn launched a background thread that hasn't finished yet).
     let final_manifest = read_agent_manifest(&manifest.manifest_file).unwrap_or(manifest);
     Ok(final_manifest)
+}
+
+fn build_async_agent_launch_output(manifest: &AgentOutput, prompt: &str) -> AsyncAgentLaunchOutput {
+    AsyncAgentLaunchOutput {
+        status: "async_launched",
+        agent_id: manifest.agent_id.clone(),
+        description: manifest.description.clone(),
+        prompt: prompt.to_string(),
+        output_file: manifest.output_file.clone(),
+    }
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
@@ -3411,6 +3537,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         .unwrap_or_default();
                     let _ = registry.append_output(&job.manifest.agent_id, &output);
                     let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Completed);
+                    enqueue_background_agent_notification(&job, "completed", &output);
                 }
                 Ok(Err(error)) => {
                     let _ = persist_agent_terminal_state(
@@ -3421,6 +3548,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                     let _ = registry.append_output(&job.manifest.agent_id, &error);
                     let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Failed);
+                    enqueue_background_agent_notification(&job, "failed", &error);
                 }
                 Err(_) => {
                     let msg = String::from("sub-agent thread panicked");
@@ -3432,11 +3560,31 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                     let _ = registry.append_output(&job.manifest.agent_id, &msg);
                     let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Failed);
+                    enqueue_background_agent_notification(&job, "failed", &msg);
                 }
             }
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn enqueue_background_agent_notification(job: &AgentJob, status: &str, body: &str) {
+    let Some(session_id) = job.parent_session_id.as_deref() else {
+        return;
+    };
+    let detail_label = if status.eq_ignore_ascii_case("completed") {
+        "result"
+    } else {
+        "error"
+    };
+    let mut message = format!(
+        "Background agent finished.\nagentId: {}\ndescription: {}\nstatus: {}\noutput_file: {}",
+        job.manifest.agent_id, job.manifest.description, status, job.manifest.output_file
+    );
+    if !body.trim().is_empty() {
+        message.push_str(&format!("\n{detail_label}:\n{}", body.trim()));
+    }
+    enqueue_session_notification(session_id.to_string(), message);
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
@@ -5429,17 +5577,19 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        global_task_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
+        AgentInput, AgentJob, AgentToolOutput, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, TaskOutputInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        drain_session_notifications, permission_enforcer::PermissionEnforcer,
+        with_active_tool_session, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode,
+        PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -7054,6 +7204,7 @@ mod tests {
         assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
+        assert_eq!(captured_job.parent_session_id, None);
 
         // Use execute_agent_with_spawn + noop closure to exercise the
         // normalization path without making real API calls (execute_agent
@@ -7085,6 +7236,58 @@ mod tests {
         )
         .expect("Agent should normalize explicit names");
         assert_eq!(named.name, "ship-audit");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn background_agent_captures_parent_session_and_formats_notification() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-session-notification");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+
+        let _ = with_active_tool_session(Some("parent-session"), || {
+            execute_agent_with_spawn(
+                AgentInput {
+                    description: "Background audit".to_string(),
+                    prompt: "Review the branch".to_string(),
+                    subagent_type: None,
+                    name: Some("audit".to_string()),
+                    model: None,
+                    run_in_background: Some(true),
+                },
+                move |job| {
+                    *captured_for_spawn
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                    Ok(())
+                },
+            )
+            .expect("background agent should be captured")
+        });
+
+        let captured_job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("spawn job should be captured");
+        assert_eq!(
+            captured_job.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+
+        enqueue_background_agent_notification(&captured_job, "completed", "review done");
+        let notifications = drain_session_notifications("parent-session");
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].contains("Background agent finished."));
+        assert!(notifications[0].contains("agentId:"));
+        assert!(notifications[0].contains("status: completed"));
+        assert!(notifications[0].contains("review done"));
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7290,6 +7493,135 @@ mod tests {
         registry.remove(&manifest.agent_id);
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_background_launch_returns_async_contract() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-bg-contract");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+
+        let launched = execute_agent_with_mode(
+            AgentInput {
+                description: "Background review".to_string(),
+                prompt: "Inspect the branch".to_string(),
+                subagent_type: None,
+                name: Some("bg-review".to_string()),
+                model: None,
+                run_in_background: Some(true),
+            },
+            |job| {
+                let registry = global_task_registry();
+                registry.create_with_id(
+                    job.manifest.agent_id.clone(),
+                    &job.prompt,
+                    Some(&job.manifest.description),
+                );
+                registry
+                    .set_status(&job.manifest.agent_id, TaskStatus::Running)
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .expect("background agent launch should succeed");
+
+        let AgentToolOutput::AsyncLaunched(launch) = launched else {
+            panic!("expected async launch output");
+        };
+        assert_eq!(launch.status, "async_launched");
+        assert_eq!(launch.description, "Background review");
+        assert_eq!(launch.prompt, "Inspect the branch");
+        assert!(Path::new(&launch.output_file).exists());
+
+        let registry = global_task_registry();
+        let task = registry
+            .get(&launch.agent_id)
+            .expect("background task should be registered");
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.prompt, "Inspect the branch");
+
+        registry.remove(&launch.agent_id);
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_reports_not_ready_and_success_for_background_agents() {
+        let registry = global_task_registry();
+
+        let running = registry.create("Inspect branch", Some("Background review"));
+        registry
+            .set_status(&running.task_id, TaskStatus::Running)
+            .expect("set status should succeed");
+
+        let not_ready = run_task_output(TaskOutputInput {
+            task_id: running.task_id.clone(),
+            block: false,
+            timeout: 30_000,
+        })
+        .expect("non-blocking task output should succeed");
+        let not_ready_json: serde_json::Value =
+            serde_json::from_str(&not_ready).expect("json output");
+        assert_eq!(not_ready_json["retrieval_status"], "not_ready");
+        assert_eq!(not_ready_json["task"]["status"], "running");
+        assert_eq!(not_ready_json["task"]["has_output"], false);
+
+        registry.remove(&running.task_id);
+
+        let completed = registry.create("Inspect branch", Some("Background review"));
+        registry
+            .set_status(&completed.task_id, TaskStatus::Running)
+            .expect("set status should succeed");
+
+        let registry_for_thread = registry.clone();
+        let completed_task_id = completed.task_id.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            registry_for_thread
+                .append_output(&completed_task_id, "review complete")
+                .expect("append output should succeed");
+            registry_for_thread
+                .set_status(&completed_task_id, TaskStatus::Completed)
+                .expect("set status should succeed");
+        });
+
+        let success = run_task_output(TaskOutputInput {
+            task_id: completed.task_id.clone(),
+            block: true,
+            timeout: 500,
+        })
+        .expect("blocking task output should succeed");
+        let success_json: serde_json::Value = serde_json::from_str(&success).expect("json output");
+        assert_eq!(success_json["retrieval_status"], "success");
+        assert_eq!(success_json["task"]["status"], "completed");
+        assert_eq!(success_json["output"], "review complete");
+        assert_eq!(success_json["task"]["output"], "review complete");
+        assert_eq!(success_json["task"]["has_output"], true);
+
+        registry.remove(&completed.task_id);
+    }
+
+    #[test]
+    fn task_output_reports_timeout_for_running_task() {
+        let registry = global_task_registry();
+        let task = registry.create("Inspect branch", Some("Background review"));
+        registry
+            .set_status(&task.task_id, TaskStatus::Running)
+            .expect("set status should succeed");
+
+        let timeout = run_task_output(TaskOutputInput {
+            task_id: task.task_id.clone(),
+            block: true,
+            timeout: 10,
+        })
+        .expect("blocking task output should succeed");
+        let timeout_json: serde_json::Value = serde_json::from_str(&timeout).expect("json output");
+        assert_eq!(timeout_json["retrieval_status"], "timeout");
+        assert_eq!(timeout_json["task"]["status"], "running");
+
+        registry.remove(&task.task_id);
     }
 
     #[test]

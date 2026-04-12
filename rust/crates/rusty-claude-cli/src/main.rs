@@ -44,15 +44,15 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
-    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    active_tool_session_id, check_base_commit, clear_oauth_credentials, format_stale_base_warning,
+    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    resolve_sandbox_status, save_oauth_credentials, with_active_tool_session, ApiClient,
+    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, ToolInvocation, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -867,6 +867,28 @@ fn parse_direct_slash_cli_action(
         Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn normalized_prompt_slash_args(args: Option<&str>) -> Option<&str> {
+    args.map(str::trim).filter(|args| !args.is_empty())
+}
+
+fn format_prompt_slash_command_input(command_name: &str, args: Option<&str>) -> String {
+    match normalized_prompt_slash_args(args) {
+        Some(args) => format!("/{command_name} {args}"),
+        None => format!("/{command_name}"),
+    }
+}
+
+fn format_prompt_slash_command_metadata(command_name: &str, args: Option<&str>) -> String {
+    let mut lines = vec![
+        format!("<command-message>{command_name}</command-message>"),
+        format!("<command-name>/{command_name}</command-name>"),
+    ];
+    if let Some(args) = normalized_prompt_slash_args(args) {
+        lines.push(format!("<command-args>{args}</command-args>"));
+    }
+    lines.join("\n")
 }
 
 fn format_unknown_option(option: &str) -> String {
@@ -3902,6 +3924,68 @@ impl LiveCli {
         }
     }
 
+    fn run_prompt_slash_command(
+        &mut self,
+        command_name: &str,
+        args: Option<&str>,
+        prompt: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let slash_input = format_prompt_slash_command_input(command_name, args);
+        self.record_prompt_history(&slash_input);
+
+        let initial_messages = vec![
+            ConversationMessage::user_text(format_prompt_slash_command_metadata(
+                command_name,
+                args,
+            )),
+            ConversationMessage::user_text(prompt),
+        ];
+
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let mut spinner = Spinner::new();
+        let mut stdout = io::stdout();
+        spinner.tick(
+            "🦀 Thinking...",
+            TerminalRenderer::new().color_theme(),
+            &mut stdout,
+        )?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn_with_messages(
+            slash_input,
+            initial_messages,
+            Some(&mut permission_prompter),
+        );
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                spinner.finish(
+                    "✨ Done",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
+                self.persist_session()?;
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                Err(Box::new(error))
+            }
+        }
+    }
+
     fn run_turn_with_output(
         &mut self,
         input: &str,
@@ -4079,7 +4163,7 @@ impl LiveCli {
             }
             SlashCommand::Simplify { args } => {
                 let prompt = build_simplify_prompt(args.as_deref());
-                self.run_turn(&prompt)?;
+                self.run_prompt_slash_command("simplify", args.as_deref(), prompt.as_ref())?;
                 false
             }
             SlashCommand::Doctor => {
@@ -8245,10 +8329,8 @@ impl CliToolExecutor {
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
     }
-}
 
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute_raw(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -8260,7 +8342,7 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -8268,27 +8350,118 @@ impl ToolExecutor for CliToolExecutor {
             self.tool_registry
                 .execute(tool_name, &value)
                 .map_err(ToolError::new)
+        }
+    }
+
+    fn render_result(
+        &self,
+        tool_name: &str,
+        result: &Result<String, ToolError>,
+    ) -> Result<(), ToolError> {
+        if !self.emit_output {
+            return Ok(());
+        }
+        let (markdown, is_error) = match result {
+            Ok(output) => (format_tool_result(tool_name, output, false), false),
+            Err(error) => (
+                format_tool_result(tool_name, &error.to_string(), true),
+                true,
+            ),
         };
-        match result {
-            Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
+        self.renderer
+            .stream_markdown(&markdown, &mut io::stdout())
+            .map_err(|error| {
+                let label = if is_error {
+                    "failed to render tool error"
+                } else {
+                    "failed to render tool result"
+                };
+                ToolError::new(format!("{label}: {error}"))
+            })
+    }
+}
+
+impl ToolExecutor for CliToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let result = self.execute_raw(tool_name, input);
+        self.render_result(tool_name, &result)?;
+        result
+    }
+
+    fn execute_many(&mut self, invocations: &[ToolInvocation]) -> Vec<Result<String, ToolError>> {
+        if invocations.len() < 2
+            || !invocations
+                .iter()
+                .all(|invocation| self.supports_parallel_execution(&invocation.tool_name))
+        {
+            return invocations
+                .iter()
+                .map(|invocation| self.execute(&invocation.tool_name, &invocation.input))
+                .collect();
+        }
+
+        let session_id = active_tool_session_id();
+        let allowed_tools = self.allowed_tools.clone();
+        let tool_registry = self.tool_registry.clone();
+        let mcp_state = self.mcp_state.clone();
+        let emit_output = self.emit_output;
+
+        let handles: Vec<std::thread::JoinHandle<Result<String, ToolError>>> = invocations
+            .iter()
+            .cloned()
+            .map(|invocation| {
+                let allowed_tools = allowed_tools.clone();
+                let tool_registry = tool_registry.clone();
+                let mcp_state = mcp_state.clone();
+                let session_id = session_id.clone();
+                std::thread::spawn(move || {
+                    let worker = CliToolExecutor {
+                        renderer: TerminalRenderer::new(),
+                        emit_output: false,
+                        allowed_tools,
+                        tool_registry,
+                        mcp_state,
+                    };
+                    with_active_tool_session(session_id.as_deref(), || {
+                        worker.execute_raw(&invocation.tool_name, &invocation.input)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(ToolError::new("tool execution thread panicked")),
+            })
+            .collect::<Vec<_>>();
+
+        if emit_output {
+            for (index, (invocation, result)) in invocations.iter().zip(results.iter()).enumerate()
+            {
+                if let Err(error) = self.render_result(&invocation.tool_name, result) {
+                    return invocations
+                        .iter()
+                        .zip(results.into_iter())
+                        .enumerate()
+                        .map(|(result_index, (_invocation, result))| {
+                            if result_index == index {
+                                Err(error.clone())
+                            } else {
+                                result
+                            }
+                        })
+                        .collect();
                 }
-                Ok(output)
-            }
-            Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                }
-                Err(error)
             }
         }
+
+        results
+    }
+
+    fn supports_parallel_execution(&self, tool_name: &str) -> bool {
+        tool_name == "Agent"
     }
 }
 
@@ -8515,6 +8688,7 @@ mod tests {
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_prompt_slash_command_input, format_prompt_slash_command_metadata,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
@@ -9940,6 +10114,30 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
+    }
+
+    #[test]
+    fn formats_prompt_slash_command_metadata_like_upstream() {
+        assert_eq!(
+            format_prompt_slash_command_metadata("simplify", None),
+            "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>"
+        );
+        assert_eq!(
+            format_prompt_slash_command_metadata("simplify", Some("focus on duplication")),
+            "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>\n<command-args>focus on duplication</command-args>"
+        );
+    }
+
+    #[test]
+    fn formats_prompt_slash_command_input_like_user_invocation() {
+        assert_eq!(
+            format_prompt_slash_command_input("simplify", None),
+            "/simplify"
+        );
+        assert_eq!(
+            format_prompt_slash_command_input("simplify", Some("focus on duplication")),
+            "/simplify focus on duplication"
+        );
     }
 
     #[test]

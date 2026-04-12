@@ -36,7 +36,12 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+mod session_notifications;
 pub use session_control::SessionStore;
+pub use session_notifications::{
+    active_tool_session_id, drain_session_notifications, enqueue_session_notification,
+    with_active_tool_session,
+};
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
@@ -71,7 +76,7 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ToolExecutor, ToolInvocation, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
