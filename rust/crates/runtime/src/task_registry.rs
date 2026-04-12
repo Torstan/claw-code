@@ -80,6 +80,27 @@ impl TaskRegistry {
         self.create_task(prompt.to_owned(), description.map(str::to_owned), None)
     }
 
+    /// Create a task with a caller-supplied ID (e.g. an agent ID) so that
+    /// external subsystems can look it up by the same identifier.
+    pub fn create_with_id(&self, task_id: String, prompt: &str, description: Option<&str>) -> Task {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let ts = now_secs();
+        let task = Task {
+            task_id: task_id.clone(),
+            prompt: prompt.to_owned(),
+            description: description.map(str::to_owned),
+            task_packet: None,
+            status: TaskStatus::Created,
+            created_at: ts,
+            updated_at: ts,
+            messages: Vec::new(),
+            output: String::new(),
+            team_id: None,
+        };
+        inner.tasks.insert(task_id, task.clone());
+        task
+    }
+
     pub fn create_from_packet(
         &self,
         packet: TaskPacket,

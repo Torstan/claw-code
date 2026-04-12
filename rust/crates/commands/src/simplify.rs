@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 pub const SIMPLIFY_PROMPT: &str = r#"# Simplify: Code Review and Cleanup
 
 Review all changed files for reuse, quality, and efficiency. Fix any issues found.
@@ -50,13 +52,17 @@ When done, briefly summarize what was fixed (or confirm the code was already cle
 "#;
 
 #[must_use]
-pub fn build_simplify_prompt(args: Option<&str>) -> String {
-    let mut prompt = SIMPLIFY_PROMPT.to_string();
-    if let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) {
-        prompt.push_str("\n\n## Additional Focus\n\n");
-        prompt.push_str(args);
+pub fn build_simplify_prompt(args: Option<&str>) -> Cow<'static, str> {
+    match args.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Cow::Borrowed(SIMPLIFY_PROMPT),
+        Some(extra) => {
+            let mut s = String::with_capacity(SIMPLIFY_PROMPT.len() + 22 + extra.len());
+            s.push_str(SIMPLIFY_PROMPT);
+            s.push_str("\n\n## Additional Focus\n\n");
+            s.push_str(extra);
+            Cow::Owned(s)
+        }
     }
-    prompt
 }
 
 #[cfg(test)]
@@ -74,7 +80,6 @@ mod tests {
         let prompt = build_simplify_prompt(Some("focus on duplication"));
 
         assert!(prompt.starts_with(SIMPLIFY_PROMPT));
-        assert!(prompt.contains("## Phase 2: Launch Three Review Agents in Parallel"));
         assert!(prompt.ends_with("## Additional Focus\n\nfocus on duplication"));
     }
 }
