@@ -2,7 +2,8 @@
 //! In-memory task registry for sub-agent task lifecycle management.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,13 @@ pub struct TaskMessage {
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskRegistry {
-    inner: Arc<Mutex<RegistryInner>>,
+    state: Arc<RegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    inner: Mutex<RegistryInner>,
+    changed: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +90,11 @@ impl TaskRegistry {
     /// Create a task with a caller-supplied ID (e.g. an agent ID) so that
     /// external subsystems can look it up by the same identifier.
     pub fn create_with_id(&self, task_id: String, prompt: &str, description: Option<&str>) -> Task {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ts = now_secs();
         let task = Task {
             task_id: task_id.clone(),
@@ -119,7 +130,11 @@ impl TaskRegistry {
         description: Option<String>,
         task_packet: Option<TaskPacket>,
     ) -> Task {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.counter += 1;
         let ts = now_secs();
         let task_id = format!("task_{:08x}_{}", ts, inner.counter);
@@ -140,12 +155,20 @@ impl TaskRegistry {
     }
 
     pub fn get(&self, task_id: &str) -> Option<Task> {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.tasks.get(task_id).cloned()
     }
 
     pub fn list(&self, status_filter: Option<TaskStatus>) -> Vec<Task> {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .tasks
             .values()
@@ -155,7 +178,11 @@ impl TaskRegistry {
     }
 
     pub fn stop(&self, task_id: &str) -> Result<Task, String> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get_mut(task_id)
@@ -173,11 +200,16 @@ impl TaskRegistry {
 
         task.status = TaskStatus::Stopped;
         task.updated_at = now_secs();
+        self.state.changed.notify_all();
         Ok(task.clone())
     }
 
     pub fn update(&self, task_id: &str, message: &str) -> Result<Task, String> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get_mut(task_id)
@@ -193,7 +225,11 @@ impl TaskRegistry {
     }
 
     pub fn output(&self, task_id: &str) -> Result<String, String> {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get(task_id)
@@ -202,7 +238,11 @@ impl TaskRegistry {
     }
 
     pub fn append_output(&self, task_id: &str, output: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get_mut(task_id)
@@ -213,18 +253,27 @@ impl TaskRegistry {
     }
 
     pub fn set_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.status = status;
         task.updated_at = now_secs();
+        self.state.changed.notify_all();
         Ok(())
     }
 
     pub fn assign_team(&self, task_id: &str, team_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
             .get_mut(task_id)
@@ -234,14 +283,69 @@ impl TaskRegistry {
         Ok(())
     }
 
+    pub fn wait_for_terminal(&self, task_id: &str, timeout: Duration) -> Result<Task, String> {
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = std::time::Instant::now();
+
+        loop {
+            let task = inner
+                .tasks
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| format!("task not found: {task_id}"))?;
+
+            if !matches!(task.status, TaskStatus::Created | TaskStatus::Running) {
+                return Ok(task);
+            }
+
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                return Ok(task);
+            };
+            if remaining.is_zero() {
+                return Ok(task);
+            }
+
+            let (next_inner, wait_result) = self
+                .state
+                .changed
+                .wait_timeout(inner, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner = next_inner;
+            if wait_result.timed_out() {
+                let task = inner
+                    .tasks
+                    .get(task_id)
+                    .cloned()
+                    .ok_or_else(|| format!("task not found: {task_id}"))?;
+                return Ok(task);
+            }
+        }
+    }
+
     pub fn remove(&self, task_id: &str) -> Option<Task> {
-        let mut inner = self.inner.lock().expect("registry lock poisoned");
-        inner.tasks.remove(task_id)
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = inner.tasks.remove(task_id);
+        if removed.is_some() {
+            self.state.changed.notify_all();
+        }
+        removed
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.tasks.len()
     }
 
@@ -254,6 +358,8 @@ impl TaskRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn creates_and_retrieves_tasks() {
@@ -372,6 +478,47 @@ mod tests {
         assert!(removed.is_some());
         assert!(registry.get(&task.task_id).is_none());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn waits_for_terminal_state_changes() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("Long-running task", None);
+        registry
+            .set_status(&task.task_id, TaskStatus::Running)
+            .expect("set status should succeed");
+
+        let registry_for_thread = registry.clone();
+        let task_id = task.task_id.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            registry_for_thread
+                .append_output(&task_id, "done")
+                .expect("append should succeed");
+            registry_for_thread
+                .set_status(&task_id, TaskStatus::Completed)
+                .expect("set status should succeed");
+        });
+
+        let completed = registry
+            .wait_for_terminal(&task.task_id, Duration::from_millis(500))
+            .expect("wait should succeed");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.output, "done");
+    }
+
+    #[test]
+    fn wait_for_terminal_returns_latest_running_state_on_timeout() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("Still running", None);
+        registry
+            .set_status(&task.task_id, TaskStatus::Running)
+            .expect("set status should succeed");
+
+        let waited = registry
+            .wait_for_terminal(&task.task_id, Duration::from_millis(10))
+            .expect("wait should succeed");
+        assert_eq!(waited.status, TaskStatus::Running);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -57,6 +58,24 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn execute_many(&mut self, invocations: &[ToolInvocation]) -> Vec<Result<String, ToolError>> {
+        invocations
+            .iter()
+            .map(|invocation| self.execute(&invocation.tool_name, &invocation.input))
+            .collect()
+    }
+
+    fn supports_parallel_execution(&self, _tool_name: &str) -> bool {
+        false
+    }
+}
+
+/// One tool call prepared for executor dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocation {
+    pub tool_name: String,
+    pub input: String,
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -136,6 +155,20 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedToolUse {
+    tool_use_id: String,
+    tool_name: String,
+    effective_input: String,
+    pre_hook_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolDispatch {
+    Immediate(ConversationMessage),
+    Ready(PreparedToolUse),
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -296,13 +329,31 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let user_input = user_input.into();
+        self.run_turn_with_messages(
+            user_input.clone(),
+            vec![ConversationMessage::user_text(user_input)],
+            prompter,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_messages(
+        &mut self,
+        user_input: impl Into<String>,
+        initial_messages: Vec<ConversationMessage>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
-        self.session
-            .push_user_text(user_input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        self.inject_pending_session_notifications()?;
+        for message in initial_messages {
+            self.session
+                .push_message(message)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -318,6 +369,8 @@ where
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
+
+            self.inject_pending_session_notifications()?;
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -367,106 +420,16 @@ where
                 break;
             }
 
+            let mut planned_dispatches = Vec::new();
             for (tool_use_id, tool_name, input) in pending_tool_uses {
-                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
-                let effective_input = pre_hook_result
-                    .updated_input()
-                    .map_or_else(|| input.clone(), ToOwned::to_owned);
-                let permission_context = PermissionContext::new(
-                    pre_hook_result.permission_override(),
-                    pre_hook_result.permission_reason().map(ToOwned::to_owned),
-                );
-
-                let permission_outcome = if pre_hook_result.is_cancelled() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_failed() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_denied() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook denied tool `{tool_name}`"),
-                        ),
-                    }
-                } else if let Some(prompt) = prompter.as_mut() {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        Some(*prompt),
-                    )
-                } else {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        None,
-                    )
-                };
-
-                let result_message = match permission_outcome {
-                    PermissionOutcome::Allow => {
-                        self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
-                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                        let post_hook_result = if is_error {
-                            self.run_post_tool_use_failure_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                            )
-                        } else {
-                            self.run_post_tool_use_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                                false,
-                            )
-                        };
-                        if post_hook_result.is_denied()
-                            || post_hook_result.is_failed()
-                            || post_hook_result.is_cancelled()
-                        {
-                            is_error = true;
-                        }
-                        output = merge_hook_feedback(
-                            post_hook_result.messages(),
-                            output,
-                            post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled(),
-                        );
-
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
-                    }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                        true,
-                    ),
-                };
-                self.session
-                    .push_message(result_message.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_tool_finished(iterations, &result_message);
-                tool_results.push(result_message);
+                planned_dispatches.push(self.plan_tool_dispatch(
+                    tool_use_id,
+                    tool_name,
+                    input,
+                    &mut prompter,
+                ));
             }
+            self.dispatch_tool_plan(iterations, planned_dispatches, &mut tool_results)?;
         }
 
         let auto_compaction = self.maybe_auto_compact();
@@ -520,6 +483,239 @@ where
     #[must_use]
     pub fn into_session(self) -> Session {
         self.session
+    }
+
+    fn inject_pending_session_notifications(&mut self) -> Result<(), RuntimeError> {
+        for message in drain_session_notifications(&self.session.session_id) {
+            self.session
+                .push_message(ConversationMessage::user_text(message))
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn plan_tool_dispatch(
+        &mut self,
+        tool_use_id: String,
+        tool_name: String,
+        input: String,
+        prompter: &mut Option<&mut dyn PermissionPrompter>,
+    ) -> ToolDispatch {
+        let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+        let effective_input = pre_hook_result
+            .updated_input()
+            .map_or_else(|| input.clone(), ToOwned::to_owned);
+        let permission_context = PermissionContext::new(
+            pre_hook_result.permission_override(),
+            pre_hook_result.permission_reason().map(ToOwned::to_owned),
+        );
+
+        let permission_outcome = if pre_hook_result.is_cancelled() {
+            PermissionOutcome::Deny {
+                reason: format_hook_message(
+                    &pre_hook_result,
+                    &format!("PreToolUse hook cancelled tool `{tool_name}`"),
+                ),
+            }
+        } else if pre_hook_result.is_failed() {
+            PermissionOutcome::Deny {
+                reason: format_hook_message(
+                    &pre_hook_result,
+                    &format!("PreToolUse hook failed for tool `{tool_name}`"),
+                ),
+            }
+        } else if pre_hook_result.is_denied() {
+            PermissionOutcome::Deny {
+                reason: format_hook_message(
+                    &pre_hook_result,
+                    &format!("PreToolUse hook denied tool `{tool_name}`"),
+                ),
+            }
+        } else if let Some(prompt) = prompter.as_deref_mut() {
+            self.permission_policy.authorize_with_context(
+                &tool_name,
+                &effective_input,
+                &permission_context,
+                Some(prompt),
+            )
+        } else {
+            self.permission_policy.authorize_with_context(
+                &tool_name,
+                &effective_input,
+                &permission_context,
+                None,
+            )
+        };
+
+        match permission_outcome {
+            PermissionOutcome::Allow => ToolDispatch::Ready(PreparedToolUse {
+                tool_use_id,
+                tool_name,
+                effective_input,
+                pre_hook_messages: pre_hook_result.messages().to_vec(),
+            }),
+            PermissionOutcome::Deny { reason } => {
+                ToolDispatch::Immediate(ConversationMessage::tool_result(
+                    tool_use_id,
+                    tool_name,
+                    merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                    true,
+                ))
+            }
+        }
+    }
+
+    fn dispatch_tool_plan(
+        &mut self,
+        iteration: usize,
+        planned_dispatches: Vec<ToolDispatch>,
+        tool_results: &mut Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        let mut dispatches = std::collections::VecDeque::from(planned_dispatches);
+
+        while let Some(dispatch) = dispatches.pop_front() {
+            match dispatch {
+                ToolDispatch::Immediate(message) => {
+                    self.push_tool_result_message(iteration, message, tool_results)?
+                }
+                ToolDispatch::Ready(prepared) => {
+                    if self
+                        .tool_executor
+                        .supports_parallel_execution(&prepared.tool_name)
+                    {
+                        let mut batch = vec![prepared];
+                        while dispatches.front().is_some_and(|next| match next {
+                            ToolDispatch::Ready(next_prepared) => self
+                                .tool_executor
+                                .supports_parallel_execution(&next_prepared.tool_name),
+                            ToolDispatch::Immediate(_) => false,
+                        }) {
+                            let ToolDispatch::Ready(next_prepared) = dispatches
+                                .pop_front()
+                                .expect("front item should still be present")
+                            else {
+                                unreachable!("front readiness already checked");
+                            };
+                            batch.push(next_prepared);
+                        }
+
+                        if batch.len() > 1 {
+                            self.execute_prepared_batch(iteration, batch, tool_results)?;
+                        } else {
+                            self.execute_prepared_tool(
+                                iteration,
+                                batch.pop().expect("single-item batch"),
+                                tool_results,
+                            )?;
+                        }
+                    } else {
+                        self.execute_prepared_tool(iteration, prepared, tool_results)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_prepared_batch(
+        &mut self,
+        iteration: usize,
+        batch: Vec<PreparedToolUse>,
+        tool_results: &mut Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        for prepared in &batch {
+            self.record_tool_started(iteration, &prepared.tool_name);
+        }
+
+        let invocations = batch
+            .iter()
+            .map(|prepared| ToolInvocation {
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+            })
+            .collect::<Vec<_>>();
+        let results = with_active_tool_session(Some(self.session.session_id.as_str()), || {
+            self.tool_executor.execute_many(&invocations)
+        });
+
+        for (prepared, result) in batch.into_iter().zip(results) {
+            let result_message = self.finalize_prepared_tool_result(prepared, result);
+            self.push_tool_result_message(iteration, result_message, tool_results)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_prepared_tool(
+        &mut self,
+        iteration: usize,
+        prepared: PreparedToolUse,
+        tool_results: &mut Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        self.record_tool_started(iteration, &prepared.tool_name);
+        let result = with_active_tool_session(Some(self.session.session_id.as_str()), || {
+            self.tool_executor
+                .execute(&prepared.tool_name, &prepared.effective_input)
+        });
+        let result_message = self.finalize_prepared_tool_result(prepared, result);
+        self.push_tool_result_message(iteration, result_message, tool_results)
+    }
+
+    fn finalize_prepared_tool_result(
+        &mut self,
+        prepared: PreparedToolUse,
+        result: Result<String, ToolError>,
+    ) -> ConversationMessage {
+        let (mut output, mut is_error) = match result {
+            Ok(output) => (output, false),
+            Err(error) => (error.to_string(), true),
+        };
+        output = merge_hook_feedback(&prepared.pre_hook_messages, output, false);
+
+        let post_hook_result = if is_error {
+            self.run_post_tool_use_failure_hook(
+                &prepared.tool_name,
+                &prepared.effective_input,
+                &output,
+            )
+        } else {
+            self.run_post_tool_use_hook(
+                &prepared.tool_name,
+                &prepared.effective_input,
+                &output,
+                false,
+            )
+        };
+        if post_hook_result.is_denied()
+            || post_hook_result.is_failed()
+            || post_hook_result.is_cancelled()
+        {
+            is_error = true;
+        }
+        output = merge_hook_feedback(
+            post_hook_result.messages(),
+            output,
+            post_hook_result.is_denied()
+                || post_hook_result.is_failed()
+                || post_hook_result.is_cancelled(),
+        );
+
+        ConversationMessage::tool_result(prepared.tool_use_id, prepared.tool_name, output, is_error)
+    }
+
+    fn push_tool_result_message(
+        &mut self,
+        iteration: usize,
+        result_message: ConversationMessage,
+        tool_results: &mut Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        self.session
+            .push_message(result_message.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        self.record_tool_finished(iteration, &result_message);
+        tool_results.push(result_message);
+        Ok(())
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -794,7 +990,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, ToolExecutor, ToolInvocation,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -804,11 +1001,12 @@ mod tests {
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -869,6 +1067,39 @@ mod tests {
                 }
                 _ => unreachable!("extra API call"),
             }
+        }
+    }
+
+    struct BatchAwareToolExecutor {
+        batched: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ToolExecutor for BatchAwareToolExecutor {
+        fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+            Ok(format!("{tool_name}:{input}"))
+        }
+
+        fn execute_many(
+            &mut self,
+            invocations: &[ToolInvocation],
+        ) -> Vec<Result<String, ToolError>> {
+            self.batched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    invocations
+                        .iter()
+                        .map(|invocation| invocation.tool_name.clone())
+                        .collect(),
+                );
+            invocations
+                .iter()
+                .map(|invocation| Ok(format!("{}:{}", invocation.tool_name, invocation.input)))
+                .collect()
+        }
+
+        fn supports_parallel_execution(&self, tool_name: &str) -> bool {
+            tool_name == "Agent"
         }
     }
 
@@ -933,6 +1164,221 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn batches_parallel_safe_tool_calls_in_one_iteration() {
+        struct ParallelApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for ParallelApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "Agent".to_string(),
+                            input: r#"{"prompt":"one"}"#.to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "Agent".to_string(),
+                            input: r#"{"prompt":"two"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let tool_messages = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == MessageRole::Tool)
+                            .collect::<Vec<_>>();
+                        assert_eq!(tool_messages.len(), 2);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let batched = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let tool_executor = BatchAwareToolExecutor {
+            batched: Arc::clone(&batched),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ParallelApiClient { calls: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("launch both", None)
+            .expect("parallel batch should succeed");
+
+        assert_eq!(summary.tool_results.len(), 2);
+        assert_eq!(
+            batched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[vec!["Agent".to_string(), "Agent".to_string()]]
+        );
+    }
+
+    #[test]
+    fn injects_pending_session_notifications_before_first_request() {
+        struct NotificationAwareApiClient;
+
+        impl ApiClient for NotificationAwareApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(request.messages.len(), 2);
+                assert_eq!(request.messages[0].role, MessageRole::User);
+                assert_eq!(request.messages[1].role, MessageRole::User);
+                let ContentBlock::Text { text } = &request.messages[0].blocks[0] else {
+                    panic!("expected notification text block");
+                };
+                assert!(text.contains("Background agent finished."));
+                Ok(vec![
+                    AssistantEvent::TextDelta("acknowledged".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.session_id = "notif-start".to_string();
+        enqueue_session_notification("notif-start", "Background agent finished.");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            NotificationAwareApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("hello", None)
+            .expect("notification injection should succeed");
+    }
+
+    #[test]
+    fn starts_turn_from_prebuilt_messages() {
+        struct PrebuiltMessageApiClient;
+
+        impl ApiClient for PrebuiltMessageApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(request.messages.len(), 2);
+                assert_eq!(request.messages[0].role, MessageRole::User);
+                assert_eq!(request.messages[1].role, MessageRole::User);
+
+                let ContentBlock::Text { text: metadata } = &request.messages[0].blocks[0] else {
+                    panic!("expected slash command metadata");
+                };
+                assert_eq!(
+                    metadata,
+                    "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>"
+                );
+
+                let ContentBlock::Text { text: prompt } = &request.messages[1].blocks[0] else {
+                    panic!("expected slash command prompt");
+                };
+                assert_eq!(prompt, "# Simplify");
+
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PrebuiltMessageApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn_with_messages(
+                "/simplify",
+                vec![
+                    crate::session::ConversationMessage::user_text(
+                        "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>",
+                    ),
+                    crate::session::ConversationMessage::user_text("# Simplify"),
+                ],
+                None,
+            )
+            .expect("prebuilt message turn should succeed");
+
+        assert_eq!(runtime.session().messages.len(), 3);
+    }
+
+    #[test]
+    fn injects_notifications_between_tool_iterations() {
+        struct TwoStepApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoStepApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "notify".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let last_message = request.messages.last().expect("notification present");
+                        assert_eq!(last_message.role, MessageRole::User);
+                        let ContentBlock::Text { text } = &last_message.blocks[0] else {
+                            panic!("expected notification text block");
+                        };
+                        assert!(text.contains("async review done"));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut session = Session::new();
+        session.session_id = "notif-iter".to_string();
+        let executor = StaticToolExecutor::new().register("notify", |_input| {
+            let session_id = active_tool_session_id()
+                .expect("tool execution should have active session context");
+            enqueue_session_notification(session_id, "async review done");
+            Ok("launched".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TwoStepApiClient { calls: 0 },
+            executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("launch notification", None)
+            .expect("notification loop should succeed");
+
+        assert_eq!(summary.iterations, 2);
     }
 
     #[test]
