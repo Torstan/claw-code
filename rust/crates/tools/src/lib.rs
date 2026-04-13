@@ -577,7 +577,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a specialized agent task and persist its handoff metadata. For independent work, you may launch multiple Agent calls in the same assistant message. After launching background agents, briefly tell the user what you launched and end your response. Do not predict agent results; they arrive later as notifications.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -855,7 +855,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "task_id": { "type": "string" },
                     "block": { "type": "boolean" },
-                    "timeout": { "type": "integer", "minimum": 0 }
+                    "timeout_ms": { "type": "integer", "minimum": 0 }
                 },
                 "required": ["task_id"],
                 "additionalProperties": false
@@ -1185,6 +1185,15 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+pub fn render_tool_result_for_model(tool_name: &str, output: &str) -> String {
+    if tool_name == "Agent" {
+        if let Some(rendered) = render_async_agent_launch_for_model(output) {
+            return rendered;
+        }
+    }
+    output.to_string()
+}
+
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
@@ -1447,12 +1456,12 @@ fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
         "task_output.begin",
         format!(
             "task_id={} block={} timeout_ms={}",
-            input.task_id, input.block, input.timeout
+            input.task_id, input.block, input.timeout_ms
         ),
     );
     let task = if input.block {
         registry
-            .wait_for_terminal(&input.task_id, Duration::from_millis(input.timeout))
+            .wait_for_terminal(&input.task_id, Duration::from_millis(input.timeout_ms))
             .map_err(|error| error.to_string())?
     } else {
         registry
@@ -2074,6 +2083,37 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
     to_pretty_json(execute_agent(input)?)
 }
 
+fn render_async_agent_launch_for_model(output: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(output).ok()?;
+    if parsed.get("status")?.as_str()? != "async_launched" {
+        return None;
+    }
+
+    let agent_id = parsed
+        .get("agentId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let output_file = parsed.get("outputFile").and_then(Value::as_str);
+
+    let mut lines = vec![
+        String::from("Async agent launched successfully."),
+        format!("agentId: {agent_id} (internal ID - do not mention to the user.)"),
+        String::from(
+            "The agent is working in the background. You will be notified automatically when it completes.",
+        ),
+        String::from(
+            "Do not duplicate this agent's work. Briefly tell the user what you launched and end your response. Do not generate any other text - agent results will arrive in a subsequent message.",
+        ),
+    ];
+    if let Some(path) = output_file {
+        lines.push(format!("output_file: {path}"));
+        lines.push(String::from(
+            "If asked, you can check progress before completion with TaskOutput or by reading the output file.",
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
@@ -2314,8 +2354,8 @@ struct TaskOutputInput {
     task_id: String,
     #[serde(default = "default_task_output_block")]
     block: bool,
-    #[serde(default = "default_task_output_timeout_ms")]
-    timeout: u64,
+    #[serde(default = "default_task_output_timeout_ms", alias = "timeout")]
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4528,13 +4568,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
-                        ..
                     } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
+                            text: render_tool_result_for_model(tool_name, output),
                         }],
                         is_error: *is_error,
                     },
@@ -5900,9 +5940,10 @@ mod tests {
         derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
         execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
-        AgentInput, AgentJob, AgentToolOutput, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor, TaskOutputInput,
+        persist_agent_terminal_state, push_output_block, render_tool_result_for_model,
+        run_task_output, run_task_packet, AgentInput, AgentJob, AgentToolOutput,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor, TaskOutputInput,
     };
     use api::{AuthSource, OutputContentBlock, ProviderClient};
     use runtime::ProviderFallbackConfig;
@@ -5990,6 +6031,34 @@ mod tests {
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
         assert!(names.contains(&"WorkerSendPrompt"));
+    }
+
+    #[test]
+    fn render_tool_result_for_model_formats_async_agent_launches() {
+        let rendered = render_tool_result_for_model(
+            "Agent",
+            r#"{
+  "status": "async_launched",
+  "agentId": "agent-123",
+  "description": "Review the diff",
+  "prompt": "Check reuse issues",
+  "outputFile": "/tmp/agent-123.md"
+}"#,
+        );
+
+        assert!(rendered.contains("Async agent launched successfully."));
+        assert!(rendered.contains("agentId: agent-123"));
+        assert!(rendered.contains("Briefly tell the user what you launched and end your response."));
+        assert!(rendered.contains("output_file: /tmp/agent-123.md"));
+        assert!(!rendered.contains("\"status\": \"async_launched\""));
+        assert!(!rendered.contains("Check reuse issues"));
+    }
+
+    #[test]
+    fn render_tool_result_for_model_preserves_non_async_outputs() {
+        let raw = r#"{"status":"completed","agentId":"agent-123"}"#;
+        assert_eq!(render_tool_result_for_model("Agent", raw), raw);
+        assert_eq!(render_tool_result_for_model("bash", raw), raw);
     }
 
     #[test]
@@ -7879,7 +7948,7 @@ mod tests {
         let not_ready = run_task_output(TaskOutputInput {
             task_id: running.task_id.clone(),
             block: false,
-            timeout: 30_000,
+            timeout_ms: 30_000,
         })
         .expect("non-blocking task output should succeed");
         let not_ready_json: serde_json::Value =
@@ -7910,7 +7979,7 @@ mod tests {
         let success = run_task_output(TaskOutputInput {
             task_id: completed.task_id.clone(),
             block: true,
-            timeout: 500,
+            timeout_ms: 500,
         })
         .expect("blocking task output should succeed");
         let success_json: serde_json::Value = serde_json::from_str(&success).expect("json output");
@@ -7934,7 +8003,7 @@ mod tests {
         let timeout = run_task_output(TaskOutputInput {
             task_id: task.task_id.clone(),
             block: true,
-            timeout: 10,
+            timeout_ms: 10,
         })
         .expect("blocking task output should succeed");
         let timeout_json: serde_json::Value = serde_json::from_str(&timeout).expect("json output");
@@ -7942,6 +8011,25 @@ mod tests {
         assert_eq!(timeout_json["task"]["status"], "running");
 
         registry.remove(&task.task_id);
+    }
+
+    #[test]
+    fn task_output_input_uses_timeout_ms_and_accepts_legacy_timeout_alias() {
+        let input: TaskOutputInput = serde_json::from_value(json!({
+            "task_id": "agent-1",
+            "block": true,
+            "timeout_ms": 120_000
+        }))
+        .expect("timeout_ms field should deserialize");
+        assert_eq!(input.timeout_ms, 120_000);
+
+        let legacy_input: TaskOutputInput = serde_json::from_value(json!({
+            "task_id": "agent-1",
+            "block": true,
+            "timeout": 120_000
+        }))
+        .expect("legacy timeout alias should deserialize");
+        assert_eq!(legacy_input.timeout_ms, 120_000);
     }
 
     #[test]

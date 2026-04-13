@@ -90,26 +90,12 @@ impl TaskRegistry {
     /// Create a task with a caller-supplied ID (e.g. an agent ID) so that
     /// external subsystems can look it up by the same identifier.
     pub fn create_with_id(&self, task_id: String, prompt: &str, description: Option<&str>) -> Task {
-        let mut inner = self
-            .state
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ts = now_secs();
-        let task = Task {
-            task_id: task_id.clone(),
-            prompt: prompt.to_owned(),
-            description: description.map(str::to_owned),
-            task_packet: None,
-            status: TaskStatus::Created,
-            created_at: ts,
-            updated_at: ts,
-            messages: Vec::new(),
-            output: String::new(),
-            team_id: None,
-        };
-        inner.tasks.insert(task_id, task.clone());
-        task
+        self.insert_task(
+            task_id,
+            prompt.to_owned(),
+            description.map(str::to_owned),
+            None,
+        )
     }
 
     pub fn create_from_packet(
@@ -130,14 +116,32 @@ impl TaskRegistry {
         description: Option<String>,
         task_packet: Option<TaskPacket>,
     ) -> Task {
+        let task_id = {
+            let mut inner = self
+                .state
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.counter += 1;
+            let ts = now_secs();
+            format!("task_{:08x}_{}", ts, inner.counter)
+        };
+        self.insert_task(task_id, prompt, description, task_packet)
+    }
+
+    fn insert_task(
+        &self,
+        task_id: String,
+        prompt: String,
+        description: Option<String>,
+        task_packet: Option<TaskPacket>,
+    ) -> Task {
         let mut inner = self
             .state
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.counter += 1;
         let ts = now_secs();
-        let task_id = format!("task_{:08x}_{}", ts, inner.counter);
         let task = Task {
             task_id: task_id.clone(),
             prompt,
