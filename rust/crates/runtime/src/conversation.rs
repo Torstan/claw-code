@@ -1958,6 +1958,49 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_session_memory_sidecar_after_successful_turn() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let path = temp_session_path("memory-after-turn");
+        let session = Session::new().with_persistence_path(path.clone());
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("refresh memory", None)
+            .expect("turn should succeed");
+
+        let memory_path = session_memory_path(runtime.session())
+            .expect("persisted session should derive a memory sidecar path");
+        let contents =
+            fs::read_to_string(&memory_path).expect("session memory sidecar should be readable");
+
+        assert!(contents.contains("# Goals"));
+        assert!(contents.contains("# Recent prompts"));
+        assert!(contents.contains("refresh memory"));
+        assert!(contents.contains("done"));
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&memory_path).ok();
+    }
+
+    #[test]
     fn forks_runtime_session_without_mutating_original() {
         let mut session = Session::new();
         session
