@@ -1,3 +1,0 @@
-{"created_at_ms":1776052111123,"model":"claude-opus-4-6","session_id":"session-1776052111123-0","type":"session_meta","updated_at_ms":1776052111123,"version":1}
-{"text":"quit","timestamp_ms":1776052196303,"type":"prompt_history"}
-{"message":{"blocks":[{"text":"quit","type":"text"}],"role":"user"},"type":"message"}
