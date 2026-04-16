@@ -37,6 +37,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+mod session_memory_compact;
 mod session_notifications;
 pub use session_control::SessionStore;
 pub use session_notifications::{
@@ -157,6 +158,7 @@ pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork, SessionPromptEntry,
 };
+pub use session_memory_compact::compact_session_with_memory;
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_claw_base_file, resolve_expected_base,

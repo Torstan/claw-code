@@ -9,10 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
 
-const SESSION_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 2;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,23 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    pub message_id: String,
+    pub timestamp_ms: u64,
+    pub compaction_meta: Option<CompactionMarker>,
+}
+
+/// Synthetic metadata attached to compact-related system markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionMarker {
+    pub kind: CompactionMarkerKind,
+}
+
+/// Distinguishes the synthetic system markers introduced by compaction stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionMarkerKind {
+    CompactBoundary,
+    MicrocompactBoundary,
+    SnipBoundary,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -335,13 +353,6 @@ impl Session {
             .ok_or_else(|| SessionError::Format("missing version".to_string()))?;
         let version = u32::try_from(version)
             .map_err(|_| SessionError::Format("version out of range".to_string()))?;
-        let messages = object
-            .get("messages")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| SessionError::Format("missing messages".to_string()))?
-            .iter()
-            .map(ConversationMessage::from_json)
-            .collect::<Result<Vec<_>, _>>()?;
         let now = current_time_millis();
         let session_id = object
             .get("session_id")
@@ -357,6 +368,15 @@ impl Session {
             .map(|value| required_u64_from_value(value, "updated_at_ms"))
             .transpose()?
             .unwrap_or(created_at_ms);
+        let messages = object
+            .get("messages")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| SessionError::Format("missing messages".to_string()))?
+            .iter()
+            .map(|message| {
+                ConversationMessage::from_json_with_fallback_timestamp(message, updated_at_ms)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let compaction = object
             .get("compaction")
             .map(SessionCompaction::from_json)
@@ -400,7 +420,7 @@ impl Session {
         let mut session_id = None;
         let mut created_at_ms = None;
         let mut updated_at_ms = None;
-        let mut messages = Vec::new();
+        let mut raw_messages = Vec::new();
         let mut compaction = None;
         let mut fork = None;
         let mut workspace_root = None;
@@ -456,7 +476,7 @@ impl Session {
                             line_number + 1
                         ))
                     })?;
-                    messages.push(ConversationMessage::from_json(message_value)?);
+                    raw_messages.push(message_value.clone());
                 }
                 "compaction" => {
                     compaction = Some(SessionCompaction::from_json(&JsonValue::Object(
@@ -480,11 +500,19 @@ impl Session {
         }
 
         let now = current_time_millis();
+        let created_at_ms = created_at_ms.unwrap_or(now);
+        let updated_at_ms = updated_at_ms.unwrap_or(created_at_ms);
+        let messages = raw_messages
+            .iter()
+            .map(|message| {
+                ConversationMessage::from_json_with_fallback_timestamp(message, updated_at_ms)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             version,
             session_id: session_id.unwrap_or_else(generate_session_id),
-            created_at_ms: created_at_ms.unwrap_or(now),
-            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
+            created_at_ms,
+            updated_at_ms,
             messages,
             compaction,
             fork,
@@ -614,31 +642,50 @@ impl Default for Session {
 }
 
 impl ConversationMessage {
+    fn new(
+        role: MessageRole,
+        blocks: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+        compaction_meta: Option<CompactionMarker>,
+    ) -> Self {
+        Self {
+            role,
+            blocks,
+            usage,
+            message_id: generate_message_id(),
+            timestamp_ms: current_time_millis(),
+            compaction_meta,
+        }
+    }
+
     #[must_use]
     pub fn user_text(text: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text { text: text.into() }],
-            usage: None,
-        }
+        Self::new(
+            MessageRole::User,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+        )
     }
 
     #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            blocks,
-            usage: None,
-        }
+        Self::new(MessageRole::Assistant, blocks, None, None)
     }
 
     #[must_use]
     pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            blocks,
-            usage,
-        }
+        Self::new(MessageRole::Assistant, blocks, usage, None)
     }
 
     #[must_use]
@@ -648,16 +695,23 @@ impl ConversationMessage {
         output: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
+        Self::new(
+            MessageRole::Tool,
+            vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
                 output: output.into(),
                 is_error,
             }],
-            usage: None,
-        }
+            None,
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn with_compaction_marker(mut self, kind: CompactionMarkerKind) -> Self {
+        self.compaction_meta = Some(CompactionMarker { kind });
+        self
     }
 
     #[must_use]
@@ -679,13 +733,27 @@ impl ConversationMessage {
             "blocks".to_string(),
             JsonValue::Array(self.blocks.iter().map(ContentBlock::to_json).collect()),
         );
+        object.insert(
+            "message_id".to_string(),
+            JsonValue::String(self.message_id.clone()),
+        );
+        object.insert(
+            "timestamp_ms".to_string(),
+            JsonValue::Number(i64::try_from(self.timestamp_ms).unwrap_or(i64::MAX)),
+        );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        if let Some(compaction_meta) = &self.compaction_meta {
+            object.insert("compaction_meta".to_string(), compaction_meta.to_json());
         }
         JsonValue::Object(object)
     }
 
-    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+    fn from_json_with_fallback_timestamp(
+        value: &JsonValue,
+        fallback_timestamp_ms: u64,
+    ) -> Result<Self, SessionError> {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("message must be an object".to_string()))?;
@@ -712,11 +780,75 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let message_id = object
+            .get("message_id")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(generate_message_id);
+        let timestamp_ms = object
+            .get("timestamp_ms")
+            .map(|value| required_u64_from_value(value, "timestamp_ms"))
+            .transpose()?
+            .unwrap_or(fallback_timestamp_ms);
+        let compaction_meta = object
+            .get("compaction_meta")
+            .map(CompactionMarker::from_json)
+            .transpose()?;
         Ok(Self {
             role,
             blocks,
             usage,
+            message_id,
+            timestamp_ms,
+            compaction_meta,
         })
+    }
+}
+
+impl CompactionMarker {
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "kind".to_string(),
+            JsonValue::String(self.kind.as_str().to_string()),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| SessionError::Format("compaction_meta must be an object".to_string()))?;
+        let kind = object
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| SessionError::Format("missing compaction_meta.kind".to_string()))?;
+        Ok(Self {
+            kind: CompactionMarkerKind::from_str(kind)?,
+        })
+    }
+}
+
+impl CompactionMarkerKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CompactBoundary => "compact_boundary",
+            Self::MicrocompactBoundary => "microcompact_boundary",
+            Self::SnipBoundary => "snip_boundary",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, SessionError> {
+        match value {
+            "compact_boundary" => Ok(Self::CompactBoundary),
+            "microcompact_boundary" => Ok(Self::MicrocompactBoundary),
+            "snip_boundary" => Ok(Self::SnipBoundary),
+            other => Err(SessionError::Format(format!(
+                "unsupported compaction_meta.kind: {other}"
+            ))),
+        }
     }
 }
 
@@ -1035,6 +1167,12 @@ fn generate_session_id() -> String {
     format!("session-{millis}-{counter}")
 }
 
+fn generate_message_id() -> String {
+    let millis = current_time_millis();
+    let counter = MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("msg-{millis}-{counter}")
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1174,6 +1312,122 @@ mod tests {
     }
 
     #[test]
+    fn conversation_message_defaults_include_message_id_and_timestamp() {
+        let message = ConversationMessage::user_text("hello");
+
+        assert_eq!(message.role, MessageRole::User);
+        assert!(!message.message_id.is_empty());
+        assert!(message.timestamp_ms > 0);
+        assert_eq!(message.compaction_meta, None);
+    }
+
+    #[test]
+    fn persists_message_metadata_in_json_round_trip() {
+        let mut session = Session::new();
+        let mut message = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "metadata survives".to_string(),
+        }]);
+        message.compaction_meta = Some(super::CompactionMarker {
+            kind: super::CompactionMarkerKind::MicrocompactBoundary,
+        });
+        let expected_message_id = message.message_id.clone();
+        let expected_timestamp_ms = message.timestamp_ms;
+        session
+            .push_message(message)
+            .expect("message should append");
+
+        let encoded = session.to_json().expect("session should encode");
+        let decoded = Session::from_json(&encoded).expect("session should decode");
+        let restored = &decoded.messages[0];
+
+        assert_eq!(restored.message_id, expected_message_id);
+        assert_eq!(restored.timestamp_ms, expected_timestamp_ms);
+        assert_eq!(
+            restored.compaction_meta,
+            Some(super::CompactionMarker {
+                kind: super::CompactionMarkerKind::MicrocompactBoundary,
+            })
+        );
+    }
+
+    #[test]
+    fn loads_legacy_message_records_without_metadata() {
+        let fallback_timestamp_ms = 1_234_567_890_u64;
+        let legacy_message = JsonValue::Object(
+            [
+                (
+                    "role".to_string(),
+                    JsonValue::String("assistant".to_string()),
+                ),
+                (
+                    "blocks".to_string(),
+                    JsonValue::Array(vec![JsonValue::Object(
+                        [
+                            ("type".to_string(), JsonValue::String("text".to_string())),
+                            (
+                                "text".to_string(),
+                                JsonValue::String("legacy message".to_string()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let message = ConversationMessage::from_json_with_fallback_timestamp(
+            &legacy_message,
+            fallback_timestamp_ms,
+        )
+        .expect("legacy message should decode");
+
+        assert_eq!(message.role, MessageRole::Assistant);
+        assert_eq!(
+            message.blocks,
+            vec![ContentBlock::Text {
+                text: "legacy message".to_string(),
+            }]
+        );
+        assert!(!message.message_id.is_empty());
+        assert_eq!(message.timestamp_ms, fallback_timestamp_ms);
+        assert_eq!(message.compaction_meta, None);
+    }
+
+    #[test]
+    fn persists_message_metadata_in_jsonl_round_trip() {
+        let path = temp_session_path("message-metadata-jsonl");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        let mut message = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "jsonl metadata".to_string(),
+        }]);
+        message.compaction_meta = Some(super::CompactionMarker {
+            kind: super::CompactionMarkerKind::SnipBoundary,
+        });
+        let expected_message_id = message.message_id.clone();
+        let expected_timestamp_ms = message.timestamp_ms;
+        session
+            .push_message(message)
+            .expect("message should append");
+        session.save_to_path(&path).expect("session should save");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+        let restored_message = &restored.messages[0];
+
+        assert_eq!(restored_message.message_id, expected_message_id);
+        assert_eq!(restored_message.timestamp_ms, expected_timestamp_ms);
+        assert_eq!(
+            restored_message.compaction_meta,
+            Some(super::CompactionMarker {
+                kind: super::CompactionMarkerKind::SnipBoundary,
+            })
+        );
+    }
+
+    #[test]
     fn loads_legacy_session_json_object() {
         let path = temp_session_path("legacy");
         let legacy = JsonValue::Object(
@@ -1193,9 +1447,12 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].role, MessageRole::User);
         assert_eq!(
-            restored.messages[0],
-            ConversationMessage::user_text("legacy")
+            restored.messages[0].blocks,
+            vec![ContentBlock::Text {
+                text: "legacy".to_string(),
+            }]
         );
         assert!(!restored.session_id.is_empty());
     }
@@ -1220,7 +1477,13 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert_eq!(
+            restored.messages[0].blocks,
+            vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }]
+        );
     }
 
     #[test]

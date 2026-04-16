@@ -10,8 +10,8 @@ pub use simplify::build_simplify_prompt;
 
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    compact_session_with_memory, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig,
+    McpServerConfig, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
 
@@ -4018,7 +4018,7 @@ pub fn handle_slash_command(
 
     match command {
         SlashCommand::Compact => {
-            let result = compact_session(session, compaction);
+            let result = compact_session_with_memory(session, compaction);
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
             } else {

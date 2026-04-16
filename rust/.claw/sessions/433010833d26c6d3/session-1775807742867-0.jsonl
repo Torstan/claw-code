@@ -1,0 +1,2 @@
+{"created_at_ms":1775807742867,"model":"claude-opus-4-6","session_id":"session-1775807742867-0","type":"session_meta","updated_at_ms":1775807742867,"version":1}
+{"message":{"blocks":[{"text":"hello","type":"text"}],"role":"user"},"type":"message"}
