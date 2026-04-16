@@ -5,15 +5,15 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::agent_debug::agent_debug_log;
-use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
-};
+use crate::compact::{estimate_session_tokens, CompactionConfig, CompactionResult};
+use crate::compact_session_with_memory;
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session_memory_compact::refresh_session_memory;
 use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
 use crate::usage::{TokenUsage, UsageTracker};
 
@@ -360,6 +360,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction: Option<AutoCompactionEvent> = None;
 
         loop {
             iterations += 1;
@@ -372,6 +373,13 @@ where
             }
 
             self.inject_pending_session_notifications()?;
+            if let Some(event) = self.maybe_auto_compact() {
+                if let Some(existing) = auto_compaction.as_mut() {
+                    existing.removed_message_count += event.removed_message_count;
+                } else {
+                    auto_compaction = Some(event);
+                }
+            }
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -459,8 +467,6 @@ where
             self.dispatch_tool_plan(iterations, planned_dispatches, &mut tool_results)?;
         }
 
-        let auto_compaction = self.maybe_auto_compact();
-
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
@@ -469,6 +475,7 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
+        let _ = refresh_session_memory(&self.session);
         self.record_turn_completed(&summary);
 
         Ok(summary)
@@ -476,7 +483,7 @@ where
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&self.session, config)
+        compact_session_with_memory(&self.session, config)
     }
 
     #[must_use]
@@ -746,19 +753,17 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
+        if estimate_session_tokens(&self.session)
+            < self.auto_compaction_input_tokens_threshold as usize
         {
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        );
+        let config = CompactionConfig {
+            max_estimated_tokens: self.auto_compaction_input_tokens_threshold as usize,
+            ..CompactionConfig::default()
+        };
+        let result = compact_session_with_memory(&self.session, config);
 
         if result.removed_message_count == 0 {
             return None;
@@ -1028,6 +1033,7 @@ mod tests {
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
     use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
     use crate::usage::TokenUsage;
     use crate::ToolError;
@@ -1861,6 +1867,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_prefers_session_memory_sidecar_when_available() {
+        struct UnusedApi;
+        impl ApiClient for UnusedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("manual compact should not call the API client");
+            }
+        }
+
+        let path = temp_session_path("manual-session-memory");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text(
+                "Ship the compaction pipeline in phases",
+            ),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I will start with rust/crates/runtime/src/conversation.rs".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("Then wire in session memory"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Next I will update rust/crates/runtime/src/session.rs".to_string(),
+            }]),
+        ];
+        let memory_path =
+            refresh_session_memory(&session).expect("session memory sidecar should be written");
+
+        let runtime = ConversationRuntime::new(
+            session,
+            UnusedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let result = runtime.compact(CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+        });
+
+        let ContentBlock::Text { text } = &result.compacted_session.messages[0].blocks[0] else {
+            panic!("compacted system message should contain text");
+        };
+        assert!(result.summary.contains("# Goals"));
+        assert!(text.contains("# Goals"));
+        assert!(text.contains("Recent prompts"));
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&memory_path).ok();
+    }
+
+    #[test]
     fn persists_conversation_turn_messages_to_jsonl_session() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
@@ -1946,21 +2005,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn auto_compacts_before_request_when_estimated_tokens_cross_threshold() {
+        struct PreRequestCompactingApi;
+        impl ApiClient for PreRequestCompactingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(
+                    request.messages.first().map(|message| message.role),
+                    Some(MessageRole::System),
+                    "request should already be compacted before the API call"
+                );
+                assert!(
+                    request.messages.iter().any(|message| {
+                        message.role == MessageRole::User
+                            && message.blocks.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text } if text == "trigger"
+                                )
+                            })
+                    }),
+                    "current user prompt must remain in the request after compaction"
+                );
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 120_000,
-                        output_tokens: 4,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    }),
                     AssistantEvent::MessageStop,
                 ])
             }
@@ -1980,12 +2047,12 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             session,
-            SimpleApi,
+            PreRequestCompactingApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(1);
 
         let summary = runtime
             .run_turn("trigger", None)
@@ -1994,10 +2061,127 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
+                removed_message_count: 1,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn auto_compaction_prefers_session_memory_sidecar_when_available() {
+        struct MemoryAwareApi;
+        impl ApiClient for MemoryAwareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let ContentBlock::Text { text } = &request.messages[0].blocks[0] else {
+                    panic!("compacted request should start with a text system message");
+                };
+                assert_eq!(request.messages[0].role, MessageRole::System);
+                assert!(text.contains("# Goals"));
+                assert!(text.contains("Recent prompts"));
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let path = temp_session_path("auto-session-memory");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text(
+                "Ship the compaction pipeline in phases",
+            ),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I will start with rust/crates/runtime/src/conversation.rs".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("Then wire in session memory"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Next I will update rust/crates/runtime/src/session.rs".to_string(),
+            }]),
+        ];
+        let memory_path =
+            refresh_session_memory(&session).expect("session memory sidecar should be written");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MemoryAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 1,
+            })
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&memory_path).ok();
+    }
+
+    #[test]
+    fn auto_compaction_falls_back_to_full_compact_when_sidecar_is_empty() {
+        struct FallbackApi;
+        impl ApiClient for FallbackApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let ContentBlock::Text { text } = &request.messages[0].blocks[0] else {
+                    panic!("compacted request should start with a text system message");
+                };
+                assert_eq!(request.messages[0].role, MessageRole::System);
+                assert!(text.contains("Conversation summary:"));
+                assert!(!text.contains("# Goals"));
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let path = temp_session_path("auto-session-memory-fallback");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+        let memory_path =
+            session_memory_path(&session).expect("persisted session should have a sidecar path");
+        fs::write(&memory_path, " \n").expect("empty sidecar should write");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FallbackApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 1,
+            })
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&memory_path).ok();
     }
 
     #[test]

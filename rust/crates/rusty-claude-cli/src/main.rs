@@ -45,15 +45,15 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     active_tool_session_id, agent_debug_log, check_base_commit, clear_oauth_credentials,
-    format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
-    pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
-    with_active_tool_session, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
-    ToolExecutor, ToolInvocation, UsageTracker,
+    compact_session_with_memory, format_stale_base_warning, format_usd, generate_pkce_pair,
+    generate_state, load_oauth_credentials, load_system_prompt,
+    parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, save_oauth_credentials, with_active_tool_session, ApiClient,
+    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, ToolInvocation, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2824,7 +2824,7 @@ fn run_resume_command(
             json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
+            let result = compact_session_with_memory(
                 session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
@@ -10154,16 +10154,12 @@ mod tests {
                     input: r#"{"command":"ls -la"}"#.to_string(),
                 },
             ]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result(
+                "toolu_abcdefghijklmnop",
+                "bash",
+                "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .",
+                false,
+            ),
         ];
 
         // when
@@ -10194,16 +10190,12 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "errs".to_string();
-        session.messages = vec![ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: "short".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "   ".to_string(),
-                is_error: true,
-            }],
-            usage: None,
-        }];
+        session.messages = vec![ConversationMessage::tool_result(
+            "short",
+            "read_file",
+            "   ",
+            true,
+        )];
 
         // when
         let markdown =
@@ -10479,13 +10471,19 @@ mod tests {
         let messages =
             build_prompt_slash_command_initial_messages("simplify", None, "# Simplify", &cwd);
         assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(
-            messages[0],
+            messages[0].blocks,
             ConversationMessage::user_text(
                 "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>"
             )
+            .blocks
         );
-        assert_eq!(messages[1], ConversationMessage::user_text("# Simplify"));
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(
+            messages[1].blocks,
+            ConversationMessage::user_text("# Simplify").blocks
+        );
 
         match previous_home {
             Some(value) => std::env::set_var("HOME", value),
@@ -11456,16 +11454,7 @@ UU conflicted.rs",
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
         ];
 
         let converted = super::convert_messages(&messages);
