@@ -392,50 +392,17 @@ where
                     return Err(error);
                 }
             } {
-                if let Some(existing) = auto_compaction.as_mut() {
-                    existing.removed_message_count += event.removed_message_count;
-                } else {
-                    auto_compaction = Some(event);
-                }
+                accumulate_auto_compaction_event(&mut auto_compaction, event.removed_message_count);
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
-            };
-            agent_debug_log(
-                "llm.request",
-                format!(
-                    "session_id={}\niteration={iterations}\nsystem_prompt_parts={}\nmessage_count={}\nrequest={request:#?}",
-                    self.session.session_id,
-                    request.system_prompt.len(),
-                    request.messages.len()
-                ),
-            );
-            let events = match self.api_client.stream(request) {
-                Ok(events) => {
-                    agent_debug_log(
-                        "llm.response",
-                        format!(
-                            "session_id={}\niteration={iterations}\nevent_count={}\nresponse={events:#?}",
-                            self.session.session_id,
-                            events.len()
-                        ),
-                    );
-                    events
-                }
-                Err(error) => {
-                    agent_debug_log(
-                        "llm.response.error",
-                        format!(
-                            "session_id={}\niteration={iterations}\nerror={error}",
-                            self.session.session_id
-                        ),
-                    );
-                    self.record_turn_failed(iterations, &error);
-                    return Err(error);
-                }
-            };
+            let events =
+                match self.stream_with_reactive_compaction(iterations, &mut auto_compaction) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                };
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
@@ -778,6 +745,7 @@ where
         if result.snipped_message_ids.is_empty() {
             return Ok(());
         }
+
         self.replace_session_and_persist(result.compacted_session)
     }
 
@@ -810,6 +778,132 @@ where
         Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         }))
+    }
+
+    fn stream_with_reactive_compaction(
+        &mut self,
+        iteration: usize,
+        auto_compaction: &mut Option<AutoCompactionEvent>,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let mut reactive_retry_attempted = false;
+
+        loop {
+            let request = ApiRequest {
+                system_prompt: self.system_prompt.clone(),
+                messages: self.session.messages.clone(),
+            };
+            agent_debug_log(
+                "llm.request",
+                format!(
+                    "session_id={}\niteration={iteration}\nsystem_prompt_parts={}\nmessage_count={}\nrequest={request:#?}",
+                    self.session.session_id,
+                    request.system_prompt.len(),
+                    request.messages.len()
+                ),
+            );
+
+            match self.api_client.stream(request) {
+                Ok(events) => {
+                    agent_debug_log(
+                        "llm.response",
+                        format!(
+                            "session_id={}\niteration={iteration}\nevent_count={}\nresponse={events:#?}",
+                            self.session.session_id,
+                            events.len()
+                        ),
+                    );
+                    return Ok(events);
+                }
+                Err(error) => {
+                    agent_debug_log(
+                        "llm.response.error",
+                        format!(
+                            "session_id={}\niteration={iteration}\nreactive_retry_attempted={reactive_retry_attempted}\nerror={error}",
+                            self.session.session_id
+                        ),
+                    );
+
+                    if reactive_retry_attempted || !is_context_window_runtime_error(&error) {
+                        return Err(error);
+                    }
+
+                    let recovered = self.maybe_reactive_compact(auto_compaction)?;
+                    if !recovered {
+                        return Err(error);
+                    }
+                    reactive_retry_attempted = true;
+                }
+            }
+        }
+    }
+
+    fn maybe_reactive_compact(
+        &mut self,
+        auto_compaction: &mut Option<AutoCompactionEvent>,
+    ) -> Result<bool, RuntimeError> {
+        let mut changed = false;
+
+        if self.force_snip_compact()? {
+            changed = true;
+        }
+        if self.force_micro_compact()? {
+            changed = true;
+        }
+
+        if !changed
+            || estimate_session_tokens(&self.session)
+                > self.auto_compaction_input_tokens_threshold as usize
+        {
+            let result = compact_session_with_memory(
+                &self.session,
+                CompactionConfig {
+                    max_estimated_tokens: 1,
+                    ..CompactionConfig::default()
+                },
+            );
+            if result.removed_message_count > 0 {
+                self.replace_session_and_persist(result.compacted_session)?;
+                accumulate_auto_compaction_event(auto_compaction, result.removed_message_count);
+                changed = true;
+            }
+        }
+
+        Ok(changed)
+    }
+
+    fn force_snip_compact(&mut self) -> Result<bool, RuntimeError> {
+        let result = snip_compact_session(
+            &self.session,
+            SnipCompactionConfig {
+                trigger_threshold_tokens: 1,
+                target_tokens: 0,
+                protected_recent_messages: 0,
+                min_candidate_tokens: 20,
+            },
+        );
+        if result.snipped_message_ids.is_empty() {
+            return Ok(false);
+        }
+
+        self.replace_session_and_persist(result.compacted_session)?;
+        Ok(true)
+    }
+
+    fn force_micro_compact(&mut self) -> Result<bool, RuntimeError> {
+        let result = micro_compact_session(
+            &self.session,
+            MicroCompactionConfig {
+                trigger_count: 0,
+                keep_recent: 0,
+                gap_threshold_minutes: u64::MAX,
+            },
+        );
+        if result.cleared_tool_result_count == 0 {
+            return Ok(false);
+        }
+
+        self.replace_session_and_persist(result.compacted_session)?;
+        Ok(true)
     }
 
     fn replace_session_and_persist(&mut self, session: Session) -> Result<(), RuntimeError> {
@@ -946,6 +1040,35 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+fn is_context_window_runtime_error(error: &RuntimeError) -> bool {
+    let message = error.to_string().to_lowercase();
+    [
+        "maximum context length",
+        "context window",
+        "context length",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "request is too large",
+        "context_window_blocked",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn accumulate_auto_compaction_event(
+    auto_compaction: &mut Option<AutoCompactionEvent>,
+    removed_message_count: usize,
+) {
+    if let Some(existing) = auto_compaction.as_mut() {
+        existing.removed_message_count += removed_message_count;
+    } else {
+        *auto_compaction = Some(AutoCompactionEvent {
+            removed_message_count,
+        });
+    }
 }
 
 fn build_assistant_message(
@@ -1086,8 +1209,7 @@ mod tests {
     use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
     use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
     use crate::snip_compact::{
-        snip_compact_session, SnipCompactionConfig, SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL,
-        SNIP_CLEARED_TOOL_RESULT_SENTINEL,
+        SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL, SNIP_CLEARED_TOOL_RESULT_SENTINEL,
     };
     use crate::usage::TokenUsage;
     use crate::ToolError;
@@ -2115,6 +2237,468 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn snip_compact_runs_before_micro_and_auto_compaction() {
+        struct SnipAwareApi;
+
+        impl ApiClient for SnipAwareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request.messages.iter().any(|message| {
+                    message.compaction_meta.as_ref().map(|meta| meta.kind)
+                        == Some(CompactionMarkerKind::SnipBoundary)
+                }));
+                assert!(
+                    !request.messages.iter().any(|message| {
+                        message.compaction_meta.as_ref().map(|meta| meta.kind)
+                            == Some(CompactionMarkerKind::MicrocompactBoundary)
+                    }),
+                    "snip should run early enough to avoid redundant micro compaction for already-snipped tool results",
+                );
+                assert!(
+                    !request.messages.iter().any(|message| {
+                        message.compaction_meta.as_ref().map(|meta| meta.kind)
+                            == Some(CompactionMarkerKind::CompactBoundary)
+                    }),
+                    "snip should reduce the request before auto compact escalates to a full summary",
+                );
+
+                let tool_outputs = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                        ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    tool_outputs,
+                    vec![
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        "tool output 6 ".repeat(30),
+                        "tool output 7 ".repeat(30),
+                    ]
+                );
+                assert!(request.messages.iter().any(|message| {
+                    message.role == MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { text }
+                                    if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
+                            )
+                        })
+                }));
+
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![crate::session::ConversationMessage::assistant(vec![
+            ContentBlock::Text {
+                text: "old assistant context ".repeat(40),
+            },
+        ])];
+        for index in 1..=7 {
+            session.messages.push(tool_use_message(
+                &format!("tool-{index}"),
+                "bash",
+                &index.to_string(),
+            ));
+            session
+                .messages
+                .push(crate::session::ConversationMessage::tool_result(
+                    format!("tool-{index}"),
+                    "bash",
+                    format!("tool output {index} ").repeat(30),
+                    false,
+                ));
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SnipAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(400);
+
+        let summary = runtime
+            .run_turn("continue", None)
+            .expect("snip-first request should succeed");
+
+        assert_eq!(summary.auto_compaction, None);
+    }
+
+    #[test]
+    fn micro_compact_does_not_clear_current_turn_tool_results_before_post_tool_request() {
+        struct PostToolApi {
+            calls: usize,
+        }
+
+        impl ApiClient for PostToolApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let mut events = (1..=7)
+                            .map(|index| AssistantEvent::ToolUse {
+                                id: format!("tool-{index}"),
+                                name: "bash".to_string(),
+                                input: index.to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        events.push(AssistantEvent::MessageStop);
+                        Ok(events)
+                    }
+                    2 => {
+                        let outputs = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            outputs,
+                            (1..=7)
+                                .map(|index| format!("tool output {index}"))
+                                .collect::<Vec<_>>(),
+                            "microcompact must not clear tool results produced in the current turn before the model consumes them",
+                        );
+                        assert!(
+                            !request.messages.iter().any(|message| {
+                                message.compaction_meta.as_ref().map(|meta| meta.kind)
+                                    == Some(CompactionMarkerKind::MicrocompactBoundary)
+                            }),
+                            "current-turn post-tool follow-up should not receive a microcompact marker",
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PostToolApi { calls: 0 },
+            StaticToolExecutor::new().register("bash", |input| Ok(format!("tool output {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("continue", None)
+            .expect("post-tool follow-up should succeed");
+    }
+
+    #[test]
+    fn micro_compact_persists_rewritten_snapshot_even_when_request_fails() {
+        struct FailingApi;
+
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("upstream failed"))
+            }
+        }
+
+        let path = temp_session_path("microcompact-failed-turn");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.messages = (1..=7)
+            .flat_map(|index| {
+                [
+                    tool_use_message(&format!("tool-{index}"), "bash", &index.to_string()),
+                    crate::session::ConversationMessage::tool_result(
+                        format!("tool-{index}"),
+                        "bash",
+                        format!("tool output {index}"),
+                        false,
+                    ),
+                ]
+            })
+            .collect();
+        session
+            .save_to_path(&path)
+            .expect("seed session should persist");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FailingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("continue", None)
+            .expect_err("API failure should propagate");
+        assert_eq!(error.to_string(), "upstream failed");
+
+        let persisted_session =
+            Session::load_from_path(&path).expect("persisted session should reload");
+        assert_eq!(
+            persisted_session.messages,
+            runtime.session().messages,
+            "failed turns must still persist the rewritten compacted snapshot",
+        );
+        assert_eq!(
+            persisted_session.updated_at_ms,
+            runtime.session().updated_at_ms
+        );
+        assert_eq!(
+            tool_result_outputs(&persisted_session),
+            vec![
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                "tool output 6".to_string(),
+                "tool output 7".to_string(),
+            ]
+        );
+        assert!(persisted_session.messages.iter().any(|message| {
+            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                == Some(CompactionMarkerKind::MicrocompactBoundary)
+        }));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reactive_compact_retries_once_on_context_window_exceeded() {
+        struct ReactiveSnipApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ReactiveSnipApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(RuntimeError::new(
+                        "Request is too large for this model's context window.",
+                    )),
+                    2 => {
+                        assert!(request.messages.iter().any(|message| {
+                            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                                == Some(CompactionMarkerKind::SnipBoundary)
+                        }));
+                        assert!(!request.messages.iter().any(|message| {
+                            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                                == Some(CompactionMarkerKind::CompactBoundary)
+                        }));
+                        assert!(request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text }
+                                        if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
+                                )
+                            })
+                        }));
+                        let tool_outputs = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            tool_outputs,
+                            vec![
+                                SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                                SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                            ]
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("reactive retry should issue exactly one retry"),
+                }
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old assistant context ".repeat(40),
+            }]),
+            tool_use_message("tool-1", "bash", "printf 1"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                "old tool output 1 ".repeat(40),
+                false,
+            ),
+            tool_use_message("tool-2", "bash", "printf 2"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-2",
+                "bash",
+                "old tool output 2 ".repeat(40),
+                false,
+            ),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ReactiveSnipApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("continue", None)
+            .expect("reactive snip retry should succeed");
+
+        assert_eq!(summary.auto_compaction, None);
+        assert!(runtime.session().messages.iter().any(|message| {
+            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                == Some(CompactionMarkerKind::SnipBoundary)
+        }));
+    }
+
+    #[test]
+    fn reactive_compact_falls_back_to_full_compact_when_light_recovery_cannot_help() {
+        struct ReactiveFullCompactApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ReactiveFullCompactApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(RuntimeError::new(
+                        "maximum context length exceeded for this request",
+                    )),
+                    2 => {
+                        assert_eq!(
+                            request.messages.first().map(|message| message.role),
+                            Some(MessageRole::System)
+                        );
+                        assert!(request.messages.iter().any(|message| {
+                            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                                == Some(CompactionMarkerKind::CompactBoundary)
+                        }));
+                        let ContentBlock::Text { text } = &request.messages[0].blocks[0] else {
+                            panic!("reactive full compact should synthesize a summary message");
+                        };
+                        assert!(text.contains("Conversation summary:"));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("reactive retry should issue exactly one retry"),
+                }
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::user_text("two"),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::user_text("four"),
+            crate::session::ConversationMessage::user_text("five"),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ReactiveFullCompactApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("continue", None)
+            .expect("reactive fallback compact should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn reactive_compact_stops_after_a_single_retry_when_context_window_error_persists() {
+        struct PersistentContextWindowApi {
+            calls: usize,
+        }
+
+        impl ApiClient for PersistentContextWindowApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Err(RuntimeError::new(
+                    "request is too large for this model's context window",
+                ))
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old assistant context ".repeat(40),
+            }]),
+            tool_use_message("tool-1", "bash", "printf 1"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                "old tool output 1 ".repeat(40),
+                false,
+            ),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            PersistentContextWindowApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let error = runtime
+            .run_turn("continue", None)
+            .expect_err("persistent context-window failures should stop after one retry");
+
+        assert_eq!(
+            error.to_string(),
+            "request is too large for this model's context window"
+        );
+        assert_eq!(runtime.api_client_mut().calls, 2);
+    }
+
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
         script.replace('\'', "\"")
@@ -2360,348 +2944,6 @@ mod tests {
     }
 
     #[test]
-    fn snip_compact_clears_old_long_assistant_and_tool_messages_but_preserves_user_and_recent_tail()
-    {
-        let preserved_user =
-            crate::session::ConversationMessage::user_text("keep this user prompt");
-        let old_assistant =
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "old assistant context ".repeat(40),
-            }]);
-        let old_tool_result = crate::session::ConversationMessage::tool_result(
-            "tool-1",
-            "bash",
-            "old tool output ".repeat(40),
-            false,
-        );
-        let recent_user = crate::session::ConversationMessage::user_text("keep recent user");
-        let recent_assistant =
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "keep recent assistant".to_string(),
-            }]);
-        let old_assistant_id = old_assistant.message_id.clone();
-        let old_tool_result_id = old_tool_result.message_id.clone();
-        let recent_assistant_id = recent_assistant.message_id.clone();
-
-        let mut session = Session::new();
-        session.messages = vec![
-            preserved_user.clone(),
-            old_assistant,
-            tool_use_message("tool-1", "bash", "printf old"),
-            old_tool_result,
-            recent_user.clone(),
-            recent_assistant,
-        ];
-
-        let result = snip_compact_session(
-            &session,
-            SnipCompactionConfig {
-                trigger_threshold_tokens: 1,
-                target_tokens: 0,
-                protected_recent_messages: 2,
-                min_candidate_tokens: 20,
-            },
-        );
-
-        assert_eq!(result.snipped_message_ids.len(), 2);
-        assert!(result.snipped_message_ids.contains(&old_assistant_id));
-        assert!(result.snipped_message_ids.contains(&old_tool_result_id));
-        assert!(result.estimated_tokens_freed > 0);
-
-        let snipped_assistant = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == old_assistant_id)
-            .expect("old assistant should remain addressable by id");
-        assert!(matches!(
-            snipped_assistant.blocks.as_slice(),
-            [ContentBlock::Text { text }] if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
-        ));
-
-        let snipped_tool_result = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == old_tool_result_id)
-            .expect("old tool result should remain addressable by id");
-        assert!(matches!(
-            snipped_tool_result.blocks.as_slice(),
-            [ContentBlock::ToolResult { output, .. }] if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL
-        ));
-
-        let preserved_recent_assistant = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == recent_assistant_id)
-            .expect("recent assistant should remain present");
-        assert!(matches!(
-            preserved_recent_assistant.blocks.as_slice(),
-            [ContentBlock::Text { text }] if text == "keep recent assistant"
-        ));
-
-        assert!(result.compacted_session.messages.iter().any(|message| {
-            message.compaction_meta.as_ref().map(|meta| meta.kind)
-                == Some(CompactionMarkerKind::SnipBoundary)
-        }));
-        assert!(result.compacted_session.messages.iter().any(|message| {
-            message.role == MessageRole::User && message.blocks == preserved_user.blocks
-        }));
-        assert!(result.compacted_session.messages.iter().any(|message| {
-            message.role == MessageRole::User && message.blocks == recent_user.blocks
-        }));
-    }
-
-    #[test]
-    fn snip_compact_runs_before_micro_and_auto_compaction() {
-        struct SnipAwareApi;
-
-        impl ApiClient for SnipAwareApi {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                assert!(request.messages.iter().any(|message| {
-                    message.compaction_meta.as_ref().map(|meta| meta.kind)
-                        == Some(CompactionMarkerKind::SnipBoundary)
-                }));
-                assert!(
-                    !request.messages.iter().any(|message| {
-                        message.compaction_meta.as_ref().map(|meta| meta.kind)
-                            == Some(CompactionMarkerKind::MicrocompactBoundary)
-                    }),
-                    "snip should run early enough to avoid redundant micro compaction for already-snipped tool results",
-                );
-                assert!(
-                    !request.messages.iter().any(|message| {
-                        message.compaction_meta.as_ref().map(|meta| meta.kind)
-                            == Some(CompactionMarkerKind::CompactBoundary)
-                    }),
-                    "snip should reduce the request before auto compact escalates to a full summary",
-                );
-
-                let tool_outputs = request
-                    .messages
-                    .iter()
-                    .flat_map(|message| message.blocks.iter())
-                    .filter_map(|block| match block {
-                        ContentBlock::ToolResult { output, .. } => Some(output.clone()),
-                        ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    tool_outputs,
-                    vec![
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        "tool output 6 ".repeat(30),
-                        "tool output 7 ".repeat(30),
-                    ]
-                );
-                assert!(request.messages.iter().any(|message| {
-                    message.role == MessageRole::Assistant
-                        && message.blocks.iter().any(|block| {
-                            matches!(
-                                block,
-                                ContentBlock::Text { text }
-                                    if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
-                            )
-                        })
-                }));
-
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut session = Session::new();
-        session.messages = vec![crate::session::ConversationMessage::assistant(vec![
-            ContentBlock::Text {
-                text: "old assistant context ".repeat(40),
-            },
-        ])];
-        for index in 1..=7 {
-            session.messages.push(tool_use_message(
-                &format!("tool-{index}"),
-                "bash",
-                &index.to_string(),
-            ));
-            session
-                .messages
-                .push(crate::session::ConversationMessage::tool_result(
-                    format!("tool-{index}"),
-                    "bash",
-                    format!("tool output {index} ").repeat(30),
-                    false,
-                ));
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            session,
-            SnipAwareApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_auto_compaction_input_tokens_threshold(400);
-
-        let summary = runtime
-            .run_turn("continue", None)
-            .expect("snip-first request should succeed");
-
-        assert_eq!(summary.auto_compaction, None);
-    }
-
-    #[test]
-    fn snip_compact_skips_error_and_non_compactable_tool_results() {
-        let safe_tool_result = crate::session::ConversationMessage::tool_result(
-            "tool-safe",
-            "bash",
-            "safe tool output ".repeat(40),
-            false,
-        );
-        let safe_tool_result_id = safe_tool_result.message_id.clone();
-        let error_tool_result = crate::session::ConversationMessage::tool_result(
-            "tool-error",
-            "bash",
-            "failing tool output ".repeat(40),
-            true,
-        );
-        let error_tool_result_id = error_tool_result.message_id.clone();
-        let status_tool_result = crate::session::ConversationMessage::tool_result(
-            "tool-status",
-            "Agent",
-            "worker status payload ".repeat(40),
-            false,
-        );
-        let status_tool_result_id = status_tool_result.message_id.clone();
-
-        let mut session = Session::new();
-        session.messages = vec![
-            tool_use_message("tool-safe", "bash", "printf safe"),
-            safe_tool_result,
-            tool_use_message("tool-error", "bash", "printf failing"),
-            error_tool_result,
-            tool_use_message("tool-status", "Agent", "{}"),
-            status_tool_result,
-        ];
-
-        let result = snip_compact_session(
-            &session,
-            SnipCompactionConfig {
-                trigger_threshold_tokens: 1,
-                target_tokens: 0,
-                protected_recent_messages: 0,
-                min_candidate_tokens: 20,
-            },
-        );
-
-        assert_eq!(
-            result.snipped_message_ids,
-            vec![safe_tool_result_id.clone()]
-        );
-
-        let snipped_tool_result = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == safe_tool_result_id)
-            .expect("safe tool result should remain present");
-        assert!(matches!(
-            snipped_tool_result.blocks.as_slice(),
-            [ContentBlock::ToolResult { output, is_error, .. }]
-                if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL && !is_error
-        ));
-
-        let preserved_error_result = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == error_tool_result_id)
-            .expect("error tool result should remain present");
-        assert!(matches!(
-            preserved_error_result.blocks.as_slice(),
-            [ContentBlock::ToolResult { output, is_error, .. }]
-                if output == &"failing tool output ".repeat(40) && *is_error
-        ));
-
-        let preserved_status_result = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == status_tool_result_id)
-            .expect("status tool result should remain present");
-        assert!(matches!(
-            preserved_status_result.blocks.as_slice(),
-            [ContentBlock::ToolResult { output, tool_name, is_error, .. }]
-                if output == &"worker status payload ".repeat(40)
-                    && tool_name == "Agent"
-                    && !is_error
-        ));
-    }
-
-    #[test]
-    fn snip_compact_prioritizes_large_tool_results_before_assistant_text() {
-        let old_assistant =
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "important assistant conclusion ".repeat(12),
-            }]);
-        let old_assistant_id = old_assistant.message_id.clone();
-        let old_tool_result = crate::session::ConversationMessage::tool_result(
-            "tool-1",
-            "bash",
-            "large low-value tool output ".repeat(80),
-            false,
-        );
-        let old_tool_result_id = old_tool_result.message_id.clone();
-
-        let mut session = Session::new();
-        session.messages = vec![
-            old_assistant,
-            tool_use_message("tool-1", "bash", "printf data"),
-            old_tool_result,
-        ];
-
-        let estimated_tokens = crate::compact::estimate_session_tokens(&session);
-        let result = snip_compact_session(
-            &session,
-            SnipCompactionConfig {
-                trigger_threshold_tokens: 1,
-                target_tokens: estimated_tokens.saturating_sub(100),
-                protected_recent_messages: 0,
-                min_candidate_tokens: 20,
-            },
-        );
-
-        assert_eq!(result.snipped_message_ids, vec![old_tool_result_id.clone()]);
-
-        let preserved_assistant = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == old_assistant_id)
-            .expect("assistant message should remain present");
-        assert!(matches!(
-            preserved_assistant.blocks.as_slice(),
-            [ContentBlock::Text { text }] if text == &"important assistant conclusion ".repeat(12)
-        ));
-
-        let snipped_tool_result = result
-            .compacted_session
-            .messages
-            .iter()
-            .find(|message| message.message_id == old_tool_result_id)
-            .expect("tool result should remain present");
-        assert!(matches!(
-            snipped_tool_result.blocks.as_slice(),
-            [ContentBlock::ToolResult { output, .. }] if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL
-        ));
-    }
-
-    #[test]
     fn micro_compact_clears_old_tool_results_but_preserves_recent_tail() {
         let mut session = Session::new();
         session.messages = vec![
@@ -2754,150 +2996,6 @@ mod tests {
             }),
             "microcompact should append a boundary marker",
         );
-    }
-
-    #[test]
-    fn micro_compact_does_not_clear_current_turn_tool_results_before_post_tool_request() {
-        struct PostToolApi {
-            calls: usize,
-        }
-
-        impl ApiClient for PostToolApi {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.calls += 1;
-                match self.calls {
-                    1 => {
-                        let mut events = (1..=7)
-                            .map(|index| AssistantEvent::ToolUse {
-                                id: format!("tool-{index}"),
-                                name: "bash".to_string(),
-                                input: index.to_string(),
-                            })
-                            .collect::<Vec<_>>();
-                        events.push(AssistantEvent::MessageStop);
-                        Ok(events)
-                    }
-                    2 => {
-                        let outputs = request
-                            .messages
-                            .iter()
-                            .flat_map(|message| message.blocks.iter())
-                            .filter_map(|block| match block {
-                                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
-                                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
-                            })
-                            .collect::<Vec<_>>();
-                        assert_eq!(
-                            outputs,
-                            (1..=7)
-                                .map(|index| format!("tool output {index}"))
-                                .collect::<Vec<_>>(),
-                            "microcompact must not clear tool results produced in the current turn before the model consumes them",
-                        );
-                        assert!(
-                            !request.messages.iter().any(|message| {
-                                message.compaction_meta.as_ref().map(|meta| meta.kind)
-                                    == Some(CompactionMarkerKind::MicrocompactBoundary)
-                            }),
-                            "current-turn post-tool follow-up should not receive a microcompact marker",
-                        );
-                        Ok(vec![
-                            AssistantEvent::TextDelta("done".to_string()),
-                            AssistantEvent::MessageStop,
-                        ])
-                    }
-                    _ => unreachable!("extra API call"),
-                }
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            PostToolApi { calls: 0 },
-            StaticToolExecutor::new().register("bash", |input| Ok(format!("tool output {input}"))),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-
-        runtime
-            .run_turn("continue", None)
-            .expect("post-tool follow-up should succeed");
-    }
-
-    #[test]
-    fn micro_compact_persists_rewritten_snapshot_even_when_request_fails() {
-        struct FailingApi;
-
-        impl ApiClient for FailingApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Err(RuntimeError::new("upstream failed"))
-            }
-        }
-
-        let path = temp_session_path("microcompact-failed-turn");
-        let mut session = Session::new().with_persistence_path(path.clone());
-        session.messages = (1..=7)
-            .flat_map(|index| {
-                [
-                    tool_use_message(&format!("tool-{index}"), "bash", &index.to_string()),
-                    crate::session::ConversationMessage::tool_result(
-                        format!("tool-{index}"),
-                        "bash",
-                        format!("tool output {index}"),
-                        false,
-                    ),
-                ]
-            })
-            .collect();
-        session
-            .save_to_path(&path)
-            .expect("seed session should persist");
-
-        let mut runtime = ConversationRuntime::new(
-            session,
-            FailingApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-
-        let error = runtime
-            .run_turn("continue", None)
-            .expect_err("API failure should propagate");
-        assert_eq!(error.to_string(), "upstream failed");
-
-        let persisted_session =
-            Session::load_from_path(&path).expect("persisted session should reload");
-        assert_eq!(
-            persisted_session.messages,
-            runtime.session().messages,
-            "failed turns must still persist the rewritten compacted snapshot",
-        );
-        assert_eq!(
-            persisted_session.updated_at_ms,
-            runtime.session().updated_at_ms
-        );
-        assert_eq!(
-            tool_result_outputs(&persisted_session),
-            vec![
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                "tool output 6".to_string(),
-                "tool output 7".to_string(),
-            ]
-        );
-        assert!(persisted_session.messages.iter().any(|message| {
-            message.compaction_meta.as_ref().map(|meta| meta.kind)
-                == Some(CompactionMarkerKind::MicrocompactBoundary)
-        }));
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
