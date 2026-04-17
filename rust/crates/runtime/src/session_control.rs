@@ -147,49 +147,65 @@ impl SessionStore {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
-            let (id, message_count, parent_session_id, branch_name) =
-                match Session::load_from_path(&path) {
-                    Ok(session) => {
-                        let parent_session_id = session
-                            .fork
-                            .as_ref()
-                            .map(|fork| fork.parent_session_id.clone());
-                        let branch_name = session
-                            .fork
-                            .as_ref()
-                            .and_then(|fork| fork.branch_name.clone());
-                        (
-                            session.session_id,
-                            session.messages.len(),
-                            parent_session_id,
-                            branch_name,
-                        )
-                    }
-                    Err(_) => (
-                        path.file_stem()
-                            .and_then(|value| value.to_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        0,
-                        None,
-                        None,
-                    ),
-                };
-            sessions.push(ManagedSessionSummary {
+            let (
                 id,
-                path,
-                modified_epoch_millis,
                 message_count,
                 parent_session_id,
                 branch_name,
+                logical_modified_epoch_millis,
+                created_at_ms,
+                session_counter,
+            ) = match Session::load_from_path(&path) {
+                Ok(session) => {
+                    let parent_session_id = session
+                        .fork
+                        .as_ref()
+                        .map(|fork| fork.parent_session_id.clone());
+                    let branch_name = session
+                        .fork
+                        .as_ref()
+                        .and_then(|fork| fork.branch_name.clone());
+                    let session_counter = session_counter_from_id(&session.session_id);
+                    (
+                        session.session_id,
+                        session.messages.len(),
+                        parent_session_id,
+                        branch_name,
+                        u128::from(session.updated_at_ms),
+                        session.created_at_ms,
+                        session_counter,
+                    )
+                }
+                Err(_) => {
+                    let id = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (
+                        id.clone(),
+                        0,
+                        None,
+                        None,
+                        modified_epoch_millis,
+                        session_created_at_from_id(&id)
+                            .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                        session_counter_from_id(&id),
+                    )
+                }
+            };
+            sessions.push(ManagedSessionSummary {
+                id,
+                path,
+                modified_epoch_millis: logical_modified_epoch_millis,
+                message_count,
+                parent_session_id,
+                branch_name,
+                created_at_ms,
+                session_counter,
             });
         }
-        sessions.sort_by(|left, right| {
-            right
-                .modified_epoch_millis
-                .cmp(&left.modified_epoch_millis)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        sort_managed_session_summaries(&mut sessions);
         Ok(sessions)
     }
 
@@ -273,6 +289,8 @@ pub struct ManagedSessionSummary {
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+    created_at_ms: u64,
+    session_counter: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,49 +456,65 @@ pub fn list_managed_sessions_for(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
-            match Session::load_from_path(&path) {
-                Ok(session) => {
-                    let parent_session_id = session
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.parent_session_id.clone());
-                    let branch_name = session
-                        .fork
-                        .as_ref()
-                        .and_then(|fork| fork.branch_name.clone());
-                    (
-                        session.session_id,
-                        session.messages.len(),
-                        parent_session_id,
-                        branch_name,
-                    )
-                }
-                Err(_) => (
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    0,
-                    None,
-                    None,
-                ),
-            };
-        sessions.push(ManagedSessionSummary {
+        let (
             id,
-            path,
-            modified_epoch_millis,
             message_count,
             parent_session_id,
             branch_name,
+            logical_modified_epoch_millis,
+            created_at_ms,
+            session_counter,
+        ) = match Session::load_from_path(&path) {
+            Ok(session) => {
+                let parent_session_id = session
+                    .fork
+                    .as_ref()
+                    .map(|fork| fork.parent_session_id.clone());
+                let branch_name = session
+                    .fork
+                    .as_ref()
+                    .and_then(|fork| fork.branch_name.clone());
+                let session_counter = session_counter_from_id(&session.session_id);
+                (
+                    session.session_id,
+                    session.messages.len(),
+                    parent_session_id,
+                    branch_name,
+                    u128::from(session.updated_at_ms),
+                    session.created_at_ms,
+                    session_counter,
+                )
+            }
+            Err(_) => {
+                let id = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                (
+                    id.clone(),
+                    0,
+                    None,
+                    None,
+                    modified_epoch_millis,
+                    session_created_at_from_id(&id)
+                        .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                    session_counter_from_id(&id),
+                )
+            }
+        };
+        sessions.push(ManagedSessionSummary {
+            id,
+            path,
+            modified_epoch_millis: logical_modified_epoch_millis,
+            message_count,
+            parent_session_id,
+            branch_name,
+            created_at_ms,
+            session_counter,
         });
     }
-    sessions.sort_by(|left, right| {
-        right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+    sort_managed_session_summaries(&mut sessions);
     Ok(sessions)
 }
 
@@ -562,6 +596,31 @@ fn session_id_from_path(path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn sort_managed_session_summaries(sessions: &mut [ManagedSessionSummary]) {
+    sessions.sort_by(|left, right| {
+        right
+            .modified_epoch_millis
+            .cmp(&left.modified_epoch_millis)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| right.session_counter.cmp(&left.session_counter))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn session_created_at_from_id(session_id: &str) -> Option<u64> {
+    parse_session_id_components(session_id).map(|(created_at_ms, _)| created_at_ms)
+}
+
+fn session_counter_from_id(session_id: &str) -> Option<u64> {
+    parse_session_id_components(session_id).map(|(_, counter)| counter)
+}
+
+fn parse_session_id_components(session_id: &str) -> Option<(u64, u64)> {
+    let suffix = session_id.strip_prefix("session-")?;
+    let (created_at_ms, counter) = suffix.rsplit_once('-')?;
+    Some((created_at_ms.parse().ok()?, counter.parse().ok()?))
+}
+
 fn format_missing_session_reference(reference: &str) -> String {
     format!(
         "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
@@ -578,8 +637,9 @@ fn format_no_managed_sessions() -> String {
 mod tests {
     use super::{
         create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
-        list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionStore, LATEST_SESSION_REFERENCE,
+        latest_managed_session_for, list_managed_sessions_for, load_managed_session_for,
+        resolve_session_reference_for, workspace_fingerprint, ManagedSessionSummary, SessionStore,
+        LATEST_SESSION_REFERENCE,
     };
     use crate::session::Session;
     use std::fs;
@@ -608,6 +668,28 @@ mod tests {
         session
     }
 
+    fn persist_session_with_metadata(
+        root: &Path,
+        session_id: &str,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Session {
+        let mut session = Session::new();
+        session.session_id = session_id.to_string();
+        session
+            .push_user_text(session_id)
+            .expect("session message should save");
+        session.created_at_ms = created_at_ms;
+        session.updated_at_ms = updated_at_ms;
+        let handle = create_managed_session_handle_for(root, &session.session_id)
+            .expect("managed session handle should build");
+        let session = session.with_persistence_path(handle.path.clone());
+        session
+            .save_to_path(&handle.path)
+            .expect("session should persist");
+        session
+    }
+
     fn wait_for_next_millisecond() {
         let start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -619,6 +701,19 @@ mod tests {
             .as_millis()
             <= start
         {}
+    }
+
+    fn set_modified_time(path: &Path, timestamp_ms: u64) {
+        let timestamp = UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("session file should open");
+        let times = std::fs::FileTimes::new()
+            .set_accessed(timestamp)
+            .set_modified(timestamp);
+        file.set_times(times)
+            .expect("session file timestamps should update");
     }
 
     fn summary_by_id<'a>(
@@ -712,6 +807,27 @@ mod tests {
         session
             .push_user_text(text)
             .expect("session message should save");
+        let handle = store.create_handle(&session.session_id);
+        let session = session.with_persistence_path(handle.path.clone());
+        session
+            .save_to_path(&handle.path)
+            .expect("session should persist");
+        session
+    }
+
+    fn persist_session_via_store_with_metadata(
+        store: &SessionStore,
+        session_id: &str,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Session {
+        let mut session = Session::new();
+        session.session_id = session_id.to_string();
+        session
+            .push_user_text(session_id)
+            .expect("session message should save");
+        session.created_at_ms = created_at_ms;
+        session.updated_at_ms = updated_at_ms;
         let handle = store.create_handle(&session.session_id);
         let session = session.with_persistence_path(handle.path.clone());
         session
@@ -837,6 +953,104 @@ mod tests {
             .expect("latest alias should resolve");
 
         // then
+        assert_eq!(latest.id, newer.session_id);
+        assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_store_latest_prefers_session_updated_at_when_file_mtime_ties() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let mut older = Session::new();
+        older.session_id = "session-z-older".to_string();
+        older
+            .push_user_text("older")
+            .expect("older session message should save");
+        older.created_at_ms = 10;
+        older.updated_at_ms = 10;
+        let older_handle = store.create_handle(&older.session_id);
+        let older = older.with_persistence_path(older_handle.path.clone());
+        older
+            .save_to_path(&older_handle.path)
+            .expect("older session should persist");
+
+        let mut newer = Session::new();
+        newer.session_id = "session-a-newer".to_string();
+        newer
+            .push_user_text("newer")
+            .expect("newer session message should save");
+        newer.created_at_ms = 20;
+        newer.updated_at_ms = 20;
+        let newer_handle = store.create_handle(&newer.session_id);
+        let newer = newer.with_persistence_path(newer_handle.path.clone());
+        newer
+            .save_to_path(&newer_handle.path)
+            .expect("newer session should persist");
+
+        let tied_timestamp_ms = 1_000;
+        set_modified_time(
+            older.persistence_path().expect("older path should exist"),
+            tied_timestamp_ms,
+        );
+        set_modified_time(
+            newer.persistence_path().expect("newer path should exist"),
+            tied_timestamp_ms,
+        );
+
+        // when
+        let latest = store.latest_session().expect("latest should resolve");
+        let handle = store
+            .resolve_reference("latest")
+            .expect("latest alias should resolve");
+
+        // then
+        assert_eq!(latest.id, newer.session_id);
+        assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_managed_session_uses_numeric_session_counter_when_updated_at_ties() {
+        // given
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let older = persist_session_with_metadata(&root, "session-1000-9", 1_000, 5_000);
+        let newer = persist_session_with_metadata(&root, "session-1000-10", 1_000, 5_000);
+
+        // when
+        let sessions = list_managed_sessions_for(&root).expect("managed sessions should list");
+        let latest = latest_managed_session_for(&root).expect("latest managed session should load");
+
+        // then
+        assert_eq!(sessions[0].id, newer.session_id);
+        assert_eq!(sessions[1].id, older.session_id);
+        assert_eq!(latest.id, newer.session_id);
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_store_latest_uses_numeric_session_counter_when_updated_at_ties() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let older = persist_session_via_store_with_metadata(&store, "session-1000-9", 1_000, 5_000);
+        let newer =
+            persist_session_via_store_with_metadata(&store, "session-1000-10", 1_000, 5_000);
+
+        // when
+        let sessions = store.list_sessions().expect("list sessions");
+        let latest = store.latest_session().expect("latest should resolve");
+        let handle = store
+            .resolve_reference("latest")
+            .expect("latest alias should resolve");
+
+        // then
+        assert_eq!(sessions[0].id, newer.session_id);
+        assert_eq!(sessions[1].id, older.session_id);
         assert_eq!(latest.id, newer.session_id);
         assert_eq!(handle.id, newer.session_id);
         fs::remove_dir_all(base).expect("temp dir should clean up");

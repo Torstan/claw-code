@@ -3333,6 +3333,8 @@ struct ManagedSessionSummary {
     message_count: usize,
     parent_session_id: Option<String>,
     branch_name: Option<String>,
+    created_at_ms: u64,
+    session_counter: Option<u64>,
 }
 
 struct LiveCli {
@@ -5048,44 +5050,90 @@ fn collect_sessions_from_dir(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
-            match Session::load_from_path(&path) {
-                Ok(session) => {
-                    let parent_session_id = session
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.parent_session_id.clone());
-                    let branch_name = session
-                        .fork
-                        .as_ref()
-                        .and_then(|fork| fork.branch_name.clone());
-                    (
-                        session.session_id,
-                        session.messages.len(),
-                        parent_session_id,
-                        branch_name,
-                    )
-                }
-                Err(_) => (
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    0,
-                    None,
-                    None,
-                ),
-            };
-        sessions.push(ManagedSessionSummary {
+        let (
             id,
-            path,
-            modified_epoch_millis,
             message_count,
             parent_session_id,
             branch_name,
+            logical_modified_epoch_millis,
+            created_at_ms,
+            session_counter,
+        ) = match Session::load_from_path(&path) {
+            Ok(session) => {
+                let parent_session_id = session
+                    .fork
+                    .as_ref()
+                    .map(|fork| fork.parent_session_id.clone());
+                let branch_name = session
+                    .fork
+                    .as_ref()
+                    .and_then(|fork| fork.branch_name.clone());
+                let session_counter = session_counter_from_id(&session.session_id);
+                (
+                    session.session_id,
+                    session.messages.len(),
+                    parent_session_id,
+                    branch_name,
+                    u128::from(session.updated_at_ms),
+                    session.created_at_ms,
+                    session_counter,
+                )
+            }
+            Err(_) => {
+                let id = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                (
+                    id.clone(),
+                    0,
+                    None,
+                    None,
+                    modified_epoch_millis,
+                    session_created_at_from_id(&id)
+                        .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                    session_counter_from_id(&id),
+                )
+            }
+        };
+        sessions.push(ManagedSessionSummary {
+            id,
+            path,
+            modified_epoch_millis: logical_modified_epoch_millis,
+            message_count,
+            parent_session_id,
+            branch_name,
+            created_at_ms,
+            session_counter,
         });
     }
     Ok(())
+}
+
+fn sort_managed_session_summaries(sessions: &mut [ManagedSessionSummary]) {
+    sessions.sort_by(|left, right| {
+        right
+            .modified_epoch_millis
+            .cmp(&left.modified_epoch_millis)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| right.session_counter.cmp(&left.session_counter))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn session_created_at_from_id(session_id: &str) -> Option<u64> {
+    parse_session_id_components(session_id).map(|(created_at_ms, _)| created_at_ms)
+}
+
+fn session_counter_from_id(session_id: &str) -> Option<u64> {
+    parse_session_id_components(session_id).map(|(_, counter)| counter)
+}
+
+fn parse_session_id_components(session_id: &str) -> Option<(u64, u64)> {
+    let suffix = session_id.strip_prefix("session-")?;
+    let (created_at_ms, counter) = suffix.rsplit_once('-')?;
+    Some((created_at_ms.parse().ok()?, counter.parse().ok()?))
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
@@ -5103,12 +5151,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         collect_sessions_from_dir(legacy_root, &mut sessions)?;
     }
 
-    sessions.sort_by(|left, right| {
-        right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+    sort_managed_session_summaries(&mut sessions);
     Ok(sessions)
 }
 
@@ -9218,6 +9261,41 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn clear_proxy_env() -> [EnvVarGuard; 8] {
+        [
+            EnvVarGuard::unset("HTTP_PROXY"),
+            EnvVarGuard::unset("HTTPS_PROXY"),
+            EnvVarGuard::unset("ALL_PROXY"),
+            EnvVarGuard::unset("NO_PROXY"),
+            EnvVarGuard::unset("http_proxy"),
+            EnvVarGuard::unset("https_proxy"),
+            EnvVarGuard::unset("all_proxy"),
+            EnvVarGuard::unset("no_proxy"),
+        ]
+    }
+
     fn sample_oauth_config(token_url: String) -> OAuthConfig {
         OAuthConfig {
             client_id: "runtime-client".to_string(),
@@ -9408,6 +9486,7 @@ mod tests {
         let _guard = env_lock();
         let workspace = temp_dir();
         let config_home = temp_dir();
+        let _proxy_env = clear_proxy_env();
         std::fs::create_dir_all(&workspace).expect("workspace should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
 
@@ -11392,6 +11471,48 @@ UU conflicted.rs",
                 .expect("resolved path should exist"),
             newer.path.canonicalize().expect("newer path should exist")
         );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn latest_session_alias_uses_numeric_counter_when_updated_at_ties() {
+        let _guard = cwd_lock().lock().expect("cwd lock");
+        let workspace = temp_workspace("latest-session-tie");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let older = create_managed_session_handle("session-1000-9").expect("older handle");
+        let mut older_session = Session::new().with_persistence_path(older.path.clone());
+        older_session.session_id = "session-1000-9".to_string();
+        older_session
+            .push_user_text("older")
+            .expect("older session should save");
+        older_session.created_at_ms = 1_000;
+        older_session.updated_at_ms = 5_000;
+        older_session
+            .save_to_path(&older.path)
+            .expect("older session should persist");
+
+        let newer = create_managed_session_handle("session-1000-10").expect("newer handle");
+        let mut newer_session = Session::new().with_persistence_path(newer.path.clone());
+        newer_session.session_id = "session-1000-10".to_string();
+        newer_session
+            .push_user_text("newer")
+            .expect("newer session should save");
+        newer_session.created_at_ms = 1_000;
+        newer_session.updated_at_ms = 5_000;
+        newer_session
+            .save_to_path(&newer.path)
+            .expect("newer session should persist");
+
+        let resolved = resolve_session_reference("latest").expect("latest session should resolve");
+        let latest = crate::latest_managed_session().expect("latest session should load");
+
+        assert_eq!(resolved.id, "session-1000-10");
+        assert_eq!(latest.id, "session-1000-10");
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");

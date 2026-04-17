@@ -9,6 +9,7 @@ use crate::compact::{estimate_session_tokens, CompactionConfig, CompactionResult
 use crate::compact_session_with_memory;
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::micro_compact::{micro_compact_session, MicroCompactionConfig};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -373,7 +374,19 @@ where
             }
 
             self.inject_pending_session_notifications()?;
-            if let Some(event) = self.maybe_auto_compact() {
+            if iterations == 1 {
+                if let Err(error) = self.maybe_micro_compact() {
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+            }
+            if let Some(event) = match self.maybe_auto_compact() {
+                Ok(event) => event,
+                Err(error) => {
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+            } {
                 if let Some(existing) = auto_compaction.as_mut() {
                     existing.removed_message_count += event.removed_message_count;
                 } else {
@@ -752,11 +765,19 @@ where
         Ok(())
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+    fn maybe_micro_compact(&mut self) -> Result<(), RuntimeError> {
+        let result = micro_compact_session(&self.session, MicroCompactionConfig::default());
+        if result.cleared_tool_result_count == 0 {
+            return Ok(());
+        }
+        self.replace_session_and_persist(result.compacted_session)
+    }
+
+    fn maybe_auto_compact(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         if estimate_session_tokens(&self.session)
             < self.auto_compaction_input_tokens_threshold as usize
         {
-            return None;
+            return Ok(None);
         }
 
         let config = CompactionConfig {
@@ -766,13 +787,23 @@ where
         let result = compact_session_with_memory(&self.session, config);
 
         if result.removed_message_count == 0 {
-            return None;
+            return Ok(None);
         }
 
-        self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        self.replace_session_and_persist(result.compacted_session)?;
+        Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
+        }))
+    }
+
+    fn replace_session_and_persist(&mut self, session: Session) -> Result<(), RuntimeError> {
+        if let Some(path) = session.persistence_path().map(|path| path.to_path_buf()) {
+            session
+                .save_to_path(&path)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        self.session = session;
+        Ok(())
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -1027,12 +1058,15 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::micro_compact::{
+        micro_compact_session, MicroCompactionConfig, MICROCOMPACT_CLEARED_SENTINEL,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{CompactionMarkerKind, ContentBlock, MessageRole, Session};
     use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
     use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
     use crate::usage::TokenUsage;
@@ -2037,6 +2071,30 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
     }
 
+    fn tool_use_message(
+        id: &str,
+        tool_name: &str,
+        input: &str,
+    ) -> crate::session::ConversationMessage {
+        crate::session::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: tool_name.to_string(),
+            input: input.to_string(),
+        }])
+    }
+
+    fn tool_result_outputs(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+            })
+            .collect()
+    }
+
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
         script.replace('\'', "\"")
@@ -2279,6 +2337,316 @@ mod tests {
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    #[test]
+    fn micro_compact_clears_old_tool_results_but_preserves_recent_tail() {
+        let mut session = Session::new();
+        session.messages = vec![
+            tool_use_message("tool-1", "bash", "printf 'one'"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                "old bash output 1",
+                false,
+            ),
+            tool_use_message("tool-2", "grep_search", r#"{"pattern":"needle"}"#),
+            crate::session::ConversationMessage::tool_result(
+                "tool-2",
+                "grep_search",
+                "old grep output 2",
+                false,
+            ),
+            tool_use_message("tool-3", "read_file", r#"{"path":"src/main.rs"}"#),
+            crate::session::ConversationMessage::tool_result(
+                "tool-3",
+                "read_file",
+                "recent read output 3",
+                false,
+            ),
+        ];
+
+        let result = micro_compact_session(
+            &session,
+            MicroCompactionConfig {
+                trigger_count: 2,
+                keep_recent: 1,
+                gap_threshold_minutes: u64::MAX,
+            },
+        );
+
+        assert_eq!(result.cleared_tool_result_count, 2);
+        assert!(result.estimated_tokens_freed > 0);
+        assert_eq!(
+            tool_result_outputs(&result.compacted_session),
+            vec![
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                "recent read output 3".to_string(),
+            ]
+        );
+        assert!(
+            result.compacted_session.messages.iter().any(|message| {
+                message.compaction_meta.as_ref().map(|meta| meta.kind)
+                    == Some(CompactionMarkerKind::MicrocompactBoundary)
+            }),
+            "microcompact should append a boundary marker",
+        );
+    }
+
+    #[test]
+    fn micro_compact_does_not_clear_current_turn_tool_results_before_post_tool_request() {
+        struct PostToolApi {
+            calls: usize,
+        }
+
+        impl ApiClient for PostToolApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let mut events = (1..=7)
+                            .map(|index| AssistantEvent::ToolUse {
+                                id: format!("tool-{index}"),
+                                name: "bash".to_string(),
+                                input: index.to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        events.push(AssistantEvent::MessageStop);
+                        Ok(events)
+                    }
+                    2 => {
+                        let outputs = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            outputs,
+                            (1..=7)
+                                .map(|index| format!("tool output {index}"))
+                                .collect::<Vec<_>>(),
+                            "microcompact must not clear tool results produced in the current turn before the model consumes them",
+                        );
+                        assert!(
+                            !request.messages.iter().any(|message| {
+                                message.compaction_meta.as_ref().map(|meta| meta.kind)
+                                    == Some(CompactionMarkerKind::MicrocompactBoundary)
+                            }),
+                            "current-turn post-tool follow-up should not receive a microcompact marker",
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PostToolApi { calls: 0 },
+            StaticToolExecutor::new().register("bash", |input| Ok(format!("tool output {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("continue", None)
+            .expect("post-tool follow-up should succeed");
+    }
+
+    #[test]
+    fn micro_compact_persists_rewritten_snapshot_even_when_request_fails() {
+        struct FailingApi;
+
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("upstream failed"))
+            }
+        }
+
+        let path = temp_session_path("microcompact-failed-turn");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.messages = (1..=7)
+            .flat_map(|index| {
+                [
+                    tool_use_message(&format!("tool-{index}"), "bash", &index.to_string()),
+                    crate::session::ConversationMessage::tool_result(
+                        format!("tool-{index}"),
+                        "bash",
+                        format!("tool output {index}"),
+                        false,
+                    ),
+                ]
+            })
+            .collect();
+        session
+            .save_to_path(&path)
+            .expect("seed session should persist");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FailingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("continue", None)
+            .expect_err("API failure should propagate");
+        assert_eq!(error.to_string(), "upstream failed");
+
+        let persisted_session =
+            Session::load_from_path(&path).expect("persisted session should reload");
+        assert_eq!(
+            persisted_session.messages,
+            runtime.session().messages,
+            "failed turns must still persist the rewritten compacted snapshot",
+        );
+        assert_eq!(
+            persisted_session.updated_at_ms,
+            runtime.session().updated_at_ms
+        );
+        assert_eq!(
+            tool_result_outputs(&persisted_session),
+            vec![
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                "tool output 6".to_string(),
+                "tool output 7".to_string(),
+            ]
+        );
+        assert!(persisted_session.messages.iter().any(|message| {
+            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                == Some(CompactionMarkerKind::MicrocompactBoundary)
+        }));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn micro_compact_time_based_trigger_uses_last_assistant_timestamp() {
+        struct TimeBasedMicrocompactApi;
+
+        impl ApiClient for TimeBasedMicrocompactApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let outputs = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                        ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    outputs,
+                    vec![
+                        MICROCOMPACT_CLEARED_SENTINEL.to_string(),
+                        "recent tool output 2".to_string(),
+                        "recent tool output 3".to_string(),
+                    ],
+                    "time-based microcompact should use the last assistant timestamp, not the last tool result timestamp",
+                );
+                assert!(request.messages.iter().any(|message| {
+                    message.compaction_meta.as_ref().map(|meta| meta.kind)
+                        == Some(CompactionMarkerKind::MicrocompactBoundary)
+                }));
+                assert!(request.messages.iter().any(|message| {
+                    message.role == MessageRole::User
+                        && message.blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { text } if text == "keep going"
+                            )
+                        })
+                }));
+
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_millis() as u64;
+        let stale_ms = now_ms.saturating_sub(2 * 60 * 60 * 1000);
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("inspect tools"),
+            tool_use_message("tool-1", "bash", "printf 'one'"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                "old tool output 1",
+                false,
+            ),
+            tool_use_message("tool-2", "bash", "printf 'two'"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-2",
+                "bash",
+                "recent tool output 2",
+                false,
+            ),
+            tool_use_message("tool-3", "bash", "printf 'three'"),
+            crate::session::ConversationMessage::tool_result(
+                "tool-3",
+                "bash",
+                "recent tool output 3",
+                false,
+            ),
+        ];
+
+        for message in &mut session.messages {
+            match message.role {
+                MessageRole::Assistant => {
+                    message.timestamp_ms = stale_ms;
+                }
+                MessageRole::Tool
+                    if matches!(
+                        message.blocks.first(),
+                        Some(ContentBlock::ToolResult { tool_use_id, .. }) if tool_use_id == "tool-1"
+                    ) =>
+                {
+                    message.timestamp_ms = stale_ms;
+                }
+                MessageRole::Tool => {
+                    message.timestamp_ms = now_ms;
+                }
+                MessageRole::System | MessageRole::User => {}
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TimeBasedMicrocompactApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("keep going", None)
+            .expect("turn should succeed");
     }
 
     #[test]
