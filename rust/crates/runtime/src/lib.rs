@@ -40,6 +40,7 @@ mod session;
 pub mod session_control;
 mod session_memory_compact;
 mod session_notifications;
+mod snip_compact;
 pub use session_control::SessionStore;
 pub use session_notifications::{
     active_tool_session_id, drain_session_notifications, enqueue_session_notification,

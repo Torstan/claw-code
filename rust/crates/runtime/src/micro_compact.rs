@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::session::{
     CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session,
 };
+use crate::snip_compact::SNIP_CLEARED_TOOL_RESULT_SENTINEL;
 
 pub const MICROCOMPACT_CLEARED_SENTINEL: &str = "[Old tool result content cleared by microcompact]";
 
@@ -14,6 +15,11 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "glob_search",
     "grep_search",
 ];
+
+#[must_use]
+pub(crate) fn is_compactable_tool_name(tool_name: &str) -> bool {
+    COMPACTABLE_TOOLS.contains(&tool_name)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MicroCompactionConfig {
@@ -116,8 +122,11 @@ fn collect_compactable_tool_result_indices(session: &Session) -> Vec<usize> {
             }
 
             message.blocks.iter().find_map(|block| match block {
-                ContentBlock::ToolResult { tool_name, .. }
-                    if COMPACTABLE_TOOLS.contains(&tool_name.as_str()) =>
+                ContentBlock::ToolResult {
+                    tool_name, output, ..
+                } if is_compactable_tool_name(tool_name)
+                    && output != SNIP_CLEARED_TOOL_RESULT_SENTINEL
+                    && output != MICROCOMPACT_CLEARED_SENTINEL =>
                 {
                     Some(index)
                 }
