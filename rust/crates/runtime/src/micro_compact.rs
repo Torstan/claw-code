@@ -50,17 +50,24 @@ pub fn micro_compact_session(
     session: &Session,
     config: MicroCompactionConfig,
 ) -> MicroCompactionResult {
+    maybe_micro_compact_session(session, config).unwrap_or_else(|| no_op_result(session))
+}
+
+#[must_use]
+pub(crate) fn maybe_micro_compact_session(
+    session: &Session,
+    config: MicroCompactionConfig,
+) -> Option<MicroCompactionResult> {
     let compactable_indices = collect_compactable_tool_result_indices(session);
     let time_triggered = is_time_based_triggered(session, config, current_time_millis());
     let count_triggered = compactable_indices.len() > config.trigger_count;
     if !time_triggered && !count_triggered {
-        return no_op_result(session);
+        return None;
     }
 
-    let keep_recent = config.keep_recent.max(1);
-    let clear_until = compactable_indices.len().saturating_sub(keep_recent);
+    let clear_until = compactable_indices.len().saturating_sub(config.keep_recent);
     if clear_until == 0 {
-        return no_op_result(session);
+        return None;
     }
 
     let mut compacted_session = session.clone();
@@ -86,7 +93,7 @@ pub fn micro_compact_session(
     }
 
     if cleared_tool_result_count == 0 {
-        return no_op_result(session);
+        return None;
     }
 
     insert_microcompact_marker(
@@ -96,11 +103,11 @@ pub fn micro_compact_session(
     );
     compacted_session.updated_at_ms = current_time_millis();
 
-    MicroCompactionResult {
+    Some(MicroCompactionResult {
         compacted_session,
         cleared_tool_result_count,
         estimated_tokens_freed,
-    }
+    })
 }
 
 fn no_op_result(session: &Session) -> MicroCompactionResult {
