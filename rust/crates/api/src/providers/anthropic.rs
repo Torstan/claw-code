@@ -1285,6 +1285,41 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn clear_proxy_env() -> [EnvVarGuard; 8] {
+        [
+            EnvVarGuard::unset("HTTP_PROXY"),
+            EnvVarGuard::unset("HTTPS_PROXY"),
+            EnvVarGuard::unset("ALL_PROXY"),
+            EnvVarGuard::unset("NO_PROXY"),
+            EnvVarGuard::unset("http_proxy"),
+            EnvVarGuard::unset("https_proxy"),
+            EnvVarGuard::unset("all_proxy"),
+            EnvVarGuard::unset("no_proxy"),
+        ]
+    }
+
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "api-oauth-test-{}-{}",
@@ -1448,6 +1483,7 @@ mod tests {
     fn resolve_saved_oauth_token_refreshes_expired_credentials() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        let _proxy_env = clear_proxy_env();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1536,6 +1572,7 @@ mod tests {
     fn resolve_saved_oauth_token_preserves_refresh_token_when_refresh_response_omits_it() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        let _proxy_env = clear_proxy_env();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
