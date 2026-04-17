@@ -16,6 +16,7 @@ use crate::permissions::{
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::session_memory_compact::refresh_session_memory;
 use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
+use crate::snip_compact::{snip_compact_session, SnipCompactionConfig};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -375,6 +376,10 @@ where
 
             self.inject_pending_session_notifications()?;
             if iterations == 1 {
+                if let Err(error) = self.maybe_snip_compact() {
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 if let Err(error) = self.maybe_micro_compact() {
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
@@ -765,6 +770,17 @@ where
         Ok(())
     }
 
+    fn maybe_snip_compact(&mut self) -> Result<(), RuntimeError> {
+        let config = SnipCompactionConfig::for_auto_compaction_threshold(
+            self.auto_compaction_input_tokens_threshold as usize,
+        );
+        let result = snip_compact_session(&self.session, config);
+        if result.snipped_message_ids.is_empty() {
+            return Ok(());
+        }
+        self.replace_session_and_persist(result.compacted_session)
+    }
+
     fn maybe_micro_compact(&mut self) -> Result<(), RuntimeError> {
         let result = micro_compact_session(&self.session, MicroCompactionConfig::default());
         if result.cleared_tool_result_count == 0 {
@@ -1069,6 +1085,10 @@ mod tests {
     use crate::session::{CompactionMarkerKind, ContentBlock, MessageRole, Session};
     use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
     use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
+    use crate::snip_compact::{
+        snip_compact_session, SnipCompactionConfig, SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL,
+        SNIP_CLEARED_TOOL_RESULT_SENTINEL,
+    };
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -2337,6 +2357,348 @@ mod tests {
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    #[test]
+    fn snip_compact_clears_old_long_assistant_and_tool_messages_but_preserves_user_and_recent_tail()
+    {
+        let preserved_user =
+            crate::session::ConversationMessage::user_text("keep this user prompt");
+        let old_assistant =
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old assistant context ".repeat(40),
+            }]);
+        let old_tool_result = crate::session::ConversationMessage::tool_result(
+            "tool-1",
+            "bash",
+            "old tool output ".repeat(40),
+            false,
+        );
+        let recent_user = crate::session::ConversationMessage::user_text("keep recent user");
+        let recent_assistant =
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "keep recent assistant".to_string(),
+            }]);
+        let old_assistant_id = old_assistant.message_id.clone();
+        let old_tool_result_id = old_tool_result.message_id.clone();
+        let recent_assistant_id = recent_assistant.message_id.clone();
+
+        let mut session = Session::new();
+        session.messages = vec![
+            preserved_user.clone(),
+            old_assistant,
+            tool_use_message("tool-1", "bash", "printf old"),
+            old_tool_result,
+            recent_user.clone(),
+            recent_assistant,
+        ];
+
+        let result = snip_compact_session(
+            &session,
+            SnipCompactionConfig {
+                trigger_threshold_tokens: 1,
+                target_tokens: 0,
+                protected_recent_messages: 2,
+                min_candidate_tokens: 20,
+            },
+        );
+
+        assert_eq!(result.snipped_message_ids.len(), 2);
+        assert!(result.snipped_message_ids.contains(&old_assistant_id));
+        assert!(result.snipped_message_ids.contains(&old_tool_result_id));
+        assert!(result.estimated_tokens_freed > 0);
+
+        let snipped_assistant = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == old_assistant_id)
+            .expect("old assistant should remain addressable by id");
+        assert!(matches!(
+            snipped_assistant.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
+        ));
+
+        let snipped_tool_result = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == old_tool_result_id)
+            .expect("old tool result should remain addressable by id");
+        assert!(matches!(
+            snipped_tool_result.blocks.as_slice(),
+            [ContentBlock::ToolResult { output, .. }] if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL
+        ));
+
+        let preserved_recent_assistant = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == recent_assistant_id)
+            .expect("recent assistant should remain present");
+        assert!(matches!(
+            preserved_recent_assistant.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "keep recent assistant"
+        ));
+
+        assert!(result.compacted_session.messages.iter().any(|message| {
+            message.compaction_meta.as_ref().map(|meta| meta.kind)
+                == Some(CompactionMarkerKind::SnipBoundary)
+        }));
+        assert!(result.compacted_session.messages.iter().any(|message| {
+            message.role == MessageRole::User && message.blocks == preserved_user.blocks
+        }));
+        assert!(result.compacted_session.messages.iter().any(|message| {
+            message.role == MessageRole::User && message.blocks == recent_user.blocks
+        }));
+    }
+
+    #[test]
+    fn snip_compact_runs_before_micro_and_auto_compaction() {
+        struct SnipAwareApi;
+
+        impl ApiClient for SnipAwareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request.messages.iter().any(|message| {
+                    message.compaction_meta.as_ref().map(|meta| meta.kind)
+                        == Some(CompactionMarkerKind::SnipBoundary)
+                }));
+                assert!(
+                    !request.messages.iter().any(|message| {
+                        message.compaction_meta.as_ref().map(|meta| meta.kind)
+                            == Some(CompactionMarkerKind::MicrocompactBoundary)
+                    }),
+                    "snip should run early enough to avoid redundant micro compaction for already-snipped tool results",
+                );
+                assert!(
+                    !request.messages.iter().any(|message| {
+                        message.compaction_meta.as_ref().map(|meta| meta.kind)
+                            == Some(CompactionMarkerKind::CompactBoundary)
+                    }),
+                    "snip should reduce the request before auto compact escalates to a full summary",
+                );
+
+                let tool_outputs = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                        ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    tool_outputs,
+                    vec![
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
+                        "tool output 6 ".repeat(30),
+                        "tool output 7 ".repeat(30),
+                    ]
+                );
+                assert!(request.messages.iter().any(|message| {
+                    message.role == MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { text }
+                                    if text == SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL
+                            )
+                        })
+                }));
+
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![crate::session::ConversationMessage::assistant(vec![
+            ContentBlock::Text {
+                text: "old assistant context ".repeat(40),
+            },
+        ])];
+        for index in 1..=7 {
+            session.messages.push(tool_use_message(
+                &format!("tool-{index}"),
+                "bash",
+                &index.to_string(),
+            ));
+            session
+                .messages
+                .push(crate::session::ConversationMessage::tool_result(
+                    format!("tool-{index}"),
+                    "bash",
+                    format!("tool output {index} ").repeat(30),
+                    false,
+                ));
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SnipAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(400);
+
+        let summary = runtime
+            .run_turn("continue", None)
+            .expect("snip-first request should succeed");
+
+        assert_eq!(summary.auto_compaction, None);
+    }
+
+    #[test]
+    fn snip_compact_skips_error_and_non_compactable_tool_results() {
+        let safe_tool_result = crate::session::ConversationMessage::tool_result(
+            "tool-safe",
+            "bash",
+            "safe tool output ".repeat(40),
+            false,
+        );
+        let safe_tool_result_id = safe_tool_result.message_id.clone();
+        let error_tool_result = crate::session::ConversationMessage::tool_result(
+            "tool-error",
+            "bash",
+            "failing tool output ".repeat(40),
+            true,
+        );
+        let error_tool_result_id = error_tool_result.message_id.clone();
+        let status_tool_result = crate::session::ConversationMessage::tool_result(
+            "tool-status",
+            "Agent",
+            "worker status payload ".repeat(40),
+            false,
+        );
+        let status_tool_result_id = status_tool_result.message_id.clone();
+
+        let mut session = Session::new();
+        session.messages = vec![
+            tool_use_message("tool-safe", "bash", "printf safe"),
+            safe_tool_result,
+            tool_use_message("tool-error", "bash", "printf failing"),
+            error_tool_result,
+            tool_use_message("tool-status", "Agent", "{}"),
+            status_tool_result,
+        ];
+
+        let result = snip_compact_session(
+            &session,
+            SnipCompactionConfig {
+                trigger_threshold_tokens: 1,
+                target_tokens: 0,
+                protected_recent_messages: 0,
+                min_candidate_tokens: 20,
+            },
+        );
+
+        assert_eq!(
+            result.snipped_message_ids,
+            vec![safe_tool_result_id.clone()]
+        );
+
+        let snipped_tool_result = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == safe_tool_result_id)
+            .expect("safe tool result should remain present");
+        assert!(matches!(
+            snipped_tool_result.blocks.as_slice(),
+            [ContentBlock::ToolResult { output, is_error, .. }]
+                if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL && !is_error
+        ));
+
+        let preserved_error_result = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == error_tool_result_id)
+            .expect("error tool result should remain present");
+        assert!(matches!(
+            preserved_error_result.blocks.as_slice(),
+            [ContentBlock::ToolResult { output, is_error, .. }]
+                if output == &"failing tool output ".repeat(40) && *is_error
+        ));
+
+        let preserved_status_result = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == status_tool_result_id)
+            .expect("status tool result should remain present");
+        assert!(matches!(
+            preserved_status_result.blocks.as_slice(),
+            [ContentBlock::ToolResult { output, tool_name, is_error, .. }]
+                if output == &"worker status payload ".repeat(40)
+                    && tool_name == "Agent"
+                    && !is_error
+        ));
+    }
+
+    #[test]
+    fn snip_compact_prioritizes_large_tool_results_before_assistant_text() {
+        let old_assistant =
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "important assistant conclusion ".repeat(12),
+            }]);
+        let old_assistant_id = old_assistant.message_id.clone();
+        let old_tool_result = crate::session::ConversationMessage::tool_result(
+            "tool-1",
+            "bash",
+            "large low-value tool output ".repeat(80),
+            false,
+        );
+        let old_tool_result_id = old_tool_result.message_id.clone();
+
+        let mut session = Session::new();
+        session.messages = vec![
+            old_assistant,
+            tool_use_message("tool-1", "bash", "printf data"),
+            old_tool_result,
+        ];
+
+        let estimated_tokens = crate::compact::estimate_session_tokens(&session);
+        let result = snip_compact_session(
+            &session,
+            SnipCompactionConfig {
+                trigger_threshold_tokens: 1,
+                target_tokens: estimated_tokens.saturating_sub(100),
+                protected_recent_messages: 0,
+                min_candidate_tokens: 20,
+            },
+        );
+
+        assert_eq!(result.snipped_message_ids, vec![old_tool_result_id.clone()]);
+
+        let preserved_assistant = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == old_assistant_id)
+            .expect("assistant message should remain present");
+        assert!(matches!(
+            preserved_assistant.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == &"important assistant conclusion ".repeat(12)
+        ));
+
+        let snipped_tool_result = result
+            .compacted_session
+            .messages
+            .iter()
+            .find(|message| message.message_id == old_tool_result_id)
+            .expect("tool result should remain present");
+        assert!(matches!(
+            snipped_tool_result.blocks.as_slice(),
+            [ContentBlock::ToolResult { output, .. }] if output == SNIP_CLEARED_TOOL_RESULT_SENTINEL
+        ));
     }
 
     #[test]
