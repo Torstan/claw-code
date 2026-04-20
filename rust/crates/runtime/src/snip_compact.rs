@@ -1,10 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::compact::estimate_session_tokens;
+use crate::compact::{estimate_message_tokens, estimate_session_tokens};
 use crate::micro_compact::{is_compactable_tool_name, MICROCOMPACT_CLEARED_SENTINEL};
-use crate::session::{
-    CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session,
-};
+use crate::session::{CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session};
 
 pub const SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL: &str =
     "[Older assistant text cleared by snip compact]";
@@ -203,20 +201,6 @@ fn rewrite_message_for_snip(message: &mut ConversationMessage) -> usize {
         *output = SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string();
     }
     estimate_message_tokens(message)
-}
-
-fn estimate_message_tokens(message: &ConversationMessage) -> usize {
-    message
-        .blocks
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
-            ContentBlock::ToolResult {
-                tool_name, output, ..
-            } => (tool_name.len() + output.len()) / 4 + 1,
-        })
-        .sum()
 }
 
 fn insert_snip_marker(

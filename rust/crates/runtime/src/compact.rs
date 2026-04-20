@@ -1,5 +1,23 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
+pub(crate) fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+    message
+        .blocks
+        .iter()
+        .map(estimate_block_tokens)
+        .sum()
+}
+
+fn estimate_block_tokens(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text { text } => text.len() / 4 + 1,
+        ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
+        ContentBlock::ToolResult {
+            tool_name, output, ..
+        } => (tool_name.len() + output.len()) / 4 + 1,
+    }
+}
+
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
@@ -107,7 +125,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .messages
         .first()
         .and_then(extract_existing_compacted_summary);
-    let compacted_prefix_len = usize::from(existing_summary.is_some());
+    let compacted_prefix_len = existing_summary.as_ref().map_or(0, |_| 1);
     let raw_keep_from = session
         .messages
         .len()
@@ -119,41 +137,30 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     // the OpenAI-compat path (400: tool message must follow assistant with
     // tool_calls). Walk the boundary back until we start at a safe point.
     let keep_from = {
-        let mut k = raw_keep_from;
-        // If the first preserved message is a tool-result turn, ensure its
-        // paired assistant tool-use turn is preserved too. Without this fix,
-        // the OpenAI-compat adapter sends an orphaned 'tool' role message
-        // with no preceding assistant 'tool_calls', which providers reject
-        // with a 400. We walk back only if the immediately preceding message
-        // is NOT an assistant message that contains a ToolUse block (i.e. the
-        // pair is actually broken at the boundary).
-        loop {
-            if k == 0 || k <= compacted_prefix_len {
+        let mut k = raw_keep_from.max(compacted_prefix_len);
+        while k > compacted_prefix_len {
+            let Some(first_preserved) = session.messages.get(k) else {
                 break;
-            }
-            let first_preserved = &session.messages[k];
+            };
             let starts_with_tool_result = first_preserved
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|block| matches!(block, ContentBlock::ToolResult { .. }));
             if !starts_with_tool_result {
                 break;
             }
-            // Check the message just before the current boundary.
+
             let preceding = &session.messages[k - 1];
             let preceding_has_tool_use = preceding
                 .blocks
                 .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
             if preceding_has_tool_use {
-                // Pair is intact — walk back one more to include the assistant turn.
-                k = k.saturating_sub(1);
-                break;
+                k -= 1;
+                continue;
             }
-            // Preceding message has no ToolUse but we have a ToolResult —
-            // this is already an orphaned pair; walk back to try to fix it.
-            k = k.saturating_sub(1);
+
+            k -= 1;
         }
         k
     };
@@ -181,13 +188,11 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
-    usize::from(
-        session
-            .messages
-            .first()
-            .and_then(extract_existing_compacted_summary)
-            .is_some(),
-    )
+    session
+        .messages
+        .first()
+        .and_then(extract_existing_compacted_summary)
+        .map_or(0, |_| 1)
 }
 
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
@@ -436,20 +441,6 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
     let mut truncated = content.chars().take(max_chars).collect::<String>();
     truncated.push('…');
     truncated
-}
-
-fn estimate_message_tokens(message: &ConversationMessage) -> usize {
-    message
-        .blocks
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
-            ContentBlock::ToolResult {
-                tool_name, output, ..
-            } => (tool_name.len() + output.len()) / 4 + 1,
-        })
-        .sum()
 }
 
 fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
