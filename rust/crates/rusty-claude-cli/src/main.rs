@@ -47,13 +47,14 @@ use runtime::{
     active_tool_session_id, agent_debug_log, check_base_commit, clear_oauth_credentials,
     compact_session_with_memory, format_stale_base_warning, format_usd, generate_pkce_pair,
     generate_state, load_oauth_credentials, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials, with_active_tool_session, ApiClient,
-    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, ToolInvocation, UsageTracker,
+    parse_oauth_callback_request_target, partial_compact_session, pricing_for_model,
+    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
+    with_active_tool_session, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
+    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, PermissionPolicy,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
+    ToolError, ToolExecutor, ToolInvocation, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2823,14 +2824,18 @@ fn run_resume_command(
             message: Some(render_repl_help()),
             json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
-        SlashCommand::Compact => {
-            let result = compact_session_with_memory(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
+        SlashCommand::Compact { ref mode } => {
+            let result = if let Some(mode) = mode {
+                partial_compact_session(session, *mode)
+            } else {
+                compact_session_with_memory(
+                    session,
+                    CompactionConfig {
+                        max_estimated_tokens: 0,
+                        ..CompactionConfig::default()
+                    },
+                )
+            };
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
@@ -4167,8 +4172,8 @@ impl LiveCli {
                 Self::print_sandbox_status();
                 false
             }
-            SlashCommand::Compact => {
-                self.compact()?;
+            SlashCommand::Compact { mode } => {
+                self.compact(mode)?;
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
@@ -4836,8 +4841,15 @@ impl LiveCli {
         self.persist_session()
     }
 
-    fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+    fn compact(
+        &mut self,
+        mode: Option<PartialCompactMode>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = if let Some(mode) = mode {
+            partial_compact_session(self.runtime.session(), mode)
+        } else {
+            self.runtime.compact(CompactionConfig::default())
+        };
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -10589,8 +10601,7 @@ mod tests {
     fn direct_slash_commands_surface_shared_validation_errors() {
         let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
             .expect_err("invalid /compact shape should be rejected");
-        assert!(compact_error.contains("Unexpected arguments for /compact."));
-        assert!(compact_error.contains("Usage            /compact"));
+        assert!(compact_error.contains("Usage:"));
 
         let plugins_error = parse_args(&[
             "/plugins".to_string(),

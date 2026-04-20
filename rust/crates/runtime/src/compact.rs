@@ -1,11 +1,7 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 pub(crate) fn estimate_message_tokens(message: &ConversationMessage) -> usize {
-    message
-        .blocks
-        .iter()
-        .map(estimate_block_tokens)
-        .sum()
+    message.blocks.iter().map(estimate_block_tokens).sum()
 }
 
 fn estimate_block_tokens(block: &ContentBlock) -> usize {
@@ -130,44 +126,144 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .messages
         .len()
         .saturating_sub(config.preserve_recent_messages);
-    // Ensure we do not split a tool-use / tool-result pair at the compaction
-    // boundary. If the first preserved message is a user message whose first
-    // block is a ToolResult, the assistant message with the matching ToolUse
-    // was slated for removal — that produces an orphaned tool role message on
-    // the OpenAI-compat path (400: tool message must follow assistant with
-    // tool_calls). Walk the boundary back until we start at a safe point.
-    let keep_from = {
-        let mut k = raw_keep_from.max(compacted_prefix_len);
-        while k > compacted_prefix_len {
-            let Some(first_preserved) = session.messages.get(k) else {
-                break;
-            };
-            let starts_with_tool_result = first_preserved
-                .blocks
-                .first()
-                .is_some_and(|block| matches!(block, ContentBlock::ToolResult { .. }));
-            if !starts_with_tool_result {
-                break;
-            }
-
-            let preceding = &session.messages[k - 1];
-            let preceding_has_tool_use = preceding
-                .blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-            if preceding_has_tool_use {
-                k -= 1;
-                continue;
-            }
-
-            k -= 1;
-        }
-        k
-    };
+    let keep_from = safe_split_boundary(&session.messages, raw_keep_from).max(compacted_prefix_len);
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    build_compaction_result(session, existing_summary.as_deref(), removed, preserved)
+}
+
+/// Specifies which portion of the session to compact in a partial compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialCompactMode {
+    UpToPrompt(usize),
+    FromPrompt(usize),
+}
+
+impl PartialCompactMode {
+    pub fn from_options(up_to_prompt: Option<usize>, from_prompt: Option<usize>) -> Option<Self> {
+        match (up_to_prompt, from_prompt) {
+            (Some(n), None) => Some(Self::UpToPrompt(n)),
+            (None, Some(n)) => Some(Self::FromPrompt(n)),
+            _ => None,
+        }
+    }
+}
+
+/// Maps a 1-based user prompt number to the message index in `session.messages`.
+/// Only counts non-system user messages with at least one text block.
+fn prompt_number_to_message_index(session: &Session, prompt_number: usize) -> Option<usize> {
+    let mut count = 0usize;
+    for (i, message) in session.messages.iter().enumerate() {
+        if message.role != MessageRole::User {
+            continue;
+        }
+        let has_text = message
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { .. }));
+        if !has_text {
+            continue;
+        }
+        count += 1;
+        if count == prompt_number {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Adjusts a split boundary backward to avoid orphaning a tool-result message
+/// whose preceding assistant tool-use would end up on the other side of the cut.
+fn safe_split_boundary(messages: &[ConversationMessage], raw_boundary: usize) -> usize {
+    let mut k = raw_boundary;
+    while k > 0 && k < messages.len() {
+        let starts_with_tool_result = messages[k]
+            .blocks
+            .first()
+            .is_some_and(|block| matches!(block, ContentBlock::ToolResult { .. }));
+        if !starts_with_tool_result {
+            break;
+        }
+        let preceding_has_tool_use = messages[k - 1]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        if preceding_has_tool_use {
+            k -= 1;
+            continue;
+        }
+        k -= 1;
+    }
+    k
+}
+
+/// Compacts a partial range of the session based on a user prompt pivot.
+#[must_use]
+pub fn partial_compact_session(session: &Session, mode: PartialCompactMode) -> CompactionResult {
+    let no_change = || CompactionResult {
+        summary: String::new(),
+        formatted_summary: String::new(),
+        compacted_session: session.clone(),
+        removed_message_count: 0,
+    };
+
+    let pivot_prompt = match mode {
+        PartialCompactMode::UpToPrompt(n) | PartialCompactMode::FromPrompt(n) => n,
+    };
+
+    let Some(pivot_index) = prompt_number_to_message_index(session, pivot_prompt) else {
+        return no_change();
+    };
+
+    let existing_summary = session
+        .messages
+        .first()
+        .and_then(extract_existing_compacted_summary);
+    let compacted_prefix_len = existing_summary.as_ref().map_or(0, |_| 1);
+
+    let (removed, preserved) = match mode {
+        PartialCompactMode::UpToPrompt(_) => {
+            let keep_from = safe_split_boundary(&session.messages, pivot_index);
+            if keep_from <= compacted_prefix_len {
+                return no_change();
+            }
+            let removed = &session.messages[compacted_prefix_len..keep_from];
+            if removed.is_empty() {
+                return no_change();
+            }
+            (removed, session.messages[keep_from..].to_vec())
+        }
+        PartialCompactMode::FromPrompt(_) => {
+            // Walk forward past the pivot prompt's assistant/tool responses.
+            let mut keep_until = pivot_index + 1;
+            while keep_until < session.messages.len() {
+                if session.messages[keep_until].role == MessageRole::User {
+                    break;
+                }
+                keep_until += 1;
+            }
+            let remove_from = safe_split_boundary(&session.messages, keep_until);
+            if remove_from >= session.messages.len() {
+                return no_change();
+            }
+            let removed = &session.messages[remove_from..];
+            if removed.is_empty() {
+                return no_change();
+            }
+            (removed, session.messages[..remove_from].to_vec())
+        }
+    };
+
+    build_compaction_result(session, existing_summary.as_deref(), removed, preserved)
+}
+
+fn build_compaction_result(
+    session: &Session,
+    existing_summary: Option<&str>,
+    removed: &[ConversationMessage],
+    preserved: Vec<ConversationMessage>,
+) -> CompactionResult {
+    let summary = merge_compact_summaries(existing_summary, &summarize_messages(removed));
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -544,7 +640,8 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 mod tests {
     use super::{
         collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        get_compact_continuation_message, infer_pending_work, partial_compact_session,
+        should_compact, CompactionConfig, PartialCompactMode,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -802,5 +899,102 @@ mod tests {
         ]);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("Next: update tests"));
+    }
+
+    #[test]
+    fn partial_compact_up_to_prompt_preserves_tail_and_summarizes_head() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("second prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "second reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("third prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "third reply".to_string(),
+            }]),
+        ];
+
+        let result = partial_compact_session(&session, PartialCompactMode::UpToPrompt(2));
+
+        assert!(
+            result.removed_message_count > 0,
+            "should compact some messages"
+        );
+        assert_eq!(
+            result.compacted_session.messages[0].role,
+            MessageRole::System
+        );
+        let has_third = result.compacted_session.messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("third prompt")))
+        });
+        assert!(has_third, "third prompt should be preserved");
+        let has_first = result.compacted_session.messages.iter().any(|m| {
+            m.role == MessageRole::User
+                && m.blocks.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains("first prompt")),
+                )
+        });
+        assert!(
+            !has_first,
+            "first prompt should be compacted away as a user message"
+        );
+    }
+
+    #[test]
+    fn partial_compact_from_prompt_preserves_head_and_summarizes_tail() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first reply".to_string(),
+            }]),
+            ConversationMessage::user_text("second prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "second reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("third prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "third reply ".repeat(100),
+            }]),
+        ];
+
+        let result = partial_compact_session(&session, PartialCompactMode::FromPrompt(2));
+
+        assert!(
+            result.removed_message_count > 0,
+            "should compact some messages"
+        );
+        assert_eq!(
+            result.compacted_session.messages[0].role,
+            MessageRole::System
+        );
+        let has_first = result.compacted_session.messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("first prompt")))
+        });
+        assert!(has_first, "first prompt should be preserved");
+    }
+
+    #[test]
+    fn partial_compact_returns_unchanged_when_prompt_out_of_range() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("only prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "only reply".to_string(),
+            }]),
+        ];
+
+        let result = partial_compact_session(&session, PartialCompactMode::UpToPrompt(5));
+
+        assert_eq!(result.removed_message_count, 0);
     }
 }
