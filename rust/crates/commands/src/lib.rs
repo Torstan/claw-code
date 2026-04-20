@@ -10,8 +10,9 @@ pub use simplify::build_simplify_prompt;
 
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
-    compact_session_with_memory, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig,
-    McpServerConfig, ScopedMcpServerConfig, Session,
+    compact_session_with_memory, partial_compact_session, CompactionConfig, ConfigLoader,
+    ConfigSource, McpOAuthConfig, McpServerConfig, PartialCompactMode, ScopedMcpServerConfig,
+    Session,
 };
 use serde_json::{json, Value};
 
@@ -1066,7 +1067,9 @@ pub enum SlashCommand {
     Help,
     Status,
     Sandbox,
-    Compact,
+    Compact {
+        mode: Option<PartialCompactMode>,
+    },
     Bughunter {
         scope: Option<String>,
     },
@@ -1349,10 +1352,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Sandbox
         }
-        "compact" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Compact
-        }
+        "compact" => parse_compact_args(command, &args, &remainder)?,
         "bughunter" => SlashCommand::Bughunter { scope: remainder },
         "commit" => {
             validate_no_args(command, &args)?;
@@ -1536,6 +1536,72 @@ fn validate_no_args(command: &str, args: &[&str]) -> Result<(), SlashCommandPars
         command,
         &format!("/{command}"),
     ))
+}
+
+fn parse_compact_args(
+    command: &str,
+    args: &[&str],
+    _remainder: &Option<String>,
+) -> Result<SlashCommand, SlashCommandParseError> {
+    if args.is_empty() {
+        return Ok(SlashCommand::Compact { mode: None });
+    }
+
+    let usage = "/compact [--up-to-prompt N | --from-prompt N]";
+    let mut up_to_prompt: Option<usize> = None;
+    let mut from_prompt: Option<usize> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i] {
+            "--up-to-prompt" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| usage_error(command, usage))?;
+                let n: usize = val.parse().map_err(|_| {
+                    command_error("Prompt number must be a positive integer.", command, usage)
+                })?;
+                if n == 0 {
+                    return Err(command_error(
+                        "Prompt number must be a positive integer.",
+                        command,
+                        usage,
+                    ));
+                }
+                up_to_prompt = Some(n);
+            }
+            "--from-prompt" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| usage_error(command, usage))?;
+                let n: usize = val.parse().map_err(|_| {
+                    command_error("Prompt number must be a positive integer.", command, usage)
+                })?;
+                if n == 0 {
+                    return Err(command_error(
+                        "Prompt number must be a positive integer.",
+                        command,
+                        usage,
+                    ));
+                }
+                from_prompt = Some(n);
+            }
+            _ => {
+                return Err(command_error(&format!("Usage: {usage}"), command, usage));
+            }
+        }
+        i += 1;
+    }
+
+    if up_to_prompt.is_some() && from_prompt.is_some() {
+        return Err(command_error(
+            "Cannot use both --up-to-prompt and --from-prompt at the same time.",
+            command,
+            usage,
+        ));
+    }
+
+    Ok(SlashCommand::Compact {
+        mode: PartialCompactMode::from_options(up_to_prompt, from_prompt),
+    })
 }
 
 fn optional_single_arg(
@@ -4017,8 +4083,12 @@ pub fn handle_slash_command(
     };
 
     match command {
-        SlashCommand::Compact => {
-            let result = compact_session_with_memory(session, compaction);
+        SlashCommand::Compact { mode } => {
+            let result = if let Some(mode) = mode {
+                partial_compact_session(session, mode)
+            } else {
+                compact_session_with_memory(session, compaction)
+            };
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
             } else {
@@ -4121,7 +4191,8 @@ mod tests {
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
-        CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
+        CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
+        PartialCompactMode, Session,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -4488,15 +4559,14 @@ mod tests {
     #[test]
     fn rejects_unexpected_arguments_for_no_arg_commands() {
         // given
-        let input = "/compact now";
+        let input = "/help now";
 
         // when
         let error = parse_error_message(input);
 
         // then
-        assert!(error.contains("Unexpected arguments for /compact."));
-        assert!(error.contains("  Usage            /compact"));
-        assert!(error.contains("  Summary          Compact local session history"));
+        assert!(error.contains("Unexpected arguments for /help."));
+        assert!(error.contains("  Usage            /help"));
     }
 
     #[test]
@@ -5597,5 +5667,157 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn parses_compact_without_arguments() {
+        let command = validate_slash_command_input("/compact")
+            .expect("should parse")
+            .expect("should be some");
+        assert_eq!(command, SlashCommand::Compact { mode: None });
+    }
+
+    #[test]
+    fn parses_compact_with_up_to_prompt() {
+        let command = validate_slash_command_input("/compact --up-to-prompt 3")
+            .expect("should parse")
+            .expect("should be some");
+        assert_eq!(
+            command,
+            SlashCommand::Compact {
+                mode: Some(PartialCompactMode::UpToPrompt(3)),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_compact_with_from_prompt() {
+        let command = validate_slash_command_input("/compact --from-prompt 5")
+            .expect("should parse")
+            .expect("should be some");
+        assert_eq!(
+            command,
+            SlashCommand::Compact {
+                mode: Some(PartialCompactMode::FromPrompt(5)),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_compact_with_both_flags() {
+        let error = parse_error_message("/compact --up-to-prompt 3 --from-prompt 5");
+        assert!(error.contains("Cannot use both"));
+    }
+
+    #[test]
+    fn rejects_compact_with_zero_prompt() {
+        let error = parse_error_message("/compact --up-to-prompt 0");
+        assert!(error.contains("must be a positive integer"));
+    }
+
+    #[test]
+    fn rejects_compact_with_non_numeric_prompt() {
+        let error = parse_error_message("/compact --up-to-prompt abc");
+        assert!(error.contains("must be a positive integer"));
+    }
+
+    #[test]
+    fn rejects_compact_with_unknown_flag() {
+        let error = parse_error_message("/compact --unknown 3");
+        assert!(error.contains("Usage"));
+    }
+
+    #[test]
+    fn partial_compact_up_to_prompt_preserves_tail_and_summarizes_head() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("second prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "second reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("third prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "third reply".to_string(),
+            }]),
+        ];
+
+        let result = handle_slash_command(
+            "/compact --up-to-prompt 2",
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        )
+        .expect("compact should be handled");
+
+        assert!(
+            result.message.contains("Compacted"),
+            "should report compaction: {}",
+            result.message
+        );
+        assert_eq!(result.session.messages[0].role, MessageRole::System);
+        let has_third_prompt = result.session.messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("third prompt")))
+        });
+        assert!(has_third_prompt, "third prompt should be preserved");
+        let has_first_prompt = result.session.messages.iter().any(|m| {
+            m.role == MessageRole::User
+                && m.blocks.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains("first prompt")),
+                )
+        });
+        assert!(
+            !has_first_prompt,
+            "first prompt should be compacted away as a user message"
+        );
+    }
+
+    #[test]
+    fn partial_compact_from_prompt_preserves_head_and_summarizes_tail() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first reply".to_string(),
+            }]),
+            ConversationMessage::user_text("second prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "second reply ".repeat(100),
+            }]),
+            ConversationMessage::user_text("third prompt ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "third reply ".repeat(100),
+            }]),
+        ];
+
+        let result = handle_slash_command(
+            "/compact --from-prompt 2",
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        )
+        .expect("compact should be handled");
+
+        assert!(
+            result.message.contains("Compacted"),
+            "should report compaction: {}",
+            result.message
+        );
+        assert_eq!(result.session.messages[0].role, MessageRole::System);
+        let has_first_prompt = result.session.messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("first prompt")))
+        });
+        assert!(has_first_prompt, "first prompt should be preserved");
     }
 }

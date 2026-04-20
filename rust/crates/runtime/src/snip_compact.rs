@@ -2,7 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::compact::{estimate_message_tokens, estimate_session_tokens};
 use crate::micro_compact::{is_compactable_tool_name, MICROCOMPACT_CLEARED_SENTINEL};
-use crate::session::{CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::session::{
+    CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session,
+};
 
 pub const SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL: &str =
     "[Older assistant text cleared by snip compact]";
