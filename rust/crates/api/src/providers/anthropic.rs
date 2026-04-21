@@ -435,7 +435,7 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let started_at = Instant::now();
         let mut attempts = 0;
-        let mut last_error: Option<ApiError>;
+        let mut last_error: Option<ApiError> = None;
 
         loop {
             attempts += 1;
@@ -557,22 +557,10 @@ impl AnthropicClient {
             }
         }
 
-        agent_debug_log(
-            "anthropic.send_with_retry.exhausted",
-            format!(
-                "model={}\nattempts={}\ntotal_elapsed_ms={}\nlast_error={}",
-                request.model,
-                attempts,
-                started_at.elapsed().as_millis(),
-                last_error
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-                    .unwrap_or_else(|| String::from("<missing>"))
-            ),
-        );
+        let last_error = last_error.expect("retry loop must capture an error");
         Err(ApiError::RetriesExhausted {
             attempts,
-            last_error: Box::new(last_error.expect("retry loop must capture an error")),
+            last_error: Box::new(last_error),
         })
     }
 
@@ -666,9 +654,22 @@ impl AnthropicClient {
             return Ok(());
         };
 
-        // Best-effort refinement using the Anthropic count_tokens endpoint.
-        // On any failure (network, parse, auth), fall back to the local
-        // byte-estimate result which already passed above.
+        // Remote count_tokens is now opt-in. The default preflight path uses
+        // the local byte-estimate guard only, so we avoid the 30s network
+        // round trip on every request. When enabled, remote count_tokens is
+        // treated as a best-effort refinement.
+        if !should_run_remote_count_tokens_preflight() {
+            agent_debug_log(
+                "anthropic.preflight.count_tokens_skipped",
+                format!(
+                    "model={}\nreason=disabled_default_path\nelapsed_ms={}",
+                    request.model,
+                    started_at.elapsed().as_millis()
+                ),
+            );
+            return Ok(());
+        }
+
         // Skip if a previous 403 was recorded (API key lacks permission).
         if self
             .count_tokens_disabled
@@ -684,6 +685,7 @@ impl AnthropicClient {
             );
             return Ok(());
         }
+
         let counted_input_tokens = match self.count_tokens(request).await {
             Ok(count) => count,
             Err(error) => {
@@ -1056,6 +1058,12 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .or_else(|| headers.get(ALT_REQUEST_ID_HEADER))
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn should_run_remote_count_tokens_preflight() -> bool {
+    std::env::var("CLAW_ENABLE_REMOTE_COUNT_TOKENS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 impl Provider for AnthropicClient {
