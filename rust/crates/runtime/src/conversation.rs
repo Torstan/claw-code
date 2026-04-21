@@ -13,6 +13,9 @@ use crate::micro_compact::{micro_compact_session, MicroCompactionConfig};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
+use crate::prompt::{
+    ProjectAttachmentContext, ProjectContext, ProjectSummaryContext, SystemPromptBuilder,
+};
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::session_memory_compact::refresh_session_memory;
 use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
@@ -1312,6 +1315,7 @@ mod tests {
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
+    use crate::prompt::{ProjectAttachmentContext, ProjectSummaryContext};
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{CompactionMarkerKind, ContentBlock, MessageRole, Session};
     use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
@@ -1442,11 +1446,10 @@ mod tests {
             .with_project_context(ProjectContext {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
-                git_status: None,
-                git_diff: None,
-                git_context: None,
                 instruction_files: Vec::new(),
             })
+            .with_summary_context(ProjectSummaryContext::default())
+            .with_attachment_context(ProjectAttachmentContext::default())
             .with_os("linux", "6.8")
             .build();
         let mut runtime = ConversationRuntime::new(
