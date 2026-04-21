@@ -1506,10 +1506,11 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let config_loader = ConfigLoader::default_for(&cwd);
     let config = config_loader.load();
     let discovered_config = config_loader.discover();
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let attachment_context = ProjectContext::discover_with_git(&cwd)?;
     let (project_root, git_branch) =
-        parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+        parse_git_status_metadata(attachment_context.git_status.as_deref());
+    let git_summary = parse_git_workspace_summary(attachment_context.git_status.as_deref());
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
     let context = StatusContext {
@@ -5423,10 +5424,11 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let attachment_context = ProjectContext::discover_with_git(&cwd)?;
     let (project_root, git_branch) =
-        parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+        parse_git_status_metadata(attachment_context.git_status.as_deref());
+    let git_summary = parse_git_workspace_summary(attachment_context.git_status.as_deref());
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     Ok(StatusContext {
         cwd,
