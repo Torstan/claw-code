@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, CacheControl, ContentBlockDelta, ContextManagement, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    InputMessage, MessageRequest, MessageResponse, OutputConfig, OutputContentBlock, PromptCache,
     ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    SystemContentBlock, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    SystemContentBlock, ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -64,12 +64,8 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+fn max_tokens_for_model(_model: &str) -> u32 {
+    64_000
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -7196,6 +7192,7 @@ impl AnthropicRuntimeClient {
                 let auth = resolve_cli_auth_source()?;
                 let inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
+                    .with_beta("prompt-caching-scope-2026-01-05")
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
@@ -7272,22 +7269,51 @@ impl ApiClient for AnthropicRuntimeClient {
                 .system_prompt
                 .iter()
                 .position(|part| part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
-            let len = request.system_prompt.len();
-            let blocks: Vec<SystemContentBlock> = request
-                .system_prompt
-                .iter()
-                .enumerate()
-                .filter(|(_, part)| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .map(|(orig_idx, part)| {
-                    let block = SystemContentBlock::text(part.clone());
-                    let is_last_static = boundary_pos.map_or(false, |bp| orig_idx + 1 == bp);
-                    if is_last_static || orig_idx == len - 1 {
-                        block.with_cache_control(CacheControl::ephemeral())
-                    } else {
-                        block
+            let mut blocks = Vec::new();
+            match boundary_pos {
+                Some(bp) => {
+                    let static_parts = request.system_prompt[..bp]
+                        .iter()
+                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let dynamic_parts = request.system_prompt[bp + 1..]
+                        .iter()
+                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+
+                    if !static_parts.is_empty() {
+                        blocks.push(
+                            SystemContentBlock::text(static_parts)
+                                .with_cache_control(CacheControl::ephemeral()),
+                        );
                     }
-                })
-                .collect();
+                    if !dynamic_parts.is_empty() {
+                        blocks.push(
+                            SystemContentBlock::text(dynamic_parts)
+                                .with_cache_control(CacheControl::ephemeral()),
+                        );
+                    }
+                }
+                None => {
+                    let merged = request
+                        .system_prompt
+                        .iter()
+                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !merged.is_empty() {
+                        blocks.push(
+                            SystemContentBlock::text(merged)
+                                .with_cache_control(CacheControl::ephemeral()),
+                        );
+                    }
+                }
+            }
             Some(blocks)
         };
         let mut tools = self
@@ -7301,8 +7327,12 @@ impl ApiClient for AnthropicRuntimeClient {
         let mut messages = convert_messages(&request.messages);
         if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
             if let Some(last_block) = last_user.content.last_mut() {
-                if let InputContentBlock::Text { cache_control, .. } = last_block {
-                    *cache_control = Some(CacheControl::ephemeral());
+                match last_block {
+                    InputContentBlock::Text { cache_control, .. }
+                    | InputContentBlock::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(CacheControl::ephemeral());
+                    }
+                    InputContentBlock::ToolUse { .. } => {}
                 }
             }
         }
@@ -7316,6 +7346,8 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             context_management: Some(ContextManagement::default()),
+            thinking: Some(ThinkingConfig::adaptive()),
+            output_config: Some(OutputConfig::high()),
             ..Default::default()
         };
         let tool_count = message_request.tools.as_ref().map_or(0, Vec::len);
@@ -8921,6 +8953,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                             text: render_tool_result_for_model(tool_name, output),
                         }],
                         is_error: *is_error,
+                        cache_control: None,
                     },
                 })
                 .collect::<Vec<_>>();

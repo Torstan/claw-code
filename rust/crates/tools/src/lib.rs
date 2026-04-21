@@ -4593,6 +4593,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                             text: render_tool_result_for_model(tool_name, output),
                         }],
                         is_error: *is_error,
+                        cache_control: None,
                     },
                 })
                 .collect::<Vec<_>>();

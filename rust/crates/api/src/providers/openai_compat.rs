@@ -921,6 +921,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
@@ -1326,6 +1327,7 @@ mod tests {
                                 value: json!({"ok": true}),
                             }],
                             is_error: false,
+                            cache_control: None,
                         },
                     ],
                 }],
@@ -1539,6 +1541,8 @@ mod tests {
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
             context_management: None,
+            thinking: None,
+            output_config: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);

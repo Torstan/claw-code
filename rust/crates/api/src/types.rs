@@ -66,6 +66,35 @@ impl Default for ContextManagement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl ThinkingConfig {
+    #[must_use]
+    pub fn adaptive() -> Self {
+        Self {
+            kind: "adaptive".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub effort: String,
+}
+
+impl OutputConfig {
+    #[must_use]
+    pub fn high() -> Self {
+        Self {
+            effort: "high".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
@@ -96,6 +125,10 @@ pub struct MessageRequest {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 impl MessageRequest {
@@ -138,6 +171,7 @@ impl InputMessage {
                     text: content.into(),
                 }],
                 is_error,
+                cache_control: None,
             }],
         }
     }
@@ -161,6 +195,8 @@ pub enum InputContentBlock {
         content: Vec<ToolResultContentBlock>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 

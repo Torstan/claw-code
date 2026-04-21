@@ -910,6 +910,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                         value: json!({"forecast": "sunny"}),
                     }],
                     is_error: false,
+                    cache_control: None,
                 },
             ],
         }],

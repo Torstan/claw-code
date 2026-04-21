@@ -304,15 +304,6 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(ref gc) = project_context.git_context {
-        if !gc.recent_commits.is_empty() {
-            lines.push(String::new());
-            lines.push("Recent commits (last 5):".to_string());
-            for c in &gc.recent_commits {
-                lines.push(format!("  {} {}", c.hash, c.subject));
-            }
-        }
-    }
     if let Some(diff) = &project_context.git_diff {
         lines.push(String::new());
         if diff.len() > MAX_GIT_DIFF_CHARS {
@@ -741,7 +732,7 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(rendered.contains("Recent commits (last 5):"));
+        assert!(rendered.contains("Recent commits:"));
         assert!(rendered.contains("first commit"));
         assert!(rendered.contains("Git status snapshot:"));
         assert!(rendered.contains("## main"));

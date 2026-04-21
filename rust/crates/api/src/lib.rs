@@ -29,8 +29,8 @@ pub use types::{
     CacheControl, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, ContextManagement, InputContentBlock, InputMessage, MessageDelta,
     MessageDeltaEvent, MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent,
-    OutputContentBlock, StreamEvent, SystemContentBlock, ToolChoice, ToolDefinition,
-    ToolResultContentBlock, Usage,
+    OutputConfig, OutputContentBlock, StreamEvent, SystemContentBlock, ThinkingConfig, ToolChoice,
+    ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{
