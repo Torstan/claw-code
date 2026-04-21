@@ -54,7 +54,7 @@ use runtime::{
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
     OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, ToolInvocation, UsageTracker,
+    ToolError, ToolExecutor, ToolInvocation, UsageTracker, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -7268,14 +7268,20 @@ impl ApiClient for AnthropicRuntimeClient {
         let system_blocks = if request.system_prompt.is_empty() {
             None
         } else {
+            let boundary_pos = request
+                .system_prompt
+                .iter()
+                .position(|part| part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
             let len = request.system_prompt.len();
             let blocks: Vec<SystemContentBlock> = request
                 .system_prompt
                 .iter()
                 .enumerate()
-                .map(|(i, part)| {
+                .filter(|(_, part)| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                .map(|(orig_idx, part)| {
                     let block = SystemContentBlock::text(part.clone());
-                    if i == len - 1 {
+                    let is_last_static = boundary_pos.map_or(false, |bp| orig_idx + 1 == bp);
+                    if is_last_static || orig_idx == len - 1 {
                         block.with_cache_control(CacheControl::ephemeral())
                     } else {
                         block

@@ -23,6 +23,12 @@ const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 const COMPACTION_ENABLED_ENV_VAR: &str = "CLAW_COMPACTION_ENABLED";
 
+const MAX_TOOL_RESULT_LINES: usize = 1500;
+const TOOL_RESULT_HEAD_LINES: usize = 1000;
+const TOOL_RESULT_TAIL_LINES: usize = 200;
+
+const REHEARSAL_MESSAGE_THRESHOLD: usize = 20;
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -525,6 +531,56 @@ where
         self.session
     }
 
+    fn build_rehearsal_section(&self) -> Option<String> {
+        if self.session.messages.len() < REHEARSAL_MESSAGE_THRESHOLD {
+            return None;
+        }
+        let memory_path = crate::session_memory_compact::session_memory_path(&self.session)?;
+        let content = std::fs::read_to_string(memory_path).ok()?;
+        let mut goals = String::new();
+        let mut current_work = String::new();
+        let mut current_section = None::<&str>;
+        for line in content.lines() {
+            if line.starts_with("# Goals") {
+                current_section = Some("goals");
+            } else if line.starts_with("# Current work") {
+                current_section = Some("current_work");
+            } else if line.starts_with("# ") {
+                current_section = None;
+            } else if let Some(section) = current_section {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && trimmed != "- None recorded" {
+                    match section {
+                        "goals" => {
+                            goals.push_str(trimmed);
+                            goals.push('\n');
+                        }
+                        "current_work" => {
+                            current_work.push_str(trimmed);
+                            current_work.push('\n');
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if goals.is_empty() && current_work.is_empty() {
+            return None;
+        }
+        let mut rehearsal = String::from("# Task rehearsal (auto-injected reminder)\n");
+        if !goals.is_empty() {
+            rehearsal.push_str("Goals:\n");
+            rehearsal.push_str(goals.trim_end());
+            rehearsal.push('\n');
+        }
+        if !current_work.is_empty() {
+            rehearsal.push_str("Current work:\n");
+            rehearsal.push_str(current_work.trim_end());
+            rehearsal.push('\n');
+        }
+        Some(rehearsal)
+    }
+
     fn inject_pending_session_notifications(&mut self) -> Result<(), RuntimeError> {
         for message in drain_session_notifications(&self.session.session_id) {
             self.session
@@ -741,6 +797,10 @@ where
                 || post_hook_result.is_cancelled(),
         );
 
+        if !is_error {
+            output = truncate_large_tool_output(&prepared.tool_name, output);
+        }
+
         ConversationMessage::tool_result(prepared.tool_use_id, prepared.tool_name, output, is_error)
     }
 
@@ -809,8 +869,12 @@ where
         let mut reactive_retry_attempted = false;
 
         loop {
+            let mut system_prompt = self.system_prompt.clone();
+            if let Some(rehearsal) = self.build_rehearsal_section() {
+                system_prompt.push(rehearsal);
+            }
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt,
                 messages: self.session.messages.clone(),
             };
             agent_debug_log(
@@ -1182,6 +1246,22 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     };
     sections.push(format!("{label}:\n{}", messages.join("\n")));
     sections.join("\n\n")
+}
+
+fn truncate_large_tool_output(tool_name: &str, output: String) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= MAX_TOOL_RESULT_LINES {
+        return output;
+    }
+    let total = lines.len();
+    let head = &lines[..TOOL_RESULT_HEAD_LINES];
+    let tail = &lines[total - TOOL_RESULT_TAIL_LINES..];
+    let omitted = total - TOOL_RESULT_HEAD_LINES - TOOL_RESULT_TAIL_LINES;
+    format!(
+        "{}\n\n[... {omitted} lines omitted from {tool_name} output ({total} total lines). Re-run the command to see full output.]\n\n{}",
+        head.join("\n"),
+        tail.join("\n"),
+    )
 }
 
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
@@ -3302,5 +3382,27 @@ mod tests {
             runtime.session().messages.len() >= msg_count_before,
             "no messages should have been removed when compaction is disabled"
         );
+    }
+
+    #[test]
+    fn truncate_large_tool_output_preserves_small_output() {
+        let output = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = super::truncate_large_tool_output("bash", output.clone());
+        assert_eq!(result, output);
+    }
+
+    #[test]
+    fn truncate_large_tool_output_truncates_oversized_output() {
+        let lines: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+        let output = lines.join("\n");
+        let result = super::truncate_large_tool_output("bash", output);
+        assert!(result.contains("line 0"));
+        assert!(result.contains("line 999"));
+        assert!(!result.contains("\nline 1000\n"));
+        assert!(result.contains("line 1999"));
+        assert!(result.contains("[... 800 lines omitted from bash output (2000 total lines)."));
     }
 }
