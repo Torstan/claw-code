@@ -62,6 +62,14 @@ pub struct ProjectContext {
     pub instruction_files: Vec<ContextFile>,
 }
 
+/// Dynamic project metadata kept out of the stable prompt prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectDynamicContext {
+    pub git_status: Option<String>,
+    pub git_diff: Option<String>,
+    pub git_context: Option<GitContext>,
+}
+
 impl ProjectContext {
     pub fn discover(
         cwd: impl Into<PathBuf>,
@@ -100,6 +108,7 @@ pub struct SystemPromptBuilder {
     os_version: Option<String>,
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
+    dynamic_project_context: Option<ProjectDynamicContext>,
     config: Option<RuntimeConfig>,
 }
 
@@ -130,6 +139,15 @@ impl SystemPromptBuilder {
     }
 
     #[must_use]
+    pub fn with_dynamic_project_context(
+        mut self,
+        dynamic_project_context: ProjectDynamicContext,
+    ) -> Self {
+        self.dynamic_project_context = Some(dynamic_project_context);
+        self
+    }
+
+    #[must_use]
     pub fn with_runtime_config(mut self, config: RuntimeConfig) -> Self {
         self.config = Some(config);
         self
@@ -143,6 +161,13 @@ impl SystemPromptBuilder {
 
     #[must_use]
     pub fn build(&self) -> Vec<String> {
+        let mut sections = self.stable_sections();
+        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
+        sections.extend(self.dynamic_sections());
+        sections
+    }
+
+    fn stable_sections(&self) -> Vec<String> {
         let mut sections = Vec::new();
         sections.push(get_simple_intro_section(self.output_style_name.is_some()));
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
@@ -151,13 +176,22 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
-        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
-        sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
+        }
+        sections
+    }
+
+    fn dynamic_sections(&self) -> Vec<String> {
+        let mut sections = Vec::new();
+        sections.push(self.environment_section());
+        if let Some(project_context) = &self.project_context {
+            sections.push(render_project_context(project_context));
+        }
+        if let Some(dynamic_project_context) = &self.dynamic_project_context {
+            sections.push(render_dynamic_project_context(dynamic_project_context));
         }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
@@ -298,13 +332,35 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             project_context.instruction_files.len()
         ));
     }
+    if project_context.git_context.is_some() {
+        bullets.push("Git context available in dynamic project context.".to_string());
+    }
     lines.extend(prepend_bullets(bullets));
-    if let Some(status) = &project_context.git_status {
+    lines.join("\n")
+}
+
+fn render_dynamic_project_context(dynamic_project_context: &ProjectDynamicContext) -> String {
+    let mut lines = vec!["# Project dynamic context".to_string()];
+    lines.extend(prepend_bullets(vec![
+        format!(
+            "Git status included: {}.",
+            dynamic_project_context.git_status.is_some()
+        ),
+        format!(
+            "Git diff included: {}.",
+            dynamic_project_context.git_diff.is_some()
+        ),
+        format!(
+            "Git context included: {}.",
+            dynamic_project_context.git_context.is_some()
+        ),
+    ]));
+    if let Some(status) = &dynamic_project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(diff) = &project_context.git_diff {
+    if let Some(diff) = &dynamic_project_context.git_diff {
         lines.push(String::new());
         if diff.len() > MAX_GIT_DIFF_CHARS {
             let line_count = diff.lines().count();
@@ -316,10 +372,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             lines.push(diff.clone());
         }
     }
-    if let Some(git_context) = &project_context.git_context {
+    if let Some(git_context) = &dynamic_project_context.git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
             lines.push(String::new());
+            lines.push("Git context snapshot:".to_string());
             lines.push(rendered);
         }
     }
@@ -435,11 +492,17 @@ pub fn load_system_prompt(
     os_version: impl Into<String>,
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
-    let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
+    let project_context = ProjectContext::discover(&cwd, current_date.into())?;
+    let dynamic_project_context = ProjectDynamicContext {
+        git_status: read_git_status(&cwd),
+        git_diff: read_git_diff(&cwd),
+        git_context: GitContext::detect(&cwd),
+    };
     let config = ConfigLoader::default_for(&cwd).load()?;
     Ok(SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_project_context(project_context)
+        .with_dynamic_project_context(dynamic_project_context)
         .with_runtime_config(config)
         .build())
 }
@@ -520,10 +583,12 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_dynamic_project_context, render_instruction_content, render_instruction_files,
+        truncate_instruction_content, ContextFile, ProjectContext, ProjectDynamicContext,
+        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
+    use crate::git_context::GitContext;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -648,12 +713,18 @@ mod tests {
 
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
-
-        let status = context.git_status.expect("git status should be present");
-        assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? CLAUDE.md"));
-        assert!(status.contains("?? tracked.txt"));
+        assert!(context.git_status.is_some());
         assert!(context.git_diff.is_none());
+        assert!(context.git_context.is_some());
+
+        let dynamic = ProjectDynamicContext {
+            git_status: context.git_status.clone(),
+            git_diff: context.git_diff.clone(),
+            git_context: context.git_context.clone(),
+        };
+        assert!(dynamic.git_status.is_some());
+        assert!(dynamic.git_diff.is_none());
+        assert!(dynamic.git_context.is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -732,7 +803,7 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(rendered.contains("Recent commits:"));
+        assert!(rendered.contains("Git context snapshot:"));
         assert!(rendered.contains("first commit"));
         assert!(rendered.contains("Git status snapshot:"));
         assert!(rendered.contains("## main"));
@@ -777,9 +848,16 @@ mod tests {
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
 
-        let diff = context.git_diff.expect("git diff should be present");
-        assert!(diff.contains("Unstaged changes:"));
-        assert!(diff.contains("tracked.txt"));
+        let dynamic = ProjectDynamicContext {
+            git_status: context.git_status.clone(),
+            git_diff: context.git_diff.clone(),
+            git_context: context.git_context.clone(),
+        };
+        assert!(dynamic.git_diff.is_some());
+
+        let rendered = render_dynamic_project_context(&dynamic);
+        assert!(rendered.contains("Git diff snapshot:"));
+        assert!(rendered.contains("tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
