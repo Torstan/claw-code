@@ -230,17 +230,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_token_limit(model).map_or_else(
-        || {
-            let canonical = resolve_model_alias(model);
-            if canonical.contains("opus") {
-                32_000
-            } else {
-                64_000
-            }
-        },
-        |limit| limit.max_output_tokens,
-    )
+    model_token_limit(model).map_or(64_000, |limit| limit.max_output_tokens)
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -256,7 +246,7 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
+            max_output_tokens: 64_000,
             context_window_tokens: 200_000,
         }),
         "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
@@ -557,7 +547,7 @@ mod tests {
 
     #[test]
     fn keeps_existing_max_token_heuristic() {
-        assert_eq!(max_tokens_for_model("opus"), 32_000);
+        assert_eq!(max_tokens_for_model("opus"), 64_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
     }
 
@@ -608,7 +598,7 @@ mod tests {
 
         // then
         assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
-        assert_eq!(effective, 32_000);
+        assert_eq!(effective, 64_000);
     }
 
     #[test]

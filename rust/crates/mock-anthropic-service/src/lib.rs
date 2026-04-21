@@ -281,6 +281,7 @@ fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bo
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 let tool_name = tool_names_by_id
