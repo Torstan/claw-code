@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::compact::{estimate_message_tokens, estimate_session_tokens};
 use crate::micro_compact::{
     build_tool_input_index, is_cleared_sentinel, is_compactable_tool_name, recoverable_sentinel,
-    MICROCOMPACT_CLEARED_SENTINEL,
 };
 use crate::session::{
     CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session,
