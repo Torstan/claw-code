@@ -21,6 +21,7 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const COMPACTION_ENABLED_ENV_VAR: &str = "CLAW_COMPACTION_ENABLED";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    compaction_enabled: bool,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -218,6 +220,8 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            compaction_enabled: compaction_enabled_from_env()
+                .unwrap_or_else(|| feature_config.compaction_enabled()),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -233,6 +237,12 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_compaction_enabled(mut self, enabled: bool) -> Self {
+        self.compaction_enabled = enabled;
         self
     }
 
@@ -375,7 +385,7 @@ where
             }
 
             self.inject_pending_session_notifications()?;
-            if iterations == 1 {
+            if iterations == 1 && self.compaction_enabled {
                 if let Err(error) = self.maybe_snip_compact() {
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
@@ -385,14 +395,19 @@ where
                     return Err(error);
                 }
             }
-            if let Some(event) = match self.maybe_auto_compact() {
-                Ok(event) => event,
-                Err(error) => {
-                    self.record_turn_failed(iterations, &error);
-                    return Err(error);
+            if self.compaction_enabled {
+                if let Some(event) = match self.maybe_auto_compact() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                } {
+                    accumulate_auto_compaction_event(
+                        &mut auto_compaction,
+                        event.removed_message_count,
+                    );
                 }
-            } {
-                accumulate_auto_compaction_event(&mut auto_compaction, event.removed_message_count);
             }
 
             let events =
@@ -460,7 +475,9 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
-        let _ = refresh_session_memory(&self.session);
+        if self.compaction_enabled {
+            let _ = refresh_session_memory(&self.session);
+        }
         self.record_turn_completed(&summary);
 
         Ok(summary)
@@ -484,6 +501,10 @@ where
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    pub fn compaction_enabled(&self) -> bool {
+        self.compaction_enabled
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
@@ -795,7 +816,7 @@ where
             agent_debug_log(
                 "llm.request",
                 format!(
-                    "session_id={}\niteration={iteration}\nsystem_prompt_parts={}\nmessage_count={}\nrequest={request:#?}",
+                    "session_id={} iteration={iteration} system_prompt_parts={} message_count={} request={request:?}",
                     self.session.session_id,
                     request.system_prompt.len(),
                     request.messages.len()
@@ -807,7 +828,7 @@ where
                     agent_debug_log(
                         "llm.response",
                         format!(
-                            "session_id={}\niteration={iteration}\nevent_count={}\nresponse={events:#?}",
+                            "session_id={} iteration={iteration} event_count={} response={events:?}",
                             self.session.session_id,
                             events.len()
                         ),
@@ -823,7 +844,10 @@ where
                         ),
                     );
 
-                    if reactive_retry_attempted || !is_context_window_runtime_error(&error) {
+                    if reactive_retry_attempted
+                        || !self.compaction_enabled
+                        || !is_context_window_runtime_error(&error)
+                    {
                         return Err(error);
                     }
 
@@ -1034,6 +1058,12 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
     )
 }
 
+fn compaction_enabled_from_env() -> Option<bool> {
+    std::env::var(COMPACTION_ENABLED_ENV_VAR)
+        .ok()
+        .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
+}
+
 #[must_use]
 fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
     value
@@ -1197,9 +1227,7 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
-    use crate::micro_compact::{
-        micro_compact_session, MicroCompactionConfig, MICROCOMPACT_CLEARED_SENTINEL,
-    };
+    use crate::micro_compact::{is_cleared_sentinel, micro_compact_session, MicroCompactionConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -1208,9 +1236,7 @@ mod tests {
     use crate::session::{CompactionMarkerKind, ContentBlock, MessageRole, Session};
     use crate::session_memory_compact::{refresh_session_memory, session_memory_path};
     use crate::session_notifications::{active_tool_session_id, enqueue_session_notification};
-    use crate::snip_compact::{
-        SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL, SNIP_CLEARED_TOOL_RESULT_SENTINEL,
-    };
+    use crate::snip_compact::SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL;
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -2271,18 +2297,15 @@ mod tests {
                         ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    tool_outputs,
-                    vec![
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                        "tool output 6 ".repeat(30),
-                        "tool output 7 ".repeat(30),
-                    ]
-                );
+                assert_eq!(tool_outputs.len(), 7);
+                for output in &tool_outputs[..5] {
+                    assert!(
+                        is_cleared_sentinel(output),
+                        "snipped tool result should be a cleared sentinel, got: {output}",
+                    );
+                }
+                assert_eq!(tool_outputs[5], "tool output 6 ".repeat(30));
+                assert_eq!(tool_outputs[6], "tool output 7 ".repeat(30));
                 assert!(request.messages.iter().any(|message| {
                     message.role == MessageRole::Assistant
                         && message.blocks.iter().any(|block| {
@@ -2463,18 +2486,16 @@ mod tests {
             persisted_session.updated_at_ms,
             runtime.session().updated_at_ms
         );
-        assert_eq!(
-            tool_result_outputs(&persisted_session),
-            vec![
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                "tool output 6".to_string(),
-                "tool output 7".to_string(),
-            ]
-        );
+        let persisted_outputs = tool_result_outputs(&persisted_session);
+        assert_eq!(persisted_outputs.len(), 7);
+        for output in &persisted_outputs[..5] {
+            assert!(
+                is_cleared_sentinel(output),
+                "microcompacted tool result should be a cleared sentinel, got: {output}",
+            );
+        }
+        assert_eq!(persisted_outputs[5], "tool output 6");
+        assert_eq!(persisted_outputs[6], "tool output 7");
         assert!(persisted_session.messages.iter().any(|message| {
             message.compaction_meta.as_ref().map(|meta| meta.kind)
                 == Some(CompactionMarkerKind::MicrocompactBoundary)
@@ -2523,13 +2544,13 @@ mod tests {
                                 ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
                             })
                             .collect::<Vec<_>>();
-                        assert_eq!(
-                            tool_outputs,
-                            vec![
-                                SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                                SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string(),
-                            ]
-                        );
+                        assert_eq!(tool_outputs.len(), 2);
+                        for output in &tool_outputs {
+                            assert!(
+                                is_cleared_sentinel(output),
+                                "reactive snip should produce cleared sentinels, got: {output}",
+                            );
+                        }
                         Ok(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -2981,14 +3002,19 @@ mod tests {
 
         assert_eq!(result.cleared_tool_result_count, 2);
         assert!(result.estimated_tokens_freed > 0);
-        assert_eq!(
-            tool_result_outputs(&result.compacted_session),
-            vec![
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                "recent read output 3".to_string(),
-            ]
+        let outputs = tool_result_outputs(&result.compacted_session);
+        assert_eq!(outputs.len(), 3);
+        assert!(
+            is_cleared_sentinel(&outputs[0]),
+            "first tool result should be cleared, got: {}",
+            outputs[0],
         );
+        assert!(
+            is_cleared_sentinel(&outputs[1]),
+            "second tool result should be cleared, got: {}",
+            outputs[1],
+        );
+        assert_eq!(outputs[2], "recent read output 3");
         assert!(
             result.compacted_session.messages.iter().any(|message| {
                 message.compaction_meta.as_ref().map(|meta| meta.kind)
@@ -3014,13 +3040,15 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
 
+                assert_eq!(outputs.len(), 3);
+                assert!(
+                    is_cleared_sentinel(&outputs[0]),
+                    "time-based microcompact should clear old tool result, got: {}",
+                    outputs[0],
+                );
+                assert_eq!(outputs[1], "recent tool output 2");
                 assert_eq!(
-                    outputs,
-                    vec![
-                        MICROCOMPACT_CLEARED_SENTINEL.to_string(),
-                        "recent tool output 2".to_string(),
-                        "recent tool output 3".to_string(),
-                    ],
+                    outputs[2], "recent tool output 3",
                     "time-based microcompact should use the last assistant timestamp, not the last tool result timestamp",
                 );
                 assert!(request.messages.iter().any(|message| {
@@ -3223,5 +3251,56 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn compaction_disabled_skips_all_strategies() {
+        struct CountingApi {
+            calls: usize,
+        }
+        impl ApiClient for CountingApi {
+            fn stream(&mut self, _: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        for i in 0..20 {
+            session
+                .messages
+                .push(crate::session::ConversationMessage::user_text(format!(
+                    "prompt {i} {}",
+                    "x".repeat(500)
+                )));
+            session
+                .messages
+                .push(crate::session::ConversationMessage::assistant(vec![
+                    ContentBlock::Text {
+                        text: format!("response {i} {}", "y".repeat(500)),
+                    },
+                ]));
+        }
+        let msg_count_before = session.messages.len();
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            CountingApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1)
+        .with_compaction_enabled(false);
+
+        let summary = runtime.run_turn("trigger", None).expect("should succeed");
+        assert_eq!(summary.auto_compaction, None);
+        assert!(
+            runtime.session().messages.len() >= msg_count_before,
+            "no messages should have been removed when compaction is disabled"
+        );
     }
 }

@@ -7,7 +7,7 @@ use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
     OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    SystemContentBlock, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -82,9 +82,10 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(300_000),
+                    cache_control: None,
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(vec![SystemContentBlock::text("Keep the answer short.")]),
             tools: None,
             tool_choice: None,
             stream: false,
@@ -483,9 +484,10 @@ fn sample_request(stream: bool) -> MessageRequest {
             role: "user".to_string(),
             content: vec![InputContentBlock::Text {
                 text: "Say hello".to_string(),
+                cache_control: None,
             }],
         }],
-        system: Some("Use tools when needed".to_string()),
+        system: Some(vec![SystemContentBlock::text("Use tools when needed")]),
         tools: Some(vec![ToolDefinition {
             name: "weather".to_string(),
             description: Some("Fetches weather".to_string()),
@@ -494,6 +496,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 "properties": {"city": {"type": "string"}},
                 "required": ["city"]
             }),
+            cache_control: None,
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,

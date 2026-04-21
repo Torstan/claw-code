@@ -6,8 +6,8 @@ use std::time::Duration;
 use api::{
     AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, ToolChoice,
-    ToolDefinition,
+    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent,
+    SystemContentBlock, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
@@ -86,7 +86,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05")
+        Some("claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -121,9 +121,10 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
+                    cache_control: None,
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(vec![SystemContentBlock::text("Keep the answer short.")]),
             tools: None,
             tool_choice: None,
             stream: false,
@@ -183,7 +184,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let request = captured.first().expect("server should capture request");
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
+        Some("claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,tools-2026-04-01")
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
@@ -901,6 +902,7 @@ fn sample_request(stream: bool) -> MessageRequest {
             content: vec![
                 InputContentBlock::Text {
                     text: "Say hello".to_string(),
+                    cache_control: None,
                 },
                 InputContentBlock::ToolResult {
                     tool_use_id: "toolu_prev".to_string(),
@@ -911,7 +913,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 },
             ],
         }],
-        system: Some("Use tools when needed".to_string()),
+        system: Some(vec![SystemContentBlock::text("Use tools when needed")]),
         tools: Some(vec![ToolDefinition {
             name: "get_weather".to_string(),
             description: Some("Fetches the weather".to_string()),
@@ -920,6 +922,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 "properties": {"city": {"type": "string"}},
                 "required": ["city"]
             }),
+            cache_control: None,
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,

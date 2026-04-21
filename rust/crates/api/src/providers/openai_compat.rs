@@ -788,11 +788,18 @@ fn strip_routing_prefix(model: &str) -> &str {
 
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
-        messages.push(json!({
-            "role": "system",
-            "content": system,
-        }));
+    if let Some(blocks) = request.system.as_ref().filter(|b| !b.is_empty()) {
+        let system_text: String = blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !system_text.is_empty() {
+            messages.push(json!({
+                "role": "system",
+                "content": system_text,
+            }));
+        }
     }
     for message in &request.messages {
         messages.extend(translate_message(message));
@@ -875,7 +882,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
-                    InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Text { text: value, .. } => text.push_str(value),
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -906,7 +913,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             .content
             .iter()
             .filter_map(|block| match block {
-                InputContentBlock::Text { text } => Some(json!({
+                InputContentBlock::Text { text, .. } => Some(json!({
                     "role": "user",
                     "content": text,
                 })),
@@ -1294,8 +1301,8 @@ mod tests {
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        InputContentBlock, InputMessage, MessageRequest, SystemContentBlock, ToolChoice,
+        ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -1311,6 +1318,7 @@ mod tests {
                     content: vec![
                         InputContentBlock::Text {
                             text: "hello".to_string(),
+                            cache_control: None,
                         },
                         InputContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
@@ -1321,11 +1329,12 @@ mod tests {
                         },
                     ],
                 }],
-                system: Some("be helpful".to_string()),
+                system: Some(vec![SystemContentBlock::text("be helpful")]),
                 tools: Some(vec![ToolDefinition {
                     name: "weather".to_string(),
                     description: Some("Get weather".to_string()),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
@@ -1529,6 +1538,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            context_management: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -1682,6 +1692,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "Hello".to_string(),
+                    cache_control: None,
                 }],
             }],
             stream: false,

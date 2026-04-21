@@ -507,7 +507,10 @@ mod tests {
         detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, PromptCache,
         PromptCacheConfig, PromptCachePaths, TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
     };
-    use crate::types::{InputMessage, MessageRequest, MessageResponse, OutputContentBlock, Usage};
+    use crate::types::{
+        InputMessage, MessageRequest, MessageResponse, OutputContentBlock, SystemContentBlock,
+        Usage,
+    };
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -700,7 +703,7 @@ mod tests {
             model: "claude-3-7-sonnet-latest".to_string(),
             max_tokens: 64,
             messages: vec![InputMessage::user_text(text)],
-            system: Some("system".to_string()),
+            system: Some(vec![SystemContentBlock::text("system")]),
             tools: None,
             tool_choice: None,
             stream: false,

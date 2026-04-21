@@ -25,10 +25,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    AuthSource, CacheControl, ContentBlockDelta, ContextManagement, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
+    SystemContentBlock, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -2825,6 +2825,16 @@ fn run_resume_command(
             json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact { ref mode } => {
+            if std::env::var("CLAW_COMPACTION_ENABLED")
+                .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+                .unwrap_or(false)
+            {
+                return Ok(ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some("Compaction is disabled.".to_string()),
+                    json: None,
+                });
+            }
             let result = if let Some(mode) = mode {
                 partial_compact_session(session, *mode)
             } else {
@@ -4250,6 +4260,21 @@ impl LiveCli {
                 self.print_prompt_history(count.as_deref());
                 false
             }
+            SlashCommand::Effort { level } => {
+                match level.as_deref() {
+                    Some(l) if matches!(l, "low" | "medium" | "high") => {
+                        self.set_reasoning_effort(Some(l.to_string()));
+                        println!("Reasoning effort set to: {l}");
+                    }
+                    Some(l) => {
+                        println!("Invalid effort level '{l}'. Must be: low, medium, or high");
+                    }
+                    None => {
+                        println!("Usage: /effort <low|medium|high>");
+                    }
+                }
+                false
+            }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
                 println!("{}", format_cost_report(usage));
@@ -4286,7 +4311,6 @@ impl LiveCli {
             | SlashCommand::Hooks { .. }
             | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
             | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }
@@ -4845,6 +4869,10 @@ impl LiveCli {
         &mut self,
         mode: Option<PartialCompactMode>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.runtime.compaction_enabled() {
+            println!("Compaction is disabled.");
+            return Ok(());
+        }
         let result = if let Some(mode) = mode {
             partial_compact_session(self.runtime.session(), mode)
         } else {
@@ -7237,17 +7265,51 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let system_blocks = if request.system_prompt.is_empty() {
+            None
+        } else {
+            let len = request.system_prompt.len();
+            let blocks: Vec<SystemContentBlock> = request
+                .system_prompt
+                .iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    let block = SystemContentBlock::text(part.clone());
+                    if i == len - 1 {
+                        block.with_cache_control(CacheControl::ephemeral())
+                    } else {
+                        block
+                    }
+                })
+                .collect();
+            Some(blocks)
+        };
+        let mut tools = self
+            .enable_tools
+            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
+        if let Some(ref mut tool_list) = tools {
+            if let Some(last) = tool_list.last_mut() {
+                last.cache_control = Some(CacheControl::ephemeral());
+            }
+        }
+        let mut messages = convert_messages(&request.messages);
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            if let Some(last_block) = last_user.content.last_mut() {
+                if let InputContentBlock::Text { cache_control, .. } = last_block {
+                    *cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            messages,
+            system: system_blocks,
+            tools,
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            context_management: Some(ContextManagement::default()),
             ..Default::default()
         };
         let tool_count = message_request.tools.as_ref().map_or(0, Vec::len);
@@ -8832,7 +8894,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .blocks
                 .iter()
                 .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Text { text } => InputContentBlock::Text {
+                        text: text.clone(),
+                        cache_control: None,
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

@@ -244,7 +244,7 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
     request.messages.iter().rev().find_map(|message| {
         message.content.iter().rev().find_map(|block| match block {
-            InputContentBlock::Text { text } => text
+            InputContentBlock::Text { text, .. } => text
                 .split_whitespace()
                 .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
                 .and_then(Scenario::parse),

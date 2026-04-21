@@ -122,6 +122,7 @@ pub struct AnthropicClient {
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    count_tokens_disabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AnthropicClient {
@@ -138,6 +139,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            count_tokens_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -154,6 +156,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            count_tokens_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -666,15 +669,37 @@ impl AnthropicClient {
         // Best-effort refinement using the Anthropic count_tokens endpoint.
         // On any failure (network, parse, auth), fall back to the local
         // byte-estimate result which already passed above.
+        // Skip if a previous 403 was recorded (API key lacks permission).
+        if self
+            .count_tokens_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            agent_debug_log(
+                "anthropic.preflight.count_tokens_skip",
+                format!(
+                    "model={}\nreason=previously_disabled_403\nelapsed_ms={}",
+                    request.model,
+                    started_at.elapsed().as_millis()
+                ),
+            );
+            return Ok(());
+        }
         let counted_input_tokens = match self.count_tokens(request).await {
             Ok(count) => count,
             Err(error) => {
+                let is_forbidden =
+                    matches!(&error, ApiError::Api { status, .. } if status.as_u16() == 403);
+                if is_forbidden {
+                    self.count_tokens_disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 agent_debug_log(
                     "anthropic.preflight.count_tokens_fallback",
                     format!(
-                        "model={}\nelapsed_ms={}\nerror={error}",
+                        "model={}\nelapsed_ms={}\nerror={error}\ndisabled={}",
                         request.model,
-                        started_at.elapsed().as_millis()
+                        started_at.elapsed().as_millis(),
+                        is_forbidden,
                     ),
                 );
                 return Ok(());
@@ -1240,6 +1265,7 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         // These fields are OpenAI-compatible only; Anthropic rejects them.
         object.remove("frequency_penalty");
         object.remove("presence_penalty");
+        object.remove("reasoning_effort");
         // Anthropic uses "stop_sequences" not "stop". Convert if present.
         if let Some(stop_val) = object.remove("stop") {
             if stop_val.as_array().map_or(false, |a| !a.is_empty()) {

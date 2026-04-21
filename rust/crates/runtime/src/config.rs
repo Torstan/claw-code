@@ -65,6 +65,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    compaction: Option<bool>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +316,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            compaction: parse_optional_bool(&merged_value, "compaction"),
         };
 
         Ok(RuntimeConfig {
@@ -482,6 +484,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn compaction_enabled(&self) -> bool {
+        self.compaction.unwrap_or(true)
     }
 }
 
@@ -738,6 +745,12 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_bool(root: &JsonValue, key: &str) -> Option<bool> {
+    root.as_object()
+        .and_then(|object| object.get(key))
+        .and_then(JsonValue::as_bool)
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
