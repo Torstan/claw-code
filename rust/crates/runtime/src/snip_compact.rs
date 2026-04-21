@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::compact::{estimate_message_tokens, estimate_session_tokens};
-use crate::micro_compact::{is_compactable_tool_name, MICROCOMPACT_CLEARED_SENTINEL};
+use crate::micro_compact::{
+    build_tool_input_index, is_cleared_sentinel, is_compactable_tool_name, recoverable_sentinel,
+    MICROCOMPACT_CLEARED_SENTINEL,
+};
 use crate::session::{
     CompactionMarkerKind, ContentBlock, ConversationMessage, MessageRole, Session,
 };
@@ -66,6 +70,7 @@ pub fn snip_compact_session(
     let mut current_tokens = estimated_tokens;
     let mut estimated_tokens_freed = 0;
     let mut snipped_message_ids = Vec::new();
+    let tool_input_index = build_tool_input_index(&session.messages);
 
     for message_index in candidate_indices {
         if current_tokens <= config.target_tokens {
@@ -76,7 +81,7 @@ pub fn snip_compact_session(
             continue;
         };
         let original_tokens = estimate_message_tokens(message);
-        let new_tokens = rewrite_message_for_snip(message);
+        let new_tokens = rewrite_message_for_snip(message, &tool_input_index);
         if new_tokens >= original_tokens {
             continue;
         }
@@ -180,12 +185,14 @@ fn is_snippable_tool_result_block(block: &ContentBlock) -> bool {
             ..
         } if !is_error
             && is_compactable_tool_name(tool_name)
-            && output != SNIP_CLEARED_TOOL_RESULT_SENTINEL
-            && output != MICROCOMPACT_CLEARED_SENTINEL
+            && !is_cleared_sentinel(output)
     )
 }
 
-fn rewrite_message_for_snip(message: &mut ConversationMessage) -> usize {
+fn rewrite_message_for_snip(
+    message: &mut ConversationMessage,
+    tool_input_index: &HashMap<&str, &str>,
+) -> usize {
     if is_snippable_assistant_text(message) {
         message.blocks = vec![ContentBlock::Text {
             text: SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL.to_string(),
@@ -197,10 +204,17 @@ fn rewrite_message_for_snip(message: &mut ConversationMessage) -> usize {
         if !is_snippable_tool_result_block(block) {
             continue;
         }
-        let ContentBlock::ToolResult { output, .. } = block else {
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            ..
+        } = block
+        else {
             continue;
         };
-        *output = SNIP_CLEARED_TOOL_RESULT_SENTINEL.to_string();
+        let tool_input = tool_input_index.get(tool_use_id.as_str()).copied();
+        *output = recoverable_sentinel(tool_name, tool_input, output);
     }
     estimate_message_tokens(message)
 }

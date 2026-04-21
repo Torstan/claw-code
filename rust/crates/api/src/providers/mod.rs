@@ -436,7 +436,8 @@ mod tests {
 
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
+        InputContentBlock, InputMessage, MessageRequest, SystemContentBlock, ToolChoice,
+        ToolDefinition,
     };
 
     use super::{
@@ -635,9 +636,10 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
+                    cache_control: None,
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(vec![SystemContentBlock::text("Keep the answer short.")]),
             tools: Some(vec![ToolDefinition {
                 name: "weather".to_string(),
                 description: Some("Fetches weather".to_string()),
@@ -645,6 +647,7 @@ mod tests {
                     "type": "object",
                     "properties": { "city": { "type": "string" } },
                 }),
+                cache_control: None,
             }]),
             tool_choice: Some(ToolChoice::Auto),
             stream: true,
@@ -681,6 +684,7 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
+                    cache_control: None,
                 }],
             }],
             system: None,

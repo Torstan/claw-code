@@ -2,13 +2,77 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl CacheControl {
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            kind: "ephemeral".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemContentBlock {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SystemContentBlock {
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManagementEdit {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub keep: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManagement {
+    pub edits: Vec<ContextManagementEdit>,
+}
+
+impl Default for ContextManagement {
+    fn default() -> Self {
+        Self {
+            edits: vec![ContextManagementEdit {
+                kind: "clear_thinking_20251015".to_string(),
+                keep: "all".to_string(),
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
     pub max_tokens: u32,
     pub messages: Vec<InputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<SystemContentBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,9 +92,10 @@ pub struct MessageRequest {
     pub stop: Option<Vec<String>>,
     /// Reasoning effort level for OpenAI-compatible reasoning models (e.g. `o4-mini`).
     /// Accepted values: `"low"`, `"medium"`, `"high"`. Omitted when `None`.
-    /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagement>,
 }
 
 impl MessageRequest {
@@ -52,7 +117,10 @@ impl InputMessage {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: vec![InputContentBlock::Text { text: text.into() }],
+            content: vec![InputContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
         }
     }
 
@@ -80,6 +148,8 @@ impl InputMessage {
 pub enum InputContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -107,6 +177,8 @@ pub struct ToolDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

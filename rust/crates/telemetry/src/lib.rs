@@ -14,6 +14,10 @@ pub const DEFAULT_APP_NAME: &str = "claude-code";
 pub const DEFAULT_RUNTIME: &str = "rust";
 pub const DEFAULT_AGENTIC_BETA: &str = "claude-code-20250219";
 pub const DEFAULT_PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
+pub const DEFAULT_CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+pub const DEFAULT_EFFORT_BETA: &str = "effort-2025-11-24";
+pub const DEFAULT_REDACT_THINKING_BETA: &str = "redact-thinking-2026-02-12";
+pub const DEFAULT_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientIdentity {
@@ -68,7 +72,11 @@ impl AnthropicRequestProfile {
             client_identity,
             betas: vec![
                 DEFAULT_AGENTIC_BETA.to_string(),
+                DEFAULT_INTERLEAVED_THINKING_BETA.to_string(),
+                DEFAULT_REDACT_THINKING_BETA.to_string(),
+                DEFAULT_CONTEXT_MANAGEMENT_BETA.to_string(),
                 DEFAULT_PROMPT_CACHING_SCOPE_BETA.to_string(),
+                DEFAULT_EFFORT_BETA.to_string(),
             ],
             extra_body: Map::new(),
         }
@@ -449,7 +457,7 @@ mod tests {
                 ("user-agent".to_string(), "claude-code/1.2.3".to_string()),
                 (
                     "anthropic-beta".to_string(),
-                    "claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01"
+                    "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,tools-2026-04-01"
                         .to_string(),
                 ),
             ]
@@ -466,7 +474,11 @@ mod tests {
             body["betas"],
             serde_json::json!([
                 "claude-code-20250219",
+                "interleaved-thinking-2025-05-14",
+                "redact-thinking-2026-02-12",
+                "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
+                "effort-2025-11-24",
                 "tools-2026-04-01"
             ])
         );

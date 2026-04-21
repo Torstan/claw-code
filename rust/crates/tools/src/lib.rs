@@ -7,8 +7,8 @@ use api::{
     detect_provider_kind, max_tokens_for_model, read_base_url, resolve_model_alias,
     resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource, ContentBlockDelta,
     InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemContentBlock,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -259,6 +259,7 @@ impl GlobalToolRegistry {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             });
         let runtime = self
             .runtime_tools
@@ -268,6 +269,7 @@ impl GlobalToolRegistry {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
+                cache_control: None,
             });
         let plugin = self
             .plugin_tools
@@ -280,6 +282,7 @@ impl GlobalToolRegistry {
                 name: tool.definition().name.clone(),
                 description: tool.definition().description.clone(),
                 input_schema: tool.definition().input_schema.clone(),
+                cache_control: None,
             });
         builtin.chain(runtime).chain(plugin).collect()
     }
@@ -4333,11 +4336,21 @@ impl ApiClient for ProviderRuntimeClient {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let system =
-            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let system = if request.system_prompt.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .system_prompt
+                    .iter()
+                    .map(|part| SystemContentBlock::text(part.clone()))
+                    .collect(),
+            )
+        };
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -4559,7 +4572,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .blocks
                 .iter()
                 .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Text { text } => InputContentBlock::Text {
+                        text: text.clone(),
+                        cache_control: None,
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
