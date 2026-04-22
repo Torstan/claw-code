@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -282,6 +284,8 @@ pub struct Usage {
     pub cache_read_input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cache_creation: BTreeMap<String, u32>,
 }
 
 impl Usage {
@@ -386,6 +390,7 @@ mod tests {
             cache_creation_input_tokens: 2,
             cache_read_input_tokens: 3,
             output_tokens: 4,
+            cache_creation: std::collections::BTreeMap::new(),
         };
 
         assert_eq!(usage.total_tokens(), 19);
@@ -407,6 +412,7 @@ mod tests {
                 cache_creation_input_tokens: 100_000,
                 cache_read_input_tokens: 200_000,
                 output_tokens: 500_000,
+                cache_creation: std::collections::BTreeMap::new(),
             },
             request_id: None,
         };

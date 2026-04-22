@@ -543,6 +543,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 6_000,
                 output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
             },
         );
         let current = TrackedPromptState::from_usage(
@@ -552,6 +553,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 1_000,
                 output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
             },
         );
         let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
@@ -571,6 +573,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 6_000,
                 output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
             },
         );
         let current = TrackedPromptState::from_usage(
@@ -580,6 +583,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 1_000,
                 output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
             },
         );
         let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
@@ -731,6 +735,7 @@ mod tests {
                 cache_creation_input_tokens: 5,
                 cache_read_input_tokens,
                 output_tokens,
+                cache_creation: std::collections::BTreeMap::new(),
             },
             request_id: Some("req_test".to_string()),
         }

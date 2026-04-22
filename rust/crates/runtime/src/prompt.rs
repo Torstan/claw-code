@@ -1,7 +1,6 @@
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
@@ -44,7 +43,6 @@ pub const SYSTEM_PROMPT_ATTACHMENT_BOUNDARY: &str = "__SYSTEM_PROMPT_ATTACHMENT_
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
-const MAX_GIT_DIFF_CHARS: usize = 4_000;
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +62,6 @@ pub struct ProjectContext {
 /// Project summary metadata used to keep prompt changes compact.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSummaryContext {
-    pub git_status_summary: Option<String>,
-    pub git_diff_summary: Option<String>,
     pub git_context_summary: Option<String>,
 }
 
@@ -73,7 +69,6 @@ pub struct ProjectSummaryContext {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectAttachmentContext {
     pub git_status: Option<String>,
-    pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
 }
 
@@ -95,7 +90,6 @@ impl ProjectContext {
         let cwd = cwd.into();
         Ok(ProjectAttachmentContext {
             git_status: read_git_status(&cwd),
-            git_diff: read_git_diff(&cwd),
             git_context: GitContext::detect(&cwd),
         })
     }
@@ -293,7 +287,7 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
 }
 
 fn read_git_status(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["--no-optional-locks", "status", "--short", "--branch"])
         .current_dir(cwd)
         .output()
@@ -308,38 +302,6 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn read_git_diff(cwd: &Path) -> Option<String> {
-    let mut sections = Vec::new();
-
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
-    if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
-    }
-
-    let unstaged = read_git_output(cwd, &["diff"])?;
-    if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
-    }
-
-    if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
-    }
-}
-
-fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
 }
 
 fn render_project_summary_context(project_context: &ProjectContext) -> String {
@@ -358,12 +320,6 @@ fn render_project_summary_context(project_context: &ProjectContext) -> String {
 fn render_summary_context(summary_context: &ProjectSummaryContext) -> String {
     let mut lines = vec!["# Summary context".to_string()];
     let mut bullets = Vec::new();
-    if let Some(status) = &summary_context.git_status_summary {
-        bullets.push(format!("Git status summary: {status}"));
-    }
-    if let Some(diff) = &summary_context.git_diff_summary {
-        bullets.push(format!("Git diff summary: {diff}"));
-    }
     if let Some(git_context) = &summary_context.git_context_summary {
         bullets.push(format!("Git context summary: {git_context}"));
     }
@@ -376,37 +332,10 @@ fn render_summary_context(summary_context: &ProjectSummaryContext) -> String {
 
 fn render_attachment_context(attachment_context: &ProjectAttachmentContext) -> String {
     let mut lines = vec!["# Project attachments".to_string()];
-    lines.extend(prepend_bullets(vec![
-        format!(
-            "Git status attached: {}.",
-            attachment_context.git_status.is_some()
-        ),
-        format!(
-            "Git diff attached: {}.",
-            attachment_context.git_diff.is_some()
-        ),
-        format!(
-            "Git context attached: {}.",
-            attachment_context.git_context.is_some()
-        ),
-    ]));
-    if let Some(status) = &attachment_context.git_status {
-        lines.push(String::new());
-        lines.push("Git status snapshot:".to_string());
-        lines.push(status.clone());
-    }
-    if let Some(diff) = &attachment_context.git_diff {
-        lines.push(String::new());
-        if diff.len() > MAX_GIT_DIFF_CHARS {
-            let line_count = diff.lines().count();
-            lines.push(format!(
-                "Git diff snapshot: [diff too large ({line_count} lines), use bash tool with `git diff` to view]"
-            ));
-        } else {
-            lines.push("Git diff snapshot:".to_string());
-            lines.push(diff.clone());
-        }
-    }
+    lines.extend(prepend_bullets(vec![format!(
+        "Git context attached: {}.",
+        attachment_context.git_context.is_some()
+    )]));
     if let Some(git_context) = &attachment_context.git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
@@ -531,18 +460,10 @@ pub fn load_system_prompt(
     let project_context = ProjectContext::discover(&cwd, current_date)?;
     let attachment_context = ProjectContext::discover_with_git(&cwd)?;
     let summary_context = ProjectSummaryContext {
-        git_status_summary: attachment_context.git_status.as_ref().map(|status| {
-            let line_count = status.lines().count();
-            format!("status snapshot with {line_count} lines")
-        }),
-        git_diff_summary: attachment_context.git_diff.as_ref().map(|diff| {
-            let line_count = diff.lines().count();
-            format!("diff snapshot with {line_count} lines")
-        }),
         git_context_summary: attachment_context
             .git_context
             .as_ref()
-            .map(|context| format!("{} recent commits", context.recent_commits.len())),
+            .map(|_| "recent commit metadata attached".to_string()),
     };
     let config = ConfigLoader::default_for(&cwd).load()?;
     Ok(SystemPromptBuilder::new()
@@ -629,11 +550,10 @@ fn get_actions_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_blank_lines, display_context_path, normalize_instruction_content, read_git_diff,
-        read_git_status, render_instruction_content, render_instruction_files,
-        truncate_instruction_content, ContextFile, ProjectAttachmentContext, ProjectContext,
-        ProjectSummaryContext, SystemPromptBuilder, SYSTEM_PROMPT_ATTACHMENT_BOUNDARY,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        collapse_blank_lines, display_context_path, normalize_instruction_content, read_git_status,
+        render_instruction_content, render_instruction_files, truncate_instruction_content,
+        ContextFile, ProjectAttachmentContext, ProjectContext, ProjectSummaryContext,
+        SystemPromptBuilder, SYSTEM_PROMPT_ATTACHMENT_BOUNDARY, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use crate::git_context::GitContext;
@@ -775,13 +695,10 @@ mod tests {
         let project_context =
             ProjectContext::discover(&root, "2026-03-31").expect("context should load");
         let summary_context = ProjectSummaryContext {
-            git_status_summary: Some("status snapshot with 2 lines".to_string()),
-            git_diff_summary: Some("diff snapshot with 1 lines".to_string()),
             git_context_summary: Some("3 recent commits".to_string()),
         };
         let attachment_context = ProjectAttachmentContext {
             git_status: Some("## main\nA  tracked.txt".to_string()),
-            git_diff: Some("diff --git a/tracked.txt b/tracked.txt".to_string()),
             git_context: GitContext::detect(&root),
         };
         let rendered = SystemPromptBuilder::new()
@@ -792,7 +709,7 @@ mod tests {
             .render();
 
         assert!(rendered.contains("# Project summary"));
-        assert!(rendered.contains("Git status summary:"));
+        assert!(rendered.contains("Git context summary:"));
         assert!(rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
         assert!(rendered.contains(SYSTEM_PROMPT_ATTACHMENT_BOUNDARY));
         assert!(rendered.contains("# Project attachments"));
@@ -834,13 +751,10 @@ mod tests {
         let project_context =
             ProjectContext::discover(&root, "2026-03-31").expect("context should load");
         let summary_context = ProjectSummaryContext {
-            git_status_summary: Some("status snapshot with 2 lines".to_string()),
-            git_diff_summary: Some("diff snapshot with 7 lines".to_string()),
             git_context_summary: Some("1 recent commits".to_string()),
         };
         let attachment_context = ProjectAttachmentContext {
             git_status: Some("## main\n M tracked.txt".to_string()),
-            git_diff: Some("diff --git a/tracked.txt b/tracked.txt".to_string()),
             git_context: GitContext::detect(&root),
         };
         let rendered = SystemPromptBuilder::new()
@@ -851,12 +765,12 @@ mod tests {
             .render();
 
         assert!(rendered.contains("# Project summary"));
-        assert!(rendered.contains("Git status summary:"));
+        assert!(rendered.contains("Git context summary:"));
         assert!(rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
         assert!(rendered.contains(SYSTEM_PROMPT_ATTACHMENT_BOUNDARY));
         assert!(rendered.contains("# Project attachments"));
-        assert!(rendered.contains("Git status snapshot:"));
-        assert!(rendered.contains("tracked.txt"));
+        assert!(rendered.contains("Git context snapshot:"));
+        assert!(rendered.contains("Recent commits:"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -897,13 +811,10 @@ mod tests {
         let project_context =
             ProjectContext::discover(&root, "2026-03-31").expect("context should load");
         let summary_context = ProjectSummaryContext {
-            git_status_summary: Some("status snapshot with 2 lines".to_string()),
-            git_diff_summary: Some("diff snapshot with 1 lines".to_string()),
             git_context_summary: Some("1 recent commit(s)".to_string()),
         };
         let attachment_context = ProjectAttachmentContext {
             git_status: read_git_status(&root),
-            git_diff: read_git_diff(&root),
             git_context: GitContext::detect(&root),
         };
         let rendered_summary = SystemPromptBuilder::new()
@@ -913,12 +824,13 @@ mod tests {
             .render();
 
         assert!(rendered_summary.contains("# Project summary"));
-        assert!(rendered_summary.contains("Git status summary:"));
+        assert!(rendered_summary.contains("Git context summary:"));
         assert!(rendered_summary.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
         assert!(rendered_summary.contains(SYSTEM_PROMPT_ATTACHMENT_BOUNDARY));
         assert!(rendered_summary.contains("# Project attachments"));
-        assert!(rendered_summary.contains("Git diff snapshot:"));
-        assert!(rendered_summary.contains("tracked.txt"));
+        assert!(rendered_summary.contains("Git context snapshot:"));
+        assert!(!rendered_summary.contains("Git status summary:"));
+        assert!(!rendered_summary.contains("gitStatus:"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1002,8 +914,6 @@ mod tests {
             ProjectContext::discover(&root, "2026-03-31").expect("context should load");
         let attachment_context = ProjectContext::discover_with_git(&root).expect("attachments");
         let summary_context = ProjectSummaryContext {
-            git_status_summary: Some("status snapshot with 2 lines".to_string()),
-            git_diff_summary: Some("diff snapshot with 1 lines".to_string()),
             git_context_summary: Some("0 recent commits".to_string()),
         };
         let config = ConfigLoader::new(&root, root.join("missing-home"))

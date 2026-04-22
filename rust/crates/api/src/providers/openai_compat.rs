@@ -457,6 +457,7 @@ impl StreamState {
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
                         output_tokens: 0,
+                        cache_creation: BTreeMap::new(),
                     },
                     request_id: None,
                 },
@@ -469,6 +470,7 @@ impl StreamState {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 output_tokens: usage.completion_tokens,
+                cache_creation: BTreeMap::new(),
             });
         }
 
@@ -577,6 +579,7 @@ impl StreamState {
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                     output_tokens: 0,
+                    cache_creation: BTreeMap::new(),
                 }),
             }));
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
@@ -1116,6 +1119,7 @@ fn normalize_response(
                 .usage
                 .as_ref()
                 .map_or(0, |usage| usage.completion_tokens),
+            cache_creation: BTreeMap::new(),
         },
         request_id: None,
     })

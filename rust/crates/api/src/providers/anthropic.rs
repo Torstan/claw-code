@@ -239,6 +239,12 @@ impl AnthropicClient {
     }
 
     #[must_use]
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.request_profile = self.request_profile.with_extra_header(name, value);
+        self
+    }
+
+    #[must_use]
     pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
         self.prompt_cache = Some(prompt_cache);
         self
@@ -1384,8 +1390,15 @@ mod tests {
         }
     }
 
-    fn spawn_token_server(response_body: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    fn spawn_token_server(response_body: &'static str) -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping oauth refresh test because localhost bind is blocked: {error}");
+                return None;
+            }
+            Err(error) => panic!("bind listener: {error}"),
+        };
         let address = listener.local_addr().expect("local addr");
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept connection");
@@ -1400,7 +1413,7 @@ mod tests {
                 .write_all(response.as_bytes())
                 .expect("write response");
         });
-        format!("http://{address}/oauth/token")
+        Some(format!("http://{address}/oauth/token"))
     }
 
     #[test]
@@ -1529,9 +1542,14 @@ mod tests {
         })
         .expect("save expired oauth credentials");
 
-        let token_url = spawn_token_server(
+        let Some(token_url) = spawn_token_server(
             "{\"access_token\":\"refreshed-token\",\"refresh_token\":\"fresh-refresh\",\"expires_at\":9999999999,\"scopes\":[\"scope:a\"]}",
-        );
+        ) else {
+            clear_oauth_credentials().expect("clear credentials");
+            std::env::remove_var("CLAW_CONFIG_HOME");
+            cleanup_temp_config_home(&config_home);
+            return;
+        };
         let resolved = resolve_saved_oauth_token(&sample_oauth_config(token_url))
             .expect("resolve refreshed token")
             .expect("token set present");
@@ -1618,9 +1636,14 @@ mod tests {
         })
         .expect("save expired oauth credentials");
 
-        let token_url = spawn_token_server(
+        let Some(token_url) = spawn_token_server(
             "{\"access_token\":\"refreshed-token\",\"expires_at\":9999999999,\"scopes\":[\"scope:a\"]}",
-        );
+        ) else {
+            clear_oauth_credentials().expect("clear credentials");
+            std::env::remove_var("CLAW_CONFIG_HOME");
+            cleanup_temp_config_home(&config_home);
+            return;
+        };
         let resolved = resolve_saved_oauth_token(&sample_oauth_config(token_url))
             .expect("resolve refreshed token")
             .expect("token set present");

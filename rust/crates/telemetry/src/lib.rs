@@ -62,6 +62,8 @@ pub struct AnthropicRequestProfile {
     pub betas: Vec<String>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extra_body: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl AnthropicRequestProfile {
@@ -79,6 +81,7 @@ impl AnthropicRequestProfile {
                 DEFAULT_EFFORT_BETA.to_string(),
             ],
             extra_body: Map::new(),
+            extra_headers: vec![],
         }
     }
 
@@ -98,6 +101,12 @@ impl AnthropicRequestProfile {
     }
 
     #[must_use]
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    #[must_use]
     pub fn header_pairs(&self) -> Vec<(String, String)> {
         let mut headers = vec![
             (
@@ -109,6 +118,7 @@ impl AnthropicRequestProfile {
         if !self.betas.is_empty() {
             headers.push(("anthropic-beta".to_string(), self.betas.join(",")));
         }
+        headers.extend(self.extra_headers.iter().cloned());
         headers
     }
 

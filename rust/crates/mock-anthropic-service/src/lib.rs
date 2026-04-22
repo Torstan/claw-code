@@ -683,6 +683,7 @@ fn text_message_response(id: &str, text: &str) -> MessageResponse {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens: 6,
+            cache_creation: std::collections::BTreeMap::new(),
         },
         request_id: None,
     }
@@ -709,6 +710,7 @@ fn text_message_response_with_usage(
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens,
+            cache_creation: std::collections::BTreeMap::new(),
         },
         request_id: None,
     }
@@ -757,6 +759,7 @@ fn tool_message_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> Mes
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens: 3,
+            cache_creation: std::collections::BTreeMap::new(),
         },
         request_id: None,
     }
