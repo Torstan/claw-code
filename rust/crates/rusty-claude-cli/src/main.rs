@@ -7195,6 +7195,7 @@ impl AnthropicRuntimeClient {
                 let inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
                     .with_beta("prompt-caching-scope-2026-01-05")
+                    .with_extra_header("X-Claude-Code-Session-Id", session_id.clone())
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
@@ -7294,10 +7295,11 @@ impl ApiClient for AnthropicRuntimeClient {
                         );
                     }
                     if !dynamic_parts.is_empty() {
-                        blocks.push(
-                            SystemContentBlock::text(dynamic_parts)
-                                .with_cache_control(CacheControl::ephemeral()),
-                        );
+                        // Keep dynamic/attachment context outside the stable
+                        // cache marker budget so tools + first user + latest
+                        // user can still fit within Anthropic's breakpoint
+                        // limits.
+                        blocks.push(SystemContentBlock::text(dynamic_parts));
                     }
                 }
                 None => {
@@ -7321,23 +7323,9 @@ impl ApiClient for AnthropicRuntimeClient {
         let mut tools = self
             .enable_tools
             .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
-        if let Some(ref mut tool_list) = tools {
-            if let Some(last) = tool_list.last_mut() {
-                last.cache_control = Some(CacheControl::ephemeral());
-            }
-        }
+        apply_tool_cache_controls(&mut tools);
         let mut messages = convert_messages(&request.messages);
-        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
-            if let Some(last_block) = last_user.content.last_mut() {
-                match last_block {
-                    InputContentBlock::Text { cache_control, .. }
-                    | InputContentBlock::ToolResult { cache_control, .. } => {
-                        *cache_control = Some(CacheControl::ephemeral());
-                    }
-                    InputContentBlock::ToolUse { .. } => {}
-                }
-            }
-        }
+        apply_message_cache_controls(&mut messages);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -7352,6 +7340,25 @@ impl ApiClient for AnthropicRuntimeClient {
             output_config: Some(OutputConfig::high()),
             ..Default::default()
         };
+        let prompt_cache_summary = summarize_prompt_cache_controls(&message_request);
+        let cache_control_types_json =
+            serde_json::to_string(&prompt_cache_summary.cache_control_types)
+                .unwrap_or_else(|_| "[]".to_string());
+        agent_debug_log(
+            "cli.provider.stream.prompt_cache",
+            format!(
+                "session_id={} model={} message_count={} cache_enabled={} cache_control_count={} cache_control_types={} system_cache_control_count={} tool_cache_control_count={} message_cache_control_count={}",
+                self.session_id,
+                self.model,
+                message_request.messages.len(),
+                prompt_cache_summary.enabled,
+                prompt_cache_summary.cache_control_count,
+                cache_control_types_json,
+                prompt_cache_summary.system_cache_control_count,
+                prompt_cache_summary.tool_cache_control_count,
+                prompt_cache_summary.message_cache_control_count
+            ),
+        );
         let tool_count = message_request.tools.as_ref().map_or(0, Vec::len);
         let max_attempts: usize = if is_post_tool { 2 } else { 1 };
         let total_started_at = Instant::now();
@@ -7608,6 +7615,21 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
+                    let cache_creation_json = serde_json::to_string(&delta.usage.cache_creation)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    agent_debug_log(
+                        "cli.provider.stream.usage",
+                        format!(
+                            "session_id={} model={} input_tokens={} output_tokens={} cache_creation_input_tokens={} cache_read_input_tokens={} cache_creation={}",
+                            self.session_id,
+                            self.model,
+                            delta.usage.input_tokens,
+                            delta.usage.output_tokens,
+                            delta.usage.cache_creation_input_tokens,
+                            delta.usage.cache_read_input_tokens,
+                            cache_creation_json,
+                        ),
+                    );
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                 }
                 ApiStreamEvent::MessageStop(_) => {
@@ -8967,6 +8989,116 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
+fn apply_message_cache_controls(messages: &mut [InputMessage]) {
+    // Only mark the LAST user message.  Older user messages must never receive
+    // cache_control — not even temporarily — so the serialized prefix stays
+    // byte-identical as the conversation grows.  This matches Claude Code's
+    // strategy: 1 message breakpoint + 2 system breakpoints = 3 total.
+    if let Some(idx) = messages.iter().rposition(|m| is_cacheable_user_message(m)) {
+        set_user_cache_control(&mut messages[idx]);
+    }
+}
+
+fn apply_tool_cache_controls(tools: &mut Option<Vec<ToolDefinition>>) {
+    let Some(tool_list) = tools.as_mut() else {
+        return;
+    };
+    if let Some(last_tool) = tool_list.last_mut() {
+        last_tool.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCacheControlSummary {
+    enabled: bool,
+    cache_control_count: usize,
+    cache_control_types: Vec<String>,
+    system_cache_control_count: usize,
+    tool_cache_control_count: usize,
+    message_cache_control_count: usize,
+}
+
+fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheControlSummary {
+    let mut cache_control_types = BTreeSet::new();
+
+    let mut record_cache_control = |cache_control: &Option<CacheControl>| -> usize {
+        let Some(cache_control) = cache_control else {
+            return 0;
+        };
+        cache_control_types.insert(cache_control.kind.clone());
+        1
+    };
+
+    let system_cache_control_count = request.system.as_ref().map_or(0, |blocks| {
+        blocks
+            .iter()
+            .map(|block| record_cache_control(&block.cache_control))
+            .sum()
+    });
+    let tool_cache_control_count = request.tools.as_ref().map_or(0, |tools| {
+        tools
+            .iter()
+            .map(|tool| record_cache_control(&tool.cache_control))
+            .sum()
+    });
+    let message_cache_control_count = request
+        .messages
+        .iter()
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .map(|block| match block {
+                    InputContentBlock::Text { cache_control, .. }
+                    | InputContentBlock::ToolResult { cache_control, .. } => {
+                        record_cache_control(cache_control)
+                    }
+                    InputContentBlock::ToolUse { .. } => 0,
+                })
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+
+    let cache_control_count =
+        system_cache_control_count + tool_cache_control_count + message_cache_control_count;
+    PromptCacheControlSummary {
+        enabled: cache_control_count > 0,
+        cache_control_count,
+        cache_control_types: cache_control_types.into_iter().collect(),
+        system_cache_control_count,
+        tool_cache_control_count,
+        message_cache_control_count,
+    }
+}
+
+fn is_cacheable_user_message(message: &InputMessage) -> bool {
+    message.role == "user"
+        && message
+            .content
+            .last()
+            .is_some_and(is_cacheable_user_content_block)
+}
+
+fn is_cacheable_user_content_block(block: &InputContentBlock) -> bool {
+    matches!(
+        block,
+        InputContentBlock::Text { .. } | InputContentBlock::ToolResult { .. }
+    )
+}
+
+fn set_user_cache_control(message: &mut InputMessage) {
+    let Some(last_block) = message.content.last_mut() else {
+        return;
+    };
+    match last_block {
+        InputContentBlock::Text { cache_control, .. }
+        | InputContentBlock::ToolResult { cache_control, .. } => {
+            *cache_control = Some(CacheControl::ephemeral());
+        }
+        InputContentBlock::ToolUse { .. } => {}
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "claw v{VERSION}")?;
@@ -9155,6 +9287,7 @@ mod tests {
         StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -11700,6 +11833,318 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    fn checkpoint_indices(messages: &[api::InputMessage]) -> Vec<usize> {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, message)| {
+                if message.role != "user" {
+                    return None;
+                }
+                match message.content.last() {
+                    Some(api::InputContentBlock::Text { cache_control, .. })
+                    | Some(api::InputContentBlock::ToolResult { cache_control, .. })
+                        if cache_control.is_some() =>
+                    {
+                        Some(idx)
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn text_cache_mark(message: &api::InputMessage) -> (&str, bool) {
+        let last = message.content.last().expect("message should have content");
+        match last {
+            api::InputContentBlock::Text {
+                text,
+                cache_control,
+            } => (text.as_str(), cache_control.is_some()),
+            other => panic!("expected trailing text block, got {other:?}"),
+        }
+    }
+
+    fn captured_message_requests(
+        runtime: &tokio::runtime::Runtime,
+        server: &MockAnthropicService,
+    ) -> Vec<api::MessageRequest> {
+        runtime
+            .block_on(server.captured_requests())
+            .into_iter()
+            .filter(|request| request.path == "/v1/messages")
+            .map(|request| {
+                serde_json::from_str(&request.raw_body)
+                    .expect("captured /v1/messages payload should deserialize")
+            })
+            .collect()
+    }
+
+    fn cache_control_marker_count(request: &api::MessageRequest) -> usize {
+        let system_markers = request.system.as_ref().map_or(0, |blocks| {
+            blocks.iter().filter(|b| b.cache_control.is_some()).count()
+        });
+        let tool_markers = request.tools.as_ref().map_or(0, |tools| {
+            tools.iter().filter(|t| t.cache_control.is_some()).count()
+        });
+        let message_markers = request
+            .messages
+            .iter()
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter(|block| match block {
+                        api::InputContentBlock::Text { cache_control, .. }
+                        | api::InputContentBlock::ToolResult { cache_control, .. } => {
+                            cache_control.is_some()
+                        }
+                        api::InputContentBlock::ToolUse { .. } => false,
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        system_markers + tool_markers + message_markers
+    }
+
+    #[test]
+    fn apply_message_cache_controls_marks_only_last_user_message() {
+        let mut messages = vec![
+            api::InputMessage::user_text("q1"),
+            api::InputMessage {
+                role: "assistant".to_string(),
+                content: vec![api::InputContentBlock::Text {
+                    text: "a1".to_string(),
+                    cache_control: None,
+                }],
+            },
+            api::InputMessage::user_text("q2"),
+        ];
+
+        super::apply_message_cache_controls(&mut messages);
+
+        assert_eq!(checkpoint_indices(&messages), vec![2]);
+        assert_eq!(text_cache_mark(&messages[0]), ("q1", false));
+        assert_eq!(text_cache_mark(&messages[1]), ("a1", false));
+        assert_eq!(text_cache_mark(&messages[2]), ("q2", true));
+    }
+
+    #[test]
+    fn apply_message_cache_controls_marks_single_user_message_once() {
+        let mut messages = vec![api::InputMessage::user_text("only-user")];
+        super::apply_message_cache_controls(&mut messages);
+        assert_eq!(checkpoint_indices(&messages), vec![0]);
+        assert_eq!(text_cache_mark(&messages[0]), ("only-user", true));
+    }
+
+    #[test]
+    fn cache_control_keeps_stable_anchor_across_context_growth() {
+        let turn_two = vec![
+            ConversationMessage::user_text("u1"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "a1".to_string(),
+            }]),
+            ConversationMessage::user_text("u2"),
+        ];
+        let mut request_two = super::convert_messages(&turn_two);
+        super::apply_message_cache_controls(&mut request_two);
+
+        let turn_three = vec![
+            ConversationMessage::user_text("u1"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "a1".to_string(),
+            }]),
+            ConversationMessage::user_text("u2"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "a2".to_string(),
+            }]),
+            ConversationMessage::user_text("u3"),
+        ];
+        let mut request_three = super::convert_messages(&turn_three);
+        super::apply_message_cache_controls(&mut request_three);
+
+        // Only the last user message is marked — older ones stay unmarked so
+        // the serialized prefix is byte-identical across turns.
+        assert_eq!(checkpoint_indices(&request_two), vec![2]);
+        assert_eq!(checkpoint_indices(&request_three), vec![4]);
+
+        // u1 must stay identical across turns (prefix stability — no cache_control either time).
+        assert_eq!(
+            request_two[0], request_three[0],
+            "first user message must stay identical across turns"
+        );
+
+        let (turn_three_u3, turn_three_u3_marked) = text_cache_mark(
+            request_three
+                .last()
+                .expect("turn three should include latest user message"),
+        );
+        assert_eq!(turn_three_u3, "u3");
+        assert!(turn_three_u3_marked);
+    }
+
+    #[test]
+    fn mocked_queries_produce_cacheable_prompt_checkpoints_across_turns() {
+        let _env_guard = env_lock();
+        let _proxy_guards = clear_proxy_env();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let server = runtime
+            .block_on(MockAnthropicService::spawn())
+            .expect("mock service should start");
+        let base_url = server.base_url();
+
+        let workspace = temp_workspace("mock-query-cache-shape");
+        let config_home = workspace.join("config-home");
+        let home = workspace.join("home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&home).expect("home should exist");
+
+        git(&["init", "--quiet", "-b", "main"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        fs::write(
+            workspace.join("CLAUDE.md"),
+            "Follow repository instructions.\n",
+        )
+        .expect("CLAUDE.md should write");
+        fs::write(workspace.join("tracked.txt"), "alpha\n").expect("tracked file should write");
+        git(&["add", "CLAUDE.md", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+        fs::write(workspace.join("tracked.txt"), "alpha\nbeta\n")
+            .expect("tracked file should update");
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let previous_base_url = std::env::var_os("ANTHROPIC_BASE_URL");
+        let previous_api_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let previous_auth_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("ANTHROPIC_BASE_URL", &base_url);
+        std::env::set_var("ANTHROPIC_API_KEY", "test-mock-query-cache");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_dir(&workspace, || {
+                let mut cli =
+                    LiveCli::new("sonnet".to_string(), true, None, PermissionMode::ReadOnly)
+                        .expect("live cli should initialize");
+                cli.run_prompt_json(&format!(
+                    "{SCENARIO_PREFIX}streaming_text turn-1 cache probe"
+                ))
+                .expect("turn 1 should succeed");
+                cli.run_prompt_json(&format!(
+                    "{SCENARIO_PREFIX}streaming_text turn-2 cache probe"
+                ))
+                .expect("turn 2 should succeed");
+                cli.run_prompt_json(&format!(
+                    "{SCENARIO_PREFIX}streaming_text turn-3 cache probe"
+                ))
+                .expect("turn 3 should succeed");
+            });
+        }));
+
+        let requests = captured_message_requests(&runtime, &server);
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match previous_base_url {
+            Some(value) => std::env::set_var("ANTHROPIC_BASE_URL", value),
+            None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+        }
+        match previous_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match previous_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+
+        if let Err(payload) = run_result {
+            std::panic::resume_unwind(payload);
+        }
+
+        assert_eq!(
+            requests.len(),
+            3,
+            "expected three LLM turns captured by mock service, got {requests:#?}"
+        );
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[1].messages.len(), 3);
+        assert_eq!(requests[2].messages.len(), 5);
+        for request in &requests {
+            let system = request
+                .system
+                .as_ref()
+                .expect("system blocks should be present");
+            assert!(
+                !system.is_empty(),
+                "system blocks should not be empty: {request:#?}"
+            );
+            assert!(
+                system
+                    .first()
+                    .is_some_and(|first_block| first_block.cache_control.is_some()),
+                "first system block should carry cache_control for stable-prefix anchoring: {system:#?}"
+            );
+            assert!(
+                system
+                    .iter()
+                    .skip(1)
+                    .all(|block| block.cache_control.is_none()),
+                "dynamic system blocks should stay uncached to preserve cache marker budget: {system:#?}"
+            );
+            let tools = request
+                .tools
+                .as_ref()
+                .expect("tools should be present in provider request");
+            let last_tool = tools
+                .last()
+                .expect("provider request should include at least one tool");
+            assert!(
+                last_tool.cache_control.is_some(),
+                "last tool definition should carry cache_control for prompt-cache anchoring: {tools:#?}"
+            );
+            assert!(
+                cache_control_marker_count(request) <= 4,
+                "provider request should stay within the 4-marker cache breakpoint budget: {request:#?}"
+            );
+        }
+
+        // Only the last user message gets cache_control — older ones stay unmarked.
+        assert_eq!(checkpoint_indices(&requests[0].messages), vec![0]);
+        assert_eq!(checkpoint_indices(&requests[1].messages), vec![2]);
+        assert_eq!(checkpoint_indices(&requests[2].messages), vec![4]);
+        // u1 must stay identical across turns (prefix stability — no cache_control either time).
+        assert_eq!(
+            requests[1].messages[0], requests[2].messages[0],
+            "first user message must stay identical across turn growth"
+        );
+
+        let (turn_three_user_three, turn_three_user_three_cached) = text_cache_mark(
+            requests[2]
+                .messages
+                .last()
+                .expect("third turn should include latest user prompt"),
+        );
+        assert_eq!(
+            turn_three_user_three,
+            format!("{SCENARIO_PREFIX}streaming_text turn-3 cache probe")
+        );
+        assert!(turn_three_user_three_cached);
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
@@ -12108,6 +12553,7 @@ UU conflicted.rs",
                     output_tokens: 1,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_creation: std::collections::BTreeMap::new(),
                 },
                 request_id: None,
             },
@@ -12143,6 +12589,7 @@ UU conflicted.rs",
                     output_tokens: 1,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_creation: std::collections::BTreeMap::new(),
                 },
                 request_id: None,
             },
@@ -12182,6 +12629,7 @@ UU conflicted.rs",
                     output_tokens: 1,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_creation: std::collections::BTreeMap::new(),
                 },
                 request_id: None,
             },
