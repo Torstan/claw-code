@@ -65,7 +65,10 @@ impl TeamRegistry {
     }
 
     pub fn create(&self, name: &str, task_ids: Vec<String>) -> Team {
-        let mut inner = self.inner.lock().expect("team registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.counter += 1;
         let ts = now_secs();
         let team_id = format!("team_{:08x}_{}", ts, inner.counter);
@@ -82,17 +85,26 @@ impl TeamRegistry {
     }
 
     pub fn get(&self, team_id: &str) -> Option<Team> {
-        let inner = self.inner.lock().expect("team registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.teams.get(team_id).cloned()
     }
 
     pub fn list(&self) -> Vec<Team> {
-        let inner = self.inner.lock().expect("team registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.teams.values().cloned().collect()
     }
 
     pub fn delete(&self, team_id: &str) -> Result<Team, String> {
-        let mut inner = self.inner.lock().expect("team registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let team = inner
             .teams
             .get_mut(team_id)
@@ -103,13 +115,19 @@ impl TeamRegistry {
     }
 
     pub fn remove(&self, team_id: &str) -> Option<Team> {
-        let mut inner = self.inner.lock().expect("team registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.teams.remove(team_id)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("team registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.teams.len()
     }
 
@@ -150,7 +168,10 @@ impl CronRegistry {
     }
 
     pub fn create(&self, schedule: &str, prompt: &str, description: Option<&str>) -> CronEntry {
-        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.counter += 1;
         let ts = now_secs();
         let cron_id = format!("cron_{:08x}_{}", ts, inner.counter);
@@ -170,12 +191,18 @@ impl CronRegistry {
     }
 
     pub fn get(&self, cron_id: &str) -> Option<CronEntry> {
-        let inner = self.inner.lock().expect("cron registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.get(cron_id).cloned()
     }
 
     pub fn list(&self, enabled_only: bool) -> Vec<CronEntry> {
-        let inner = self.inner.lock().expect("cron registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .values()
@@ -185,7 +212,10 @@ impl CronRegistry {
     }
 
     pub fn delete(&self, cron_id: &str) -> Result<CronEntry, String> {
-        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .remove(cron_id)
@@ -194,7 +224,10 @@ impl CronRegistry {
 
     /// Disable a cron entry without removing it.
     pub fn disable(&self, cron_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = inner
             .entries
             .get_mut(cron_id)
@@ -206,7 +239,10 @@ impl CronRegistry {
 
     /// Record a cron run.
     pub fn record_run(&self, cron_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = inner
             .entries
             .get_mut(cron_id)
@@ -219,7 +255,10 @@ impl CronRegistry {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("cron registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.len()
     }
 

@@ -97,7 +97,7 @@ impl McpToolRegistry {
         resources: Vec<McpResourceInfo>,
         server_info: Option<String>,
     ) {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.insert(
             server_name.to_owned(),
             McpServerState {
@@ -283,7 +283,7 @@ impl McpToolRegistry {
         server_name: &str,
         status: McpConnectionStatus,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = inner
             .get_mut(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -293,7 +293,7 @@ impl McpToolRegistry {
 
     /// Disconnect / remove a server.
     pub fn disconnect(&self, server_name: &str) -> Option<McpServerState> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.remove(server_name)
     }
 
