@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+// Extracted modules
+pub mod file_ops;
+
 use api::{
     detect_provider_kind, max_tokens_for_model, read_base_url, resolve_model_alias,
     resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource, ContentBlockDelta,
@@ -2031,38 +2034,11 @@ fn branch_divergence_output(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
-}
+// File operations now in file_ops module
+use file_ops::{
+    run_read_file, run_write_file, run_edit_file, run_glob_search, run_grep_search,
+    ReadFileInput, WriteFileInput, EditFileInput, GlobSearchInputValue
+};
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
@@ -2166,32 +2142,7 @@ fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
-#[derive(Debug, Deserialize)]
-struct ReadFileInput {
-    path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WriteFileInput {
-    path: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditFileInput {
-    path: String,
-    old_string: String,
-    new_string: String,
-    replace_all: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GlobSearchInputValue {
-    pattern: String,
-    path: Option<String>,
-}
+// Moved to file_ops module
 
 #[derive(Debug, Deserialize)]
 struct WebFetchInput {
