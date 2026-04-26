@@ -195,7 +195,10 @@ mod tests {
             .args(args)
             .current_dir(cwd)
             .status()
-            .unwrap_or_else(|e| panic!("git {} failed to execute: {e}", args.join(" ")));
+            .unwrap_or_else(|e| {
+                eprintln!("git {} failed to execute: {e}", args.join(" "));
+                std::process::exit(1);
+            });
         assert!(
             status.success(),
             "git {} exited with {status}",
