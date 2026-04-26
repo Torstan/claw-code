@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-// Extracted modules
-pub mod file_ops;
+// Extracted modules (lib_ prefix for clarity)
+pub mod lib_file_ops;
+pub mod lib_simple_tools;
 
 use api::{
     detect_provider_kind, max_tokens_for_model, read_base_url, resolve_model_alias,
@@ -2034,10 +2035,16 @@ fn branch_divergence_output(
     }
 }
 
-// File operations now in file_ops module
-use file_ops::{
+// File operations now in lib_file_ops module
+use lib_file_ops::{
     run_read_file, run_write_file, run_edit_file, run_glob_search, run_grep_search,
     ReadFileInput, WriteFileInput, EditFileInput, GlobSearchInputValue
+};
+
+// Simple tools now in lib_simple_tools module
+use lib_simple_tools::{
+    run_todo_write, run_skill, run_agent,
+    TodoWriteInput, TodoItem, TodoStatus, SkillInput, AgentInput
 };
 
 #[allow(clippy::needless_pass_by_value)]
