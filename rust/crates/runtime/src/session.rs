@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +12,6 @@ use crate::usage::TokenUsage;
 const SESSION_VERSION: u32 = 2;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
-static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
@@ -62,6 +61,7 @@ pub struct CompactionMarker {
 
 /// Distinguishes the synthetic system markers introduced by compaction stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum CompactionMarkerKind {
     CompactBoundary,
     MicrocompactBoundary,
@@ -415,6 +415,7 @@ impl Session {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_jsonl(contents: &str) -> Result<Self, SessionError> {
         let mut version = SESSION_VERSION;
         let mut session_id = None;
@@ -494,7 +495,7 @@ impl Session {
                     return Err(SessionError::Format(format!(
                         "unsupported JSONL record type at line {}: {other}",
                         line_number + 1
-                    )))
+                    )));
                 }
             }
         }
@@ -769,7 +770,7 @@ impl ConversationMessage {
             other => {
                 return Err(SessionError::Format(format!(
                     "unsupported message role: {other}"
-                )))
+                )));
             }
         };
         let blocks = object
@@ -783,8 +784,7 @@ impl ConversationMessage {
         let message_id = object
             .get("message_id")
             .and_then(JsonValue::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(generate_message_id);
+            .map_or_else(generate_message_id, ToOwned::to_owned);
         let timestamp_ms = object
             .get("timestamp_ms")
             .map(|value| required_u64_from_value(value, "timestamp_ms"))
@@ -1162,9 +1162,21 @@ fn current_time_millis() -> u64 {
 }
 
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    let mut buf = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .expect("/dev/urandom should open")
+        .read_exact(&mut buf)
+        .expect("/dev/urandom should provide 16 bytes");
+    buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+    buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u16::from_be_bytes([buf[4], buf[5]]),
+        u16::from_be_bytes([buf[6], buf[7]]),
+        u16::from_be_bytes([buf[8], buf[9]]),
+        u64::from_be_bytes([0, 0, buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+    )
 }
 
 fn generate_message_id() -> String {
@@ -1191,7 +1203,7 @@ fn temporary_path_for(path: &Path) -> PathBuf {
     path.with_file_name(format!(
         "{file_name}.tmp-{}-{}",
         current_time_millis(),
-        SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
@@ -1309,6 +1321,22 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn session_ids_are_uuid_v4() {
+        let session = Session::new();
+        let parts: Vec<&str> = session.session_id.split('-').collect();
+
+        assert_eq!(parts.len(), 5, "session ID should be UUID v4");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert!(parts[2].starts_with('4'));
+        assert_eq!(parts[3].len(), 4);
+        let variant = u8::from_str_radix(&parts[3][..1], 16).expect("variant nibble");
+        assert!((8..=0xb).contains(&variant));
+        assert_eq!(parts[4].len(), 12);
     }
 
     #[test]
@@ -1723,12 +1751,8 @@ mod tests {
 /// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
-    let store = crate::session_control::SessionStore::from_cwd(cwd).map_err(|e| {
-        SessionError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let store = crate::session_control::SessionStore::from_cwd(cwd)
+        .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
     Ok(store.sessions_dir().to_path_buf())
 }
 

@@ -140,6 +140,7 @@ pub enum PartialCompactMode {
 }
 
 impl PartialCompactMode {
+    #[must_use]
     pub fn from_options(up_to_prompt: Option<usize>, from_prompt: Option<usize>) -> Option<Self> {
         match (up_to_prompt, from_prompt) {
             (Some(n), None) => Some(Self::UpToPrompt(n)),

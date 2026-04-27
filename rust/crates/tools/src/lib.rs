@@ -1188,6 +1188,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+#[must_use]
 pub fn render_tool_result_for_model(tool_name: &str, output: &str) -> String {
     if tool_name == "Agent" {
         if let Some(rendered) = render_async_agent_launch_for_model(output) {
@@ -1465,7 +1466,7 @@ fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
     let task = if input.block {
         registry
             .wait_for_terminal(&input.task_id, Duration::from_millis(input.timeout_ms))
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.clone())?
     } else {
         registry
             .get(&input.task_id)
@@ -2571,6 +2572,7 @@ struct AsyncAgentLaunchOutput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 enum AgentToolOutput {
     Completed(AgentOutput),
     AsyncLaunched(AsyncAgentLaunchOutput),
@@ -3630,6 +3632,7 @@ fn build_async_agent_launch_output(manifest: &AgentOutput, prompt: &str) -> Asyn
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let started_at = Instant::now();
     let spawned_agent_id = job.manifest.agent_id.clone();
@@ -3653,7 +3656,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     );
     registry
         .set_status(&agent_id, TaskStatus::Running)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.clone())?;
     agent_debug_log(
         "agent.background.register.done",
         format!(
@@ -3766,7 +3769,10 @@ fn enqueue_background_agent_notification(job: &AgentJob, status: &str, body: &st
         job.manifest.agent_id, job.manifest.description, status, job.manifest.output_file
     );
     if !body.trim().is_empty() {
-        message.push_str(&format!("\n{detail_label}:\n{}", body.trim()));
+        let _ = std::fmt::Write::write_fmt(
+            &mut message,
+            format_args!("\n{detail_label}:\n{}", body.trim()),
+        );
     }
     enqueue_session_notification(session_id.to_string(), message);
 }
@@ -4243,10 +4249,7 @@ impl ProviderRuntimeClient {
         fallback_config: &ProviderFallbackConfig,
         session_id: &str,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config
-            .primary()
-            .map(str::to_string)
-            .unwrap_or(model);
+        let primary_model = fallback_config.primary().map_or(model, str::to_string);
         let primary = build_provider_entry(&primary_model, session_id)?;
         let mut chain = vec![primary];
         for fallback_model in fallback_config.fallbacks() {
@@ -4274,6 +4277,9 @@ fn build_provider_entry(model: &str, session_id: &str) -> Result<ProviderEntry, 
             let auth = resolve_subagent_auth_source()?;
             let client = AnthropicClient::from_auth(auth)
                 .with_base_url(read_base_url())
+                .with_extra_header("X-Claude-Code-Session-Id", session_id.to_string())
+                .with_extra_header("x-app", "cli")
+                .with_extra_header("anthropic-dangerous-direct-browser-access", "true")
                 .with_prompt_cache(PromptCache::new(session_id));
             ProviderClient::Anthropic(client)
         }
@@ -4411,7 +4417,6 @@ impl ApiClient for ProviderRuntimeClient {
                         entry.model
                     );
                     last_error = Some(error);
-                    continue;
                 }
                 Err(error) => {
                     agent_debug_log(
@@ -4428,11 +4433,10 @@ impl ApiClient for ProviderRuntimeClient {
             }
         }
 
-        Err(RuntimeError::new(
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
-        ))
+        Err(RuntimeError::new(last_error.map_or_else(
+            || String::from("provider chain exhausted with no attempts"),
+            |error| error.to_string(),
+        )))
     }
 }
 
@@ -4665,9 +4669,13 @@ fn prompt_cache_record_to_runtime_event(
     Some(PromptCacheEvent {
         unexpected: cache_break.unexpected,
         reason: cache_break.reason,
+        reason_code: cache_break.reason_code,
+        diagnostic_scope: cache_break.diagnostic_scope,
+        changed_components: cache_break.changed_components,
         previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
         current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
         token_drop: cache_break.token_drop,
+        elapsed_seconds: cache_break.elapsed_seconds,
     })
 }
 
@@ -9378,6 +9386,25 @@ printf 'pwsh:%s' "$1"
                 assert_eq!(
                     inner.auth_source(),
                     &AuthSource::BearerToken("test-bearer-token".to_string())
+                );
+                let headers = inner.request_profile().header_pairs();
+                assert!(
+                    headers.contains(&(
+                        "X-Claude-Code-Session-Id".to_string(),
+                        "agent-session-123".to_string()
+                    )),
+                    "subagent Anthropic requests should carry session affinity headers: {headers:?}"
+                );
+                assert!(
+                    headers.contains(&("x-app".to_string(), "cli".to_string())),
+                    "subagent Anthropic requests should match CLI relay headers: {headers:?}"
+                );
+                assert!(
+                    headers.contains(&(
+                        "anthropic-dangerous-direct-browser-access".to_string(),
+                        "true".to_string()
+                    )),
+                    "subagent Anthropic requests should match CLI relay headers: {headers:?}"
                 );
             }
             other => panic!("expected anthropic provider entry, got {other:?}"),

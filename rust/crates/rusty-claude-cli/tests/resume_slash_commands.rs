@@ -628,6 +628,9 @@ fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
 fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
+    // Keep CLI integration tests hermetic even when the developer shell
+    // disables compaction globally.
+    command.env_remove("CLAW_COMPACTION_ENABLED");
     for (key, value) in envs {
         command.env(key, value);
     }

@@ -435,15 +435,15 @@ impl AnthropicClient {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let started_at = Instant::now();
         let mut attempts = 0;
-        let mut last_error: Option<ApiError> = None;
 
-        loop {
+        let last_error = loop {
             attempts += 1;
             let attempt_started_at = Instant::now();
             agent_debug_log(
@@ -501,12 +501,10 @@ impl AnthropicClient {
                             ),
                         );
                         self.record_request_failure(attempts, &error);
-                        last_error = Some(error);
                         if attempts > self.max_retries {
-                            break;
+                            break error;
                         }
                         tokio::time::sleep(backoff).await;
-                        continue;
                     }
                     Err(error) => {
                         let error = enrich_bearer_auth_error(error, &self.auth);
@@ -538,12 +536,10 @@ impl AnthropicClient {
                         ),
                     );
                     self.record_request_failure(attempts, &error);
-                    last_error = Some(error);
                     if attempts > self.max_retries {
-                        break;
+                        break error;
                     }
                     tokio::time::sleep(backoff).await;
-                    continue;
                 }
                 Err(error) => {
                     agent_debug_log(
@@ -561,9 +557,8 @@ impl AnthropicClient {
                     return Err(error);
                 }
             }
-        }
+        };
 
-        let last_error = last_error.expect("retry loop must capture an error");
         Err(ApiError::RetriesExhausted {
             attempts,
             last_error: Box::new(last_error),
@@ -576,6 +571,9 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let started_at = Instant::now();
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let request_headers = self.request_profile.header_pairs();
+        let request_headers_json =
+            serde_json::to_string(&request_headers).unwrap_or_else(|_| "[]".to_string());
         agent_debug_log(
             "anthropic.send_raw_request.begin",
             format!(
@@ -586,9 +584,24 @@ impl AnthropicClient {
                 request.max_tokens
             ),
         );
+        agent_debug_log(
+            "anthropic.send_raw_request.headers",
+            format!(
+                "model={}\nurl={request_url}\nheaders={request_headers_json}",
+                request.model
+            ),
+        );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        let body_bytes = serde_json::to_vec(&request_body).map_err(ApiError::from)?;
+        agent_debug_log(
+            "anthropic.send_raw_request.body",
+            String::from_utf8_lossy(&body_bytes),
+        );
+        let request_builder = self
+            .build_request(&request_url)
+            .header("content-type", "application/json")
+            .body(body_bytes);
         match request_builder.send().await {
             Ok(response) => {
                 agent_debug_log(
@@ -629,6 +642,7 @@ impl AnthropicClient {
         request_builder
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
         let started_at = Instant::now();
         agent_debug_log(
@@ -1282,7 +1296,7 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         object.remove("reasoning_effort");
         // Anthropic uses "stop_sequences" not "stop". Convert if present.
         if let Some(stop_val) = object.remove("stop") {
-            if stop_val.as_array().map_or(false, |a| !a.is_empty()) {
+            if stop_val.as_array().is_some_and(|a| !a.is_empty()) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }

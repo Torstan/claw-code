@@ -82,7 +82,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some("claude-cli/0.1.0 (external, cli)")
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
@@ -188,7 +188,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/9.9.9")
+        Some("claude-code/9.9.9 (external, cli)")
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -718,10 +718,12 @@ async fn send_message_tracks_unexpected_prompt_cache_breaks() {
         .prompt_cache_stats()
         .expect("prompt cache stats should exist");
     assert_eq!(cache_stats.unexpected_cache_breaks, 1);
-    assert_eq!(
-        cache_stats.last_break_reason.as_deref(),
-        Some("cache read tokens dropped while prompt fingerprint remained stable")
-    );
+    let last_break_reason = cache_stats
+        .last_break_reason
+        .as_deref()
+        .expect("break reason should be recorded");
+    assert!(last_break_reason.contains("local request fingerprint stayed stable"));
+    assert!(last_break_reason.contains("possible relay or upstream cache-domain drift"));
 
     std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
     std::env::remove_var("CLAUDE_CONFIG_HOME");

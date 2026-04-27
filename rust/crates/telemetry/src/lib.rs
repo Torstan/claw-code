@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
-pub const DEFAULT_APP_NAME: &str = "claude-code";
+pub const DEFAULT_APP_NAME: &str = "claude-cli";
 pub const DEFAULT_RUNTIME: &str = "rust";
 pub const DEFAULT_AGENTIC_BETA: &str = "claude-code-20250219";
 pub const DEFAULT_PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
@@ -44,7 +44,7 @@ impl ClientIdentity {
 
     #[must_use]
     pub fn user_agent(&self) -> String {
-        format!("{}/{}", self.app_name, self.app_version)
+        format!("{}/{} (external, cli)", self.app_name, self.app_version)
     }
 }
 
@@ -464,7 +464,7 @@ mod tests {
                     "anthropic-version".to_string(),
                     DEFAULT_ANTHROPIC_VERSION.to_string()
                 ),
-                ("user-agent".to_string(), "claude-code/1.2.3".to_string()),
+                ("user-agent".to_string(), "claude-code/1.2.3 (external, cli)".to_string()),
                 (
                     "anthropic-beta".to_string(),
                     "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,tools-2026-04-01"

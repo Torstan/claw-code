@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use runtime::agent_debug_log;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MessageRequest, MessageResponse, Usage};
+use crate::types::{InputContentBlock, MessageRequest, MessageResponse, Usage};
 
 const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
@@ -94,9 +95,14 @@ pub struct PromptCacheStats {
 pub struct CacheBreakEvent {
     pub unexpected: bool,
     pub reason: String,
+    pub reason_code: String,
+    pub diagnostic_scope: String,
+    #[serde(default)]
+    pub changed_components: Vec<String>,
     pub previous_cache_read_input_tokens: u32,
     pub current_cache_read_input_tokens: u32,
     pub token_drop: u32,
+    pub elapsed_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +233,13 @@ impl PromptCache {
                 inner.stats.expected_invalidations += 1;
             }
             inner.stats.last_break_reason = Some(event.reason.clone());
+            log_cache_break(
+                &inner.config.session_id,
+                &request_hash,
+                event,
+                previous.as_ref(),
+                &current,
+            );
         }
 
         inner.previous = Some(current);
@@ -270,9 +283,21 @@ struct TrackedPromptState {
     observed_at_unix_secs: u64,
     #[serde(default = "current_fingerprint_version")]
     fingerprint_version: u32,
+    #[serde(default)]
+    model_name: String,
     model_hash: u64,
+    #[serde(default)]
+    system_block_count: usize,
     system_hash: u64,
+    #[serde(default)]
+    tool_count: usize,
     tools_hash: u64,
+    #[serde(default)]
+    message_count: usize,
+    #[serde(default)]
+    last_message_role: Option<String>,
+    #[serde(default)]
+    last_message_content_types: Vec<String>,
     messages_hash: u64,
     cache_read_input_tokens: u32,
 }
@@ -280,12 +305,20 @@ struct TrackedPromptState {
 impl TrackedPromptState {
     fn from_usage(request: &MessageRequest, usage: &Usage) -> Self {
         let hashes = RequestFingerprints::from_request(request);
+        let (last_message_role, last_message_content_types) =
+            summarize_last_message(&request.messages);
         Self {
             observed_at_unix_secs: now_unix_secs(),
             fingerprint_version: current_fingerprint_version(),
+            model_name: request.model.clone(),
             model_hash: hashes.model,
+            system_block_count: request.system.as_ref().map_or(0, Vec::len),
             system_hash: hashes.system,
+            tool_count: request.tools.as_ref().map_or(0, Vec::len),
             tools_hash: hashes.tools,
+            message_count: request.messages.len(),
+            last_message_role,
+            last_message_content_types,
             messages_hash: hashes.messages,
             cache_read_input_tokens: usage.cache_read_input_tokens,
         }
@@ -318,17 +351,24 @@ fn detect_cache_break(
 ) -> Option<CacheBreakEvent> {
     let previous = previous?;
     if previous.fingerprint_version != current.fingerprint_version {
+        let elapsed = current
+            .observed_at_unix_secs
+            .saturating_sub(previous.observed_at_unix_secs);
         return Some(CacheBreakEvent {
             unexpected: false,
             reason: format!(
-                "fingerprint version changed (v{} -> v{})",
+                "local prompt-cache fingerprint version changed (v{} -> v{}); historical cache comparisons are no longer comparable. This is not an Anthropic server-provided miss reason.",
                 previous.fingerprint_version, current.fingerprint_version
             ),
+            reason_code: "fingerprint_version_changed".to_string(),
+            diagnostic_scope: "local_fingerprint_version".to_string(),
+            changed_components: Vec::new(),
             previous_cache_read_input_tokens: previous.cache_read_input_tokens,
             current_cache_read_input_tokens: current.cache_read_input_tokens,
             token_drop: previous
                 .cache_read_input_tokens
                 .saturating_sub(current.cache_read_input_tokens),
+            elapsed_seconds: elapsed,
         });
     }
     let token_drop = previous
@@ -338,47 +378,244 @@ fn detect_cache_break(
         return None;
     }
 
-    let mut reasons = Vec::new();
+    let mut changed_components = Vec::new();
     if previous.model_hash != current.model_hash {
-        reasons.push("model changed");
+        changed_components.push("model".to_string());
     }
     if previous.system_hash != current.system_hash {
-        reasons.push("system prompt changed");
+        changed_components.push("system".to_string());
     }
     if previous.tools_hash != current.tools_hash {
-        reasons.push("tool definitions changed");
+        changed_components.push("tools".to_string());
     }
     if previous.messages_hash != current.messages_hash {
-        reasons.push("message payload changed");
+        changed_components.push("messages".to_string());
     }
 
     let elapsed = current
         .observed_at_unix_secs
         .saturating_sub(previous.observed_at_unix_secs);
 
-    let (unexpected, reason) = if reasons.is_empty() {
+    let (unexpected, reason_code, diagnostic_scope, reason) = if changed_components.is_empty() {
         if elapsed > config.prompt_ttl.as_secs() {
             (
                 false,
-                format!("possible prompt cache TTL expiry after {elapsed}s"),
+                "possible_prompt_ttl_expiry".to_string(),
+                "local_ttl_heuristic".to_string(),
+                format!(
+                    "cache_read_input_tokens dropped ({} -> {}) after {elapsed}s while the local request fingerprint stayed stable; possible prompt cache TTL expiry. This is a local heuristic, not an Anthropic server-provided miss reason.",
+                    previous.cache_read_input_tokens, current.cache_read_input_tokens
+                ),
             )
         } else {
             (
                 true,
-                "cache read tokens dropped while prompt fingerprint remained stable".to_string(),
+                "stable_fingerprint_cache_drop".to_string(),
+                "local_request_fingerprint".to_string(),
+                format!(
+                    "cache_read_input_tokens dropped ({} -> {}) while the local request fingerprint stayed stable for {elapsed}s. The client did not observe any model/system/tools/messages change; possible relay or upstream cache-domain drift, server-side invalidation, or another non-payload cache break.",
+                    previous.cache_read_input_tokens, current.cache_read_input_tokens
+                ),
             )
         }
     } else {
-        (false, reasons.join(", "))
+        (
+            false,
+            "local_request_components_changed".to_string(),
+            "local_request_fingerprint".to_string(),
+            format_request_change_reason(&changed_components, previous, current),
+        )
     };
 
     Some(CacheBreakEvent {
         unexpected,
         reason,
+        reason_code,
+        diagnostic_scope,
+        changed_components,
         previous_cache_read_input_tokens: previous.cache_read_input_tokens,
         current_cache_read_input_tokens: current.cache_read_input_tokens,
         token_drop,
+        elapsed_seconds: elapsed,
     })
+}
+
+fn summarize_last_message(
+    messages: &[crate::types::InputMessage],
+) -> (Option<String>, Vec<String>) {
+    let Some(last_message) = messages.last() else {
+        return (None, Vec::new());
+    };
+    let content_types = last_message
+        .content
+        .iter()
+        .map(input_content_block_kind)
+        .map(str::to_string)
+        .collect();
+    (Some(last_message.role.clone()), content_types)
+}
+
+fn input_content_block_kind(block: &InputContentBlock) -> &'static str {
+    match block {
+        InputContentBlock::Text { .. } => "text",
+        InputContentBlock::ToolUse { .. } => "tool_use",
+        InputContentBlock::ToolResult { .. } => "tool_result",
+    }
+}
+
+fn format_request_change_reason(
+    changed_components: &[String],
+    previous: &TrackedPromptState,
+    current: &TrackedPromptState,
+) -> String {
+    let mut details = Vec::new();
+    if changed_components
+        .iter()
+        .any(|component| component == "model")
+    {
+        details.push(format!(
+            "model '{}' -> '{}'",
+            display_string_or_placeholder(&previous.model_name),
+            display_string_or_placeholder(&current.model_name)
+        ));
+    }
+    if changed_components
+        .iter()
+        .any(|component| component == "system")
+    {
+        if previous.system_block_count == current.system_block_count {
+            details.push(format!(
+                "system prompt changed with the same block count ({})",
+                current.system_block_count
+            ));
+        } else {
+            details.push(format!(
+                "system_block_count {} -> {}",
+                previous.system_block_count, current.system_block_count
+            ));
+        }
+    }
+    if changed_components
+        .iter()
+        .any(|component| component == "tools")
+    {
+        if previous.tool_count == current.tool_count {
+            details.push(format!(
+                "tool definitions changed with the same tool count ({})",
+                current.tool_count
+            ));
+        } else {
+            details.push(format!(
+                "tool_count {} -> {}",
+                previous.tool_count, current.tool_count
+            ));
+        }
+    }
+    if changed_components
+        .iter()
+        .any(|component| component == "messages")
+    {
+        let mut message_details = vec![format!(
+            "message_count {} -> {}",
+            previous.message_count, current.message_count
+        )];
+        if previous.last_message_role != current.last_message_role {
+            message_details.push(format!(
+                "last_message_role {} -> {}",
+                display_optional_string(previous.last_message_role.as_deref()),
+                display_optional_string(current.last_message_role.as_deref())
+            ));
+        }
+        if previous.last_message_content_types != current.last_message_content_types {
+            message_details.push(format!(
+                "last_message_content_types {} -> {}",
+                display_string_list(&previous.last_message_content_types),
+                display_string_list(&current.last_message_content_types)
+            ));
+        }
+        if previous.message_count == current.message_count
+            && previous.last_message_role == current.last_message_role
+            && previous.last_message_content_types == current.last_message_content_types
+        {
+            message_details.push(
+                "message count and last-message shape stayed the same; the diff is inside message content or ordering"
+                    .to_string(),
+            );
+        }
+        details.push(format!("messages: {}", message_details.join(", ")));
+    }
+
+    format!(
+        "local request fingerprint changed in [{}]: {}. This is a client-side diagnostic, not an Anthropic server-provided miss reason.",
+        changed_components.join(", "),
+        details.join("; ")
+    )
+}
+
+fn display_optional_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "<none>".to_string(), ToString::to_string)
+}
+
+fn display_string_or_placeholder(value: &str) -> String {
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn display_string_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", values.join(", "))
+    }
+}
+
+fn log_cache_break(
+    session_id: &str,
+    request_hash: &str,
+    event: &CacheBreakEvent,
+    previous: Option<&TrackedPromptState>,
+    current: &TrackedPromptState,
+) {
+    let changed_components = if event.changed_components.is_empty() {
+        "<none>".to_string()
+    } else {
+        event.changed_components.join(",")
+    };
+    let previous_message_count = previous.map_or(0, |state| state.message_count);
+    let previous_tool_count = previous.map_or(0, |state| state.tool_count);
+    let previous_system_block_count = previous.map_or(0, |state| state.system_block_count);
+    let previous_model = previous.map_or("<none>", |state| state.model_name.as_str());
+    let previous_last_message_role = previous
+        .and_then(|state| state.last_message_role.as_deref())
+        .map_or_else(|| "<none>".to_string(), ToString::to_string);
+    let previous_last_message_content_types = previous.map_or_else(
+        || "[]".to_string(),
+        |state| display_string_list(&state.last_message_content_types),
+    );
+    agent_debug_log(
+        "prompt_cache.break_detected",
+        format!(
+            "session_id={session_id}\nrequest_hash={request_hash}\nunexpected={}\nreason_code={}\ndiagnostic_scope={}\nchanged_components={changed_components}\nprevious_cache_read_input_tokens={}\ncurrent_cache_read_input_tokens={}\ntoken_drop={}\nelapsed_seconds={}\nprevious_model={}\ncurrent_model={}\nprevious_system_block_count={previous_system_block_count}\ncurrent_system_block_count={}\nprevious_tool_count={previous_tool_count}\ncurrent_tool_count={}\nprevious_message_count={previous_message_count}\ncurrent_message_count={}\nprevious_last_message_role={previous_last_message_role}\ncurrent_last_message_role={}\nprevious_last_message_content_types={previous_last_message_content_types}\ncurrent_last_message_content_types={}\nreason={}",
+            event.unexpected,
+            event.reason_code,
+            event.diagnostic_scope,
+            event.previous_cache_read_input_tokens,
+            event.current_cache_read_input_tokens,
+            event.token_drop,
+            event.elapsed_seconds,
+            previous_model,
+            current.model_name,
+            current.system_block_count,
+            current.tool_count,
+            current.message_count,
+            display_optional_string(current.last_message_role.as_deref()),
+            display_string_list(&current.last_message_content_types),
+            event.reason
+        ),
+    );
 }
 
 fn apply_usage_to_stats(
@@ -559,7 +796,12 @@ mod tests {
         let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
             .expect("break should be detected");
         assert!(event.unexpected);
-        assert!(event.reason.contains("stable"));
+        assert_eq!(event.reason_code, "stable_fingerprint_cache_drop");
+        assert!(event.changed_components.is_empty());
+        assert_eq!(event.diagnostic_scope, "local_request_fingerprint");
+        assert!(event
+            .reason
+            .contains("local request fingerprint stayed stable"));
     }
 
     #[test]
@@ -589,7 +831,13 @@ mod tests {
         let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
             .expect("break should be detected");
         assert!(!event.unexpected);
-        assert!(event.reason.contains("message payload changed"));
+        assert_eq!(event.reason_code, "local_request_components_changed");
+        assert_eq!(event.changed_components, vec!["messages".to_string()]);
+        assert_eq!(event.diagnostic_scope, "local_request_fingerprint");
+        assert!(event.reason.contains("client-side diagnostic"));
+        assert!(event
+            .reason
+            .contains("message count and last-message shape stayed the same"));
     }
 
     #[test]
@@ -684,6 +932,62 @@ mod tests {
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    #[test]
+    fn cache_break_writes_plaintext_debug_log() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "prompt-cache-debug-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let debug_root = temp_root.join("debug");
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        std::env::set_var("CLAWD_AGENT_DEBUG", &debug_root);
+
+        let cache = PromptCache::new("debug-session");
+        let first_request = sample_request("first");
+        let second_request = sample_request("second");
+
+        let _ = cache.record_usage(
+            &first_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
+            },
+        );
+        let record = cache.record_usage(
+            &second_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000,
+                output_tokens: 0,
+                cache_creation: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let event = record.cache_break.expect("break should be recorded");
+        assert_eq!(event.reason_code, "local_request_components_changed");
+
+        let log_path = debug_root.join("clawd-agent-debug.log");
+        let log_contents = std::fs::read_to_string(&log_path).expect("debug log should exist");
+        assert!(log_contents.contains("prompt_cache.break_detected"));
+        assert!(log_contents.contains("session_id=debug-session"));
+        assert!(log_contents.contains("reason_code=local_request_components_changed"));
+        assert!(log_contents.contains("changed_components=messages"));
+        assert!(log_contents.contains("current_message_count=1"));
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("CLAWD_AGENT_DEBUG");
     }
 
     #[test]

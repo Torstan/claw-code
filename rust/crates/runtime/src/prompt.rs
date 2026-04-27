@@ -44,16 +44,12 @@ pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
-/// context is the most important, see
-/// https://manus.im/zh-cn/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus
-/// 1. Add session affinity header (X-Claude-Code-Session-Id) to relay requests: the relay
-/// proxy use X-Claude-Code-Session-Id to route to the LLM backend to meet the cache policy.
-/// see more info of cache control of claude code:
-/// https://anthropic-claude-docs.mintlify.app/en/docs/build-with-claude/prompt-caching
-/// 2. fix prompt cache stability by marking only the last user message with cache_control to
-/// matching Claude Code's caching strategy
-/// 3. remove git diff/status in abstract to make prefix in prompt more stable.
-
+// Context-engineering notes:
+// 1. Add the X-Claude-Code-Session-Id affinity header so relay requests route
+//    consistently for prompt caching.
+// 2. Mark only the last user message with cache_control to match Claude Code's
+//    caching strategy.
+// 3. Keep git diff/status out of the summary to make the prompt prefix stable.
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -317,7 +313,6 @@ fn read_git_status(cwd: &Path) -> Option<String> {
 fn render_project_summary_context(project_context: &ProjectContext) -> String {
     let mut lines = vec!["# Project summary".to_string()];
     lines.extend(prepend_bullets(vec![
-        format!("Today's date is {}.", project_context.current_date),
         format!("Working directory: {}", project_context.cwd.display()),
         format!(
             "Claude instruction files discovered: {}.",

@@ -74,6 +74,7 @@ impl SessionStore {
         &self.workspace_root
     }
 
+    #[must_use]
     pub fn create_handle(&self, session_id: &str) -> SessionHandle {
         let id = session_id.to_string();
         let path = self
@@ -155,44 +156,41 @@ impl SessionStore {
                 logical_modified_epoch_millis,
                 created_at_ms,
                 session_counter,
-            ) = match Session::load_from_path(&path) {
-                Ok(session) => {
-                    let parent_session_id = session
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.parent_session_id.clone());
-                    let branch_name = session
-                        .fork
-                        .as_ref()
-                        .and_then(|fork| fork.branch_name.clone());
-                    let session_counter = session_counter_from_id(&session.session_id);
-                    (
-                        session.session_id,
-                        session.messages.len(),
-                        parent_session_id,
-                        branch_name,
-                        u128::from(session.updated_at_ms),
-                        session.created_at_ms,
-                        session_counter,
-                    )
-                }
-                Err(_) => {
-                    let id = path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    (
-                        id.clone(),
-                        0,
-                        None,
-                        None,
-                        modified_epoch_millis,
-                        session_created_at_from_id(&id)
-                            .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
-                        session_counter_from_id(&id),
-                    )
-                }
+            ) = if let Ok(session) = Session::load_from_path(&path) {
+                let parent_session_id = session
+                    .fork
+                    .as_ref()
+                    .map(|fork| fork.parent_session_id.clone());
+                let branch_name = session
+                    .fork
+                    .as_ref()
+                    .and_then(|fork| fork.branch_name.clone());
+                let session_counter = session_counter_from_id(&session.session_id);
+                (
+                    session.session_id,
+                    session.messages.len(),
+                    parent_session_id,
+                    branch_name,
+                    u128::from(session.updated_at_ms),
+                    session.created_at_ms,
+                    session_counter,
+                )
+            } else {
+                let id = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                (
+                    id.clone(),
+                    0,
+                    None,
+                    None,
+                    modified_epoch_millis,
+                    session_created_at_from_id(&id)
+                        .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                    session_counter_from_id(&id),
+                )
             };
             sessions.push(ManagedSessionSummary {
                 id,
@@ -464,44 +462,41 @@ pub fn list_managed_sessions_for(
             logical_modified_epoch_millis,
             created_at_ms,
             session_counter,
-        ) = match Session::load_from_path(&path) {
-            Ok(session) => {
-                let parent_session_id = session
-                    .fork
-                    .as_ref()
-                    .map(|fork| fork.parent_session_id.clone());
-                let branch_name = session
-                    .fork
-                    .as_ref()
-                    .and_then(|fork| fork.branch_name.clone());
-                let session_counter = session_counter_from_id(&session.session_id);
-                (
-                    session.session_id,
-                    session.messages.len(),
-                    parent_session_id,
-                    branch_name,
-                    u128::from(session.updated_at_ms),
-                    session.created_at_ms,
-                    session_counter,
-                )
-            }
-            Err(_) => {
-                let id = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                (
-                    id.clone(),
-                    0,
-                    None,
-                    None,
-                    modified_epoch_millis,
-                    session_created_at_from_id(&id)
-                        .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
-                    session_counter_from_id(&id),
-                )
-            }
+        ) = if let Ok(session) = Session::load_from_path(&path) {
+            let parent_session_id = session
+                .fork
+                .as_ref()
+                .map(|fork| fork.parent_session_id.clone());
+            let branch_name = session
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.branch_name.clone());
+            let session_counter = session_counter_from_id(&session.session_id);
+            (
+                session.session_id,
+                session.messages.len(),
+                parent_session_id,
+                branch_name,
+                u128::from(session.updated_at_ms),
+                session.created_at_ms,
+                session_counter,
+            )
+        } else {
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (
+                id.clone(),
+                0,
+                None,
+                None,
+                modified_epoch_millis,
+                session_created_at_from_id(&id)
+                    .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                session_counter_from_id(&id),
+            )
         };
         sessions.push(ManagedSessionSummary {
             id,

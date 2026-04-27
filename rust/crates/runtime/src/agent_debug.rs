@@ -113,6 +113,11 @@ fn format_timestamp_micros_with_offset(timestamp_us: u128, offset_seconds: i64) 
     )
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 {
