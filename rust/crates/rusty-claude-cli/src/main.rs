@@ -109,9 +109,10 @@ type RuntimePluginStateBuildOutput = (
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|error| format!("<cwd-error:{error}>"));
+    let cwd = std::env::current_dir().map_or_else(
+        |error| format!("<cwd-error:{error}>"),
+        |path| path.display().to_string(),
+    );
     agent_debug_log("process.start", format!("cwd={cwd} argv={argv:?}"));
 
     if let Err(error) = run() {
@@ -574,7 +575,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
+                return Err(format_unknown_option(other));
             }
             other => {
                 rest.push(other.to_string());
@@ -799,6 +800,7 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn parse_direct_slash_cli_action(
     rest: &[String],
     model: String,
@@ -1265,7 +1267,7 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --session".to_string())?;
-                session_reference = value.clone();
+                session_reference.clone_from(value);
                 index += 2;
             }
             flag if flag.starts_with("--session=") => {
@@ -2312,6 +2314,7 @@ fn version_json_value() -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
     let resolved_path = if session_path.exists() {
         session_path.to_path_buf()
@@ -3169,8 +3172,7 @@ fn detect_broad_cwd() -> Option<PathBuf> {
     };
     let is_home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h) == cwd)
-        .unwrap_or(false);
+        .is_some_and(|h| h == cwd);
     let is_root = cwd.parent().is_none();
     if is_home || is_root {
         Some(cwd)
@@ -3242,10 +3244,7 @@ fn enforce_broad_cwd_policy(
 }
 
 fn run_stale_base_preflight(flag_value: Option<&str>) {
-    let cwd = match env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return,
-    };
+    let Ok(cwd) = env::current_dir() else { return };
     let source = resolve_expected_base(flag_value, &cwd);
     let state = check_base_commit(&cwd, source.as_ref());
     if let Some(warning) = format_stale_base_warning(&state) {
@@ -3253,6 +3252,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -4010,11 +4010,8 @@ impl LiveCli {
         let slash_input = format_prompt_slash_command_input(command_name, args);
         self.record_prompt_history(&slash_input);
 
-        let initial_messages = std::env::current_dir()
-            .map(|cwd| {
-                build_prompt_slash_command_initial_messages(command_name, args, prompt, &cwd)
-            })
-            .unwrap_or_else(|_| {
+        let initial_messages = std::env::current_dir().map_or_else(
+            |_| {
                 vec![
                     ConversationMessage::user_text(format_prompt_slash_command_metadata(
                         command_name,
@@ -4022,7 +4019,9 @@ impl LiveCli {
                     )),
                     ConversationMessage::user_text(prompt),
                 ]
-            });
+            },
+            |cwd| build_prompt_slash_command_initial_messages(command_name, args, prompt, &cwd),
+        );
 
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -4697,6 +4696,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_session_command(
         &mut self,
         action: Option<&str>,
@@ -5095,44 +5095,41 @@ fn collect_sessions_from_dir(
             logical_modified_epoch_millis,
             created_at_ms,
             session_counter,
-        ) = match Session::load_from_path(&path) {
-            Ok(session) => {
-                let parent_session_id = session
-                    .fork
-                    .as_ref()
-                    .map(|fork| fork.parent_session_id.clone());
-                let branch_name = session
-                    .fork
-                    .as_ref()
-                    .and_then(|fork| fork.branch_name.clone());
-                let session_counter = session_counter_from_id(&session.session_id);
-                (
-                    session.session_id,
-                    session.messages.len(),
-                    parent_session_id,
-                    branch_name,
-                    u128::from(session.updated_at_ms),
-                    session.created_at_ms,
-                    session_counter,
-                )
-            }
-            Err(_) => {
-                let id = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                (
-                    id.clone(),
-                    0,
-                    None,
-                    None,
-                    modified_epoch_millis,
-                    session_created_at_from_id(&id)
-                        .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
-                    session_counter_from_id(&id),
-                )
-            }
+        ) = if let Ok(session) = Session::load_from_path(&path) {
+            let parent_session_id = session
+                .fork
+                .as_ref()
+                .map(|fork| fork.parent_session_id.clone());
+            let branch_name = session
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.branch_name.clone());
+            let session_counter = session_counter_from_id(&session.session_id);
+            (
+                session.session_id,
+                session.messages.len(),
+                parent_session_id,
+                branch_name,
+                u128::from(session.updated_at_ms),
+                session.created_at_ms,
+                session_counter,
+            )
+        } else {
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (
+                id.clone(),
+                0,
+                None,
+                None,
+                modified_epoch_millis,
+                session_created_at_from_id(&id)
+                    .unwrap_or(u64::try_from(modified_epoch_millis).unwrap_or(u64::MAX)),
+                session_counter_from_id(&id),
+            )
         };
         sessions.push(ManagedSessionSummary {
             id,
@@ -5744,14 +5741,14 @@ fn render_config_json(
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
             };
-            let loaded = runtime_config
+            let is_loaded = runtime_config
                 .loaded_entries()
                 .iter()
                 .any(|le| le.path == e.path);
             serde_json::json!({
                 "path": e.path.display().to_string(),
                 "source": source,
-                "loaded": loaded,
+                "loaded": is_loaded,
             })
         })
         .collect();
@@ -6176,6 +6173,11 @@ fn format_history_timestamp(timestamp_ms: u64) -> String {
 
 // Computes civil (Gregorian) year/month/day from days since the Unix epoch
 // (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 {
@@ -7195,7 +7197,9 @@ impl AnthropicRuntimeClient {
                 let inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
                     .with_beta("prompt-caching-scope-2026-01-05")
-                    .with_extra_header("X-Claude-Code-Session-Id", session_id.clone())
+                    .with_extra_header("X-Claude-Code-Session-Id", session_id.to_string())
+                    .with_extra_header("x-app", "cli")
+                    .with_extra_header("anthropic-dangerous-direct-browser-access", "true")
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
@@ -7273,49 +7277,46 @@ impl ApiClient for AnthropicRuntimeClient {
                 .iter()
                 .position(|part| part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
             let mut blocks = Vec::new();
-            match boundary_pos {
-                Some(bp) => {
-                    let static_parts = request.system_prompt[..bp]
-                        .iter()
-                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    let dynamic_parts = request.system_prompt[bp + 1..]
-                        .iter()
-                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+            if let Some(bp) = boundary_pos {
+                let static_parts = request.system_prompt[..bp]
+                    .iter()
+                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let dynamic_parts = request.system_prompt[bp + 1..]
+                    .iter()
+                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
 
-                    if !static_parts.is_empty() {
-                        blocks.push(
-                            SystemContentBlock::text(static_parts)
-                                .with_cache_control(CacheControl::ephemeral()),
-                        );
-                    }
-                    if !dynamic_parts.is_empty() {
-                        // Keep dynamic/attachment context outside the stable
-                        // cache marker budget so tools + first user + latest
-                        // user can still fit within Anthropic's breakpoint
-                        // limits.
-                        blocks.push(SystemContentBlock::text(dynamic_parts));
-                    }
+                if !static_parts.is_empty() {
+                    blocks.push(
+                        SystemContentBlock::text(static_parts)
+                            .with_cache_control(CacheControl::ephemeral()),
+                    );
                 }
-                None => {
-                    let merged = request
-                        .system_prompt
-                        .iter()
-                        .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    if !merged.is_empty() {
-                        blocks.push(
-                            SystemContentBlock::text(merged)
-                                .with_cache_control(CacheControl::ephemeral()),
-                        );
-                    }
+                if !dynamic_parts.is_empty() {
+                    // Keep dynamic/attachment context outside the stable
+                    // cache marker budget so tools + first user + latest
+                    // user can still fit within Anthropic's breakpoint
+                    // limits.
+                    blocks.push(SystemContentBlock::text(dynamic_parts));
+                }
+            } else {
+                let merged = request
+                    .system_prompt
+                    .iter()
+                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !merged.is_empty() {
+                    blocks.push(
+                        SystemContentBlock::text(merged)
+                            .with_cache_control(CacheControl::ephemeral()),
+                    );
                 }
             }
             Some(blocks)
@@ -7428,7 +7429,6 @@ impl ApiClient for AnthropicRuntimeClient {
                                 total_started_at.elapsed().as_millis()
                             ),
                         );
-                        continue;
                     }
                     Err(error) => {
                         agent_debug_log(
@@ -7842,9 +7842,13 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
             json!({
                 "unexpected": event.unexpected,
                 "reason": event.reason,
+                "reason_code": event.reason_code,
+                "diagnostic_scope": event.diagnostic_scope,
+                "changed_components": event.changed_components,
                 "previous_cache_read_input_tokens": event.previous_cache_read_input_tokens,
                 "current_cache_read_input_tokens": event.current_cache_read_input_tokens,
                 "token_drop": event.token_drop,
+                "elapsed_seconds": event.elapsed_seconds,
             })
         })
         .collect()
@@ -8590,9 +8594,13 @@ fn prompt_cache_record_to_runtime_event(
     Some(PromptCacheEvent {
         unexpected: cache_break.unexpected,
         reason: cache_break.reason,
+        reason_code: cache_break.reason_code,
+        diagnostic_scope: cache_break.diagnostic_scope,
+        changed_components: cache_break.changed_components,
         previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
         current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
         token_drop: cache_break.token_drop,
+        elapsed_seconds: cache_break.elapsed_seconds,
     })
 }
 
@@ -8809,6 +8817,7 @@ impl ToolExecutor for CliToolExecutor {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_many(&mut self, invocations: &[ToolInvocation]) -> Vec<Result<String, ToolError>> {
         if invocations.len() < 2
             || !invocations
@@ -8843,8 +8852,8 @@ impl ToolExecutor for CliToolExecutor {
 
         let handles: Vec<std::thread::JoinHandle<Result<String, ToolError>>> = invocations
             .iter()
-            .cloned()
             .map(|invocation| {
+                let invocation = invocation.clone();
                 let allowed_tools = allowed_tools.clone();
                 let tool_registry = tool_registry.clone();
                 let mcp_state = mcp_state.clone();
@@ -8994,7 +9003,7 @@ fn apply_message_cache_controls(messages: &mut [InputMessage]) {
     // cache_control — not even temporarily — so the serialized prefix stays
     // byte-identical as the conversation grows.  This matches Claude Code's
     // strategy: 1 message breakpoint + 2 system breakpoints = 3 total.
-    if let Some(idx) = messages.iter().rposition(|m| is_cacheable_user_message(m)) {
+    if let Some(idx) = messages.iter().rposition(is_cacheable_user_message) {
         set_user_cache_control(&mut messages[idx]);
     }
 }
@@ -9182,7 +9191,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)"
+    )?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"

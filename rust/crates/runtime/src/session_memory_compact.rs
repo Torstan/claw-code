@@ -40,7 +40,7 @@ pub(crate) fn try_session_memory_compact(
     }
 
     let summary = summary.to_string();
-    result.summary = summary.clone();
+    result.summary.clone_from(&summary);
     result.formatted_summary = format_compact_summary(&summary);
     let recent_messages_preserved = result.compacted_session.messages.len() > 1;
     if let Some(system_message) = result.compacted_session.messages.first_mut() {
@@ -135,10 +135,13 @@ fn collect_files(session: &Session) -> Vec<String> {
                     ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
                 )
             });
+            let extension = std::path::Path::new(candidate).extension();
             if candidate.contains('/')
-                || candidate.ends_with(".rs")
-                || candidate.ends_with(".md")
-                || candidate.ends_with(".toml")
+                || extension.is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("rs")
+                        || ext.eq_ignore_ascii_case("md")
+                        || ext.eq_ignore_ascii_case("toml")
+                })
             {
                 files.insert(candidate.to_string());
             }

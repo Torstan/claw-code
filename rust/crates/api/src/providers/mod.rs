@@ -245,14 +245,12 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
     match canonical.as_str() {
-        "claude-opus-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 200_000,
-        }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 200_000,
-        }),
+        "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 64_000,
+                context_window_tokens: 200_000,
+            })
+        }
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,

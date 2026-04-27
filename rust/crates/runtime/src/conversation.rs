@@ -13,9 +13,6 @@ use crate::micro_compact::{micro_compact_session, MicroCompactionConfig};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::prompt::{
-    ProjectAttachmentContext, ProjectContext, ProjectSummaryContext, SystemPromptBuilder,
-};
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::session_memory_compact::refresh_session_memory;
 use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
@@ -58,9 +55,13 @@ pub enum AssistantEvent {
 pub struct PromptCacheEvent {
     pub unexpected: bool,
     pub reason: String,
+    pub reason_code: String,
+    pub diagnostic_scope: String,
+    pub changed_components: Vec<String>,
     pub previous_cache_read_input_tokens: u32,
     pub current_cache_read_input_tokens: u32,
     pub token_drop: u32,
+    pub elapsed_seconds: u64,
 }
 
 /// Minimal streaming API contract required by [`ConversationRuntime`].
@@ -469,7 +470,7 @@ where
                 planned_dispatches.push(self.plan_tool_dispatch(
                     tool_use_id,
                     tool_name,
-                    input,
+                    &input,
                     &mut prompter,
                 ));
             }
@@ -597,13 +598,13 @@ where
         &mut self,
         tool_use_id: String,
         tool_name: String,
-        input: String,
+        input: &str,
         prompter: &mut Option<&mut dyn PermissionPrompter>,
     ) -> ToolDispatch {
-        let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+        let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
-            .map_or_else(|| input.clone(), ToOwned::to_owned);
+            .map_or_else(|| input.to_string(), ToOwned::to_owned);
         let permission_context = PermissionContext::new(
             pre_hook_result.permission_override(),
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
@@ -675,7 +676,7 @@ where
         while let Some(dispatch) = dispatches.pop_front() {
             match dispatch {
                 ToolDispatch::Immediate(message) => {
-                    self.push_tool_result_message(iteration, message, tool_results)?
+                    self.push_tool_result_message(iteration, message, tool_results)?;
                 }
                 ToolDispatch::Ready(prepared) => {
                     if self
@@ -998,7 +999,7 @@ where
     }
 
     fn replace_session_and_persist(&mut self, session: Session) -> Result<(), RuntimeError> {
-        if let Some(path) = session.persistence_path().map(|path| path.to_path_buf()) {
+        if let Some(path) = session.persistence_path().map(std::path::Path::to_path_buf) {
             session
                 .save_to_path(&path)
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -1377,9 +1378,13 @@ mod tests {
                             reason:
                                 "cache read tokens dropped while prompt fingerprint remained stable"
                                     .to_string(),
+                            reason_code: "stable_fingerprint_cache_drop".to_string(),
+                            diagnostic_scope: "local_request_fingerprint".to_string(),
+                            changed_components: Vec::new(),
                             previous_cache_read_input_tokens: 6_000,
                             current_cache_read_input_tokens: 1_000,
                             token_drop: 5_000,
+                            elapsed_seconds: 2,
                         }),
                         AssistantEvent::MessageStop,
                     ])
@@ -2265,7 +2270,8 @@ mod tests {
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-        );
+        )
+        .with_compaction_enabled(true);
 
         runtime
             .run_turn("refresh memory", None)
@@ -2436,7 +2442,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(400);
+        .with_auto_compaction_input_tokens_threshold(400)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("continue", None)
@@ -2551,7 +2558,8 @@ mod tests {
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-        );
+        )
+        .with_compaction_enabled(true);
 
         let error = runtime
             .run_turn("continue", None)
@@ -2672,7 +2680,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(100_000)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("continue", None)
@@ -2737,7 +2746,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(100_000)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("continue", None)
@@ -2790,7 +2800,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(100_000)
+        .with_compaction_enabled(true);
 
         let error = runtime
             .run_turn("continue", None)
@@ -2861,7 +2872,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(1);
+        .with_auto_compaction_input_tokens_threshold(1)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("trigger", None)
@@ -2918,7 +2930,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(1);
+        .with_auto_compaction_input_tokens_threshold(1)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("trigger", None)
@@ -2976,7 +2989,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(1);
+        .with_auto_compaction_input_tokens_threshold(1)
+        .with_compaction_enabled(true);
 
         let summary = runtime
             .run_turn("trigger", None)
@@ -3213,7 +3227,8 @@ mod tests {
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-        );
+        )
+        .with_compaction_enabled(true);
 
         runtime
             .run_turn("keep going", None)

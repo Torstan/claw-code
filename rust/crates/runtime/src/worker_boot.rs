@@ -577,12 +577,13 @@ fn push_event(
 /// poll this file instead of requiring an HTTP route on the opencode binary.
 fn emit_state_file(worker: &Worker) {
     let state_dir = std::path::Path::new(&worker.cwd).join(".claw");
-    if let Err(_) = std::fs::create_dir_all(&state_dir) {
+    if std::fs::create_dir_all(&state_dir).is_err() {
         return;
     }
     let state_path = state_dir.join("worker-state.json");
     let tmp_path = state_dir.join("worker-state.json.tmp");
 
+    #[allow(clippy::items_after_statements)]
     #[derive(serde::Serialize)]
     struct StateSnapshot<'a> {
         worker_id: &'a str,

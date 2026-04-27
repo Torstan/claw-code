@@ -58,10 +58,10 @@ impl OpenAiCompatConfig {
         }
     }
 
-    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
-    /// higher rate limits than going through OpenRouter.
+    /// higher rate limits than going through `OpenRouter`.
     #[must_use]
     pub const fn dashscope() -> Self {
         Self {
@@ -170,7 +170,7 @@ impl OpenAiCompatClient {
                     .to_string();
                 let code = err_obj
                     .get("code")
-                    .and_then(|c| c.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(|c| c as u16);
                 return Err(ApiError::Api {
                     status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
@@ -753,7 +753,7 @@ struct ErrorBody {
 }
 
 /// Returns true for models known to reject tuning parameters like temperature,
-/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
 fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
@@ -985,12 +985,11 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         }
         let paired = preceding
             .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
-            .map(|tool_calls| {
+            .is_some_and(|tool_calls| {
                 tool_calls
                     .iter()
                     .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
-            })
-            .unwrap_or(false);
+            });
         if !paired {
             drop_indices.insert(i);
         }
@@ -1019,7 +1018,7 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
 
 /// Recursively ensure every object-type node in a JSON Schema has
 /// `"properties"` (at least `{}`) and `"additionalProperties": false`.
-/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// The `OpenAI` `/responses` endpoint validates schemas strictly and rejects
 /// objects that omit these fields; `/chat/completions` is lenient but also
 /// accepts them, so we normalise unconditionally.
 fn normalize_object_schema(schema: &mut Value) {
@@ -1185,7 +1184,7 @@ fn parse_sse_frame(
                 .to_string();
             let code = err_obj
                 .get("code")
-                .and_then(|c| c.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|c| c as u16);
             let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
                 .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
@@ -1197,7 +1196,7 @@ fn parse_sse_frame(
                     .map(str::to_owned),
                 message: Some(msg),
                 request_id: None,
-                body: payload.to_string(),
+                body: payload.clone(),
                 retryable: false,
             });
         }
