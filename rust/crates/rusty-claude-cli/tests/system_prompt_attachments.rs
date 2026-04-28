@@ -191,6 +191,8 @@ fn cacheable_system_blocks_are_split_by_scope_and_ttl() {
     );
 
     assert!(system[0].text.contains("You are an interactive agent"));
+    assert!(system[0].text.contains("# Tone and style"));
+    assert!(system[0].text.contains("short and concise"));
     assert!(system[0].text.contains("# Claude instructions"));
     assert!(system[0].text.contains("# Project summary"));
     assert!(!system[0].text.contains("# Runtime config"));

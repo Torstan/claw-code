@@ -184,6 +184,7 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
+        sections.push(get_tone_and_style_section());
         sections.push(get_actions_section());
         if let Some(project_context) = &self.project_context {
             if !project_context.instruction_files.is_empty() {
@@ -539,6 +540,20 @@ fn get_simple_doing_tasks_section() -> String {
     ]);
 
     std::iter::once("# Doing tasks".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_tone_and_style_section() -> String {
+    let items = prepend_bullets(vec![
+        "Keep user-facing text short and concise by default.".to_string(),
+        "For exploratory questions like \"what could we do about X?\", \"how should we approach this?\", or \"what do you think?\", respond in 2-3 sentences with a recommendation and the main tradeoff.".to_string(),
+        "Match the response to the task: a simple question gets a direct answer, not headers and sections.".to_string(),
+        "For end-of-turn summaries, use one or two sentences covering what changed and any verification result.".to_string(),
+    ]);
+
+    std::iter::once("# Tone and style".to_string())
         .chain(items)
         .collect::<Vec<_>>()
         .join("\n")
@@ -934,6 +949,10 @@ mod tests {
             .render();
 
         assert!(prompt.contains("# System"));
+        assert!(prompt.contains("# Tone and style"));
+        assert!(prompt.contains("short and concise"));
+        assert!(prompt.contains("respond in 2-3 sentences"));
+        assert!(prompt.contains("a simple question gets a direct answer"));
         assert!(prompt.contains("# Project summary"));
         assert!(prompt.contains("# Project attachments"));
         assert!(prompt.contains("# Claude instructions"));
