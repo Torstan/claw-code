@@ -23,8 +23,8 @@ Key takeaways:
 
 Data sources:
 
-- Claw: `/mnt/d/ginobili/code/claw-code/claw.all.1027.orig.json`
-- Claude Code: `/mnt/d/ginobili/code/claw-code/claude.req.all2351.json`
+- Claw: `claw.all.1027.orig.json`
+- Claude Code: `claude.req.all2351.json`
 
 Comparison method:
 
@@ -49,7 +49,7 @@ Core metric formulas:
 |---|---|---|
 | **Input token advantage** | Claw uses **8,524.60 core input tokens** vs. Claude Code's **25,199.65**, or **0.34x (-66.17%)**. Raw request tokens are also much lower: **250** vs. **1,557**. | **P0:** Claw has fewer auxiliary calls than Claude Code in this sample. Claude Code includes Haiku/Opus helper calls such as title, clarification, and memory-related calls under the same request summaries.<br>**P1:** Claw uses a smaller and more constrained prompt/tool surface.<br>**P2:** Prompt layering keeps stable context compact and avoids repeatedly inflating the cache-sensitive prefix. |
 | **Cache hit-rate change** | Claw does **not** improve cache hit rate in this sample. It is **92.73%** vs. Claude Code's **95.20%**, lower by **2.47 pp**. | **P0:** Session affinity via `X-Claude-Code-Session-Id` keeps requests in a stable cache domain.<br>**P1:** Only the latest user message receives `cache_control`, keeping older conversation prefix bytes stable.<br>**P2:** Stable/dynamic/attachment prompt layering reduces accidental cache breaks. These optimizations keep Claw close to Claude Code, but not above it in this dataset. |
-| **Output token increase** | Claw outputs **5,379 core output tokens** vs. Claude Code's **2,152**, or **2.50x (+149.95%)**. | **P0:** Claw's common-request records are mostly direct Opus answer calls, while Claude Code includes shorter helper/metadata calls in the grouped baseline.<br>**P1:** Claw answers appear more verbose on the shared user-facing prompts.<br>**P2:** This raises output-side cost, so the input-side savings should be evaluated together with response quality. |
+| **Output token increase** | Claw outputs **5,379 core output tokens** vs. Claude Code's **2,152**, or **2.50x (+149.95%)**. | **P0:** Claw's system prompt lack of output standard, e.g. "Your responses should be short and concise." |
 
 ### Shared Request Summary Comparison (Claude Code Aggregated as Baseline)
 
@@ -88,7 +88,7 @@ Core metric formulas:
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | As an senior engineer, should I learn rust? | 2 | Claude Opus 4.6 x2 | 86 | 1,800 | 876 | 15,024 | 94.49% | 2,683.40 | 1,800 | 4,483.40 |
 | Is Python hard for a teenager? | 1 | Claude Opus 4.6 x1 | 39 | 465 | 670 | 8,732 | 92.87% | 1,749.70 | 465 | 2,214.70 |
-| source /mnt/d/ginobili/code/claw-code/.venv_pdf_translate/bin/activate | 1 | Claude Opus 4.6 x1 | 52 | 117 | 1,143 | 9,269 | 89.02% | 2,407.65 | 117 | 2,524.65 |
+| source /xxxx/bin/activate | 1 | Claude Opus 4.6 x1 | 52 | 117 | 1,143 | 9,269 | 89.02% | 2,407.65 | 117 | 2,524.65 |
 | what is the difference between cpp and rust? | 2 | Claude Opus 4.6 x2 | 86 | 1,126 | 947 | 12,760 | 93.09% | 2,545.75 | 1,126 | 3,671.75 |
 | which one is more intresting to learn? | 1 | Claude Opus 4.6 x1 | 41 | 543 | 1,516 | 8,131 | 84.29% | 2,749.10 | 543 | 3,292.10 |
 | which one is more useful in AI? | 2 | Claude Opus 4.6 x2 | 78 | 2,453 | 1,453 | 14,012 | 90.60% | 3,295.45 | 2,453 | 5,748.45 |
@@ -100,5 +100,5 @@ These summaries do not have matching groups in the Claude Code sample, so they a
 | Request summary | N | LLM | Request tokens | Response tokens | Cache create | Cache read | Core cache hit | Core input | Core output | Core total |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Is Python hard for a teenager? | 1 | Claude Opus 4.6 x1 | 39 | 465 | 670 | 8,732 | 92.87% | 1,749.70 | 465 | 2,214.70 |
-| source /mnt/d/ginobili/code/claw-code/.venv_pdf_translate/bin/activate | 1 | Claude Opus 4.6 x1 | 52 | 117 | 1,143 | 9,269 | 89.02% | 2,407.65 | 117 | 2,524.65 |
+| source /xxx/bin/activate | 1 | Claude Opus 4.6 x1 | 52 | 117 | 1,143 | 9,269 | 89.02% | 2,407.65 | 117 | 2,524.65 |
 | which one is more intresting to learn? | 1 | Claude Opus 4.6 x1 | 41 | 543 | 1,516 | 8,131 | 84.29% | 2,749.10 | 543 | 3,292.10 |
