@@ -34,6 +34,22 @@ const REHEARSAL_MESSAGE_THRESHOLD: usize = 20;
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    pub suppress_background_task_tools: bool,
+}
+
+/// Per-turn execution policy passed by command handlers to the conversation runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnExecutionPolicy {
+    pub synchronous_agents: bool,
+}
+
+impl TurnExecutionPolicy {
+    #[must_use]
+    pub fn synchronous_agents() -> Self {
+        Self {
+            synchronous_agents: true,
+        }
+    }
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -354,11 +370,22 @@ where
         user_input: impl Into<String>,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_with_policy(user_input, TurnExecutionPolicy::default(), prompter)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_policy(
+        &mut self,
+        user_input: impl Into<String>,
+        policy: TurnExecutionPolicy,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
-        self.run_turn_with_messages(
+        self.run_turn_with_messages_and_policy(
             user_input.clone(),
             vec![ConversationMessage::user_text(user_input)],
             prompter,
+            policy,
         )
     }
 
@@ -367,7 +394,23 @@ where
         &mut self,
         user_input: impl Into<String>,
         initial_messages: Vec<ConversationMessage>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_with_messages_and_policy(
+            user_input,
+            initial_messages,
+            prompter,
+            TurnExecutionPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_messages_and_policy(
+        &mut self,
+        user_input: impl Into<String>,
+        initial_messages: Vec<ConversationMessage>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
+        policy: TurnExecutionPolicy,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
@@ -420,15 +463,18 @@ where
                 }
             }
 
-            let events =
-                match self.stream_with_reactive_compaction(iterations, &mut auto_compaction) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        self.record_turn_failed(iterations, &error);
-                        return Err(error);
-                    }
-                };
-            let (assistant_message, usage, turn_prompt_cache_events) =
+            let events = match self.stream_with_reactive_compaction(
+                iterations,
+                &mut auto_compaction,
+                policy,
+            ) {
+                Ok(events) => events,
+                Err(error) => {
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+            };
+            let (mut assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -436,6 +482,9 @@ where
                         return Err(error);
                     }
                 };
+            if policy.synchronous_agents {
+                force_synchronous_agent_inputs(&mut assistant_message);
+            }
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -771,7 +820,10 @@ where
             Ok(output) => (output, false),
             Err(error) => (error.to_string(), true),
         };
-        output = merge_hook_feedback(&prepared.pre_hook_messages, output, false);
+        if !is_error && tool_output_indicates_error(&prepared.tool_name, &output) {
+            is_error = true;
+        }
+        output = merge_hook_feedback(&prepared.pre_hook_messages, output, is_error);
 
         let post_hook_result = if is_error {
             self.run_post_tool_use_failure_hook(
@@ -869,6 +921,7 @@ where
         &mut self,
         iteration: usize,
         auto_compaction: &mut Option<AutoCompactionEvent>,
+        policy: TurnExecutionPolicy,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut reactive_retry_attempted = false;
 
@@ -880,6 +933,7 @@ where
             let request = ApiRequest {
                 system_prompt,
                 messages: self.session.messages.clone(),
+                suppress_background_task_tools: policy.synchronous_agents,
             };
             agent_debug_log(
                 "llm.request",
@@ -1169,6 +1223,43 @@ fn accumulate_auto_compaction_event(
     }
 }
 
+fn force_synchronous_agent_input(tool_name: &str, input: String) -> String {
+    if tool_name != "Agent" {
+        return input;
+    }
+
+    let Ok(mut value) = serde_json::from_str::<Value>(&input) else {
+        return input;
+    };
+    let Value::Object(object) = &mut value else {
+        return input;
+    };
+
+    if object.get("run_in_background") != Some(&Value::Bool(true)) {
+        return input;
+    }
+    object.insert("run_in_background".to_string(), Value::Bool(false));
+    serde_json::to_string(&value).unwrap_or(input)
+}
+
+fn force_synchronous_agent_inputs(message: &mut ConversationMessage) {
+    for block in &mut message.blocks {
+        let ContentBlock::ToolUse { name, input, .. } = block else {
+            continue;
+        };
+        let forced_input = force_synchronous_agent_input(name, std::mem::take(input));
+        *input = forced_input;
+    }
+}
+
+fn normalize_tool_input(input: String) -> String {
+    if input.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        input
+    }
+}
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -1190,6 +1281,7 @@ fn build_assistant_message(
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
+                let input = normalize_tool_input(input);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -1252,6 +1344,32 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
+fn tool_output_indicates_error(tool_name: &str, output: &str) -> bool {
+    if tool_name != "bash" {
+        return false;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+
+    value
+        .get("interrupted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("returnCodeInterpretation")
+            .is_some_and(non_success_return_code_interpretation)
+}
+
+fn non_success_return_code_interpretation(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    }
+}
+
 fn truncate_large_tool_output(tool_name: &str, output: String) -> String {
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() <= MAX_TOOL_RESULT_LINES {
@@ -1306,7 +1424,7 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, ToolInvocation,
+        StaticToolExecutor, ToolExecutor, ToolInvocation, TurnExecutionPolicy,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -1324,6 +1442,7 @@ mod tests {
     use crate::snip_compact::SNIP_CLEARED_ASSISTANT_TEXT_SENTINEL;
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1490,6 +1609,79 @@ mod tests {
     }
 
     #[test]
+    fn marks_bash_nonzero_exit_output_as_tool_error() {
+        struct BashFailureApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for BashFailureApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "bash".to_string(),
+                            input: r#"{"command":"false"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let tool_result = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .find_map(|block| match block {
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    output,
+                                    is_error,
+                                    ..
+                                } => Some((tool_use_id, output, is_error)),
+                                _ => None,
+                            })
+                            .expect("second request should include bash tool result");
+                        assert_eq!(tool_result.0, "tool-1");
+                        assert!(tool_result
+                            .1
+                            .contains(r#""returnCodeInterpretation":"exit_code:2""#));
+                        assert!(*tool_result.2);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let tool_executor = StaticToolExecutor::new().register("bash", |_input| {
+            Ok(
+                r#"{"stdout":"","stderr":"failed","returnCodeInterpretation":"exit_code:2","interrupted":false}"#
+                    .to_string(),
+            )
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BashFailureApiClient { calls: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("run failing command", None)
+            .expect("turn should complete");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(matches!(
+            summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
+    }
+
+    #[test]
     fn batches_parallel_safe_tool_calls_in_one_iteration() {
         struct ParallelApiClient {
             calls: usize,
@@ -1552,6 +1744,224 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_slice(),
             &[vec!["Agent".to_string(), "Agent".to_string()]]
+        );
+    }
+
+    #[test]
+    fn simplify_turn_forces_background_agents_into_synchronous_batch() {
+        struct SimplifyApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for SimplifyApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        assert!(request.suppress_background_task_tools);
+                        assert!(request.messages.iter().any(|message| {
+                            message.role == MessageRole::User
+                                && message.blocks.iter().any(|block| {
+                                    matches!(
+                                        block,
+                                        ContentBlock::Text { text }
+                                            if text.contains("<command-name>/simplify</command-name>")
+                                    )
+                                })
+                        }));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "agent-1".to_string(),
+                                name: "Agent".to_string(),
+                                input: r#"{"description":"Code reuse review","prompt":"Check reuse","run_in_background":true}"#.to_string(),
+                            },
+                            AssistantEvent::ToolUse {
+                                id: "agent-2".to_string(),
+                                name: "Agent".to_string(),
+                                input: r#"{"description":"Code quality review","prompt":"Check quality","run_in_background":true}"#.to_string(),
+                            },
+                            AssistantEvent::ToolUse {
+                                id: "agent-3".to_string(),
+                                name: "Agent".to_string(),
+                                input: r#"{"description":"Efficiency review","prompt":"Check efficiency","run_in_background":true}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        assert!(request.suppress_background_task_tools);
+                        let agent_inputs = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolUse { name, input, .. } if name == "Agent" => {
+                                    Some(input.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(agent_inputs.len(), 3);
+                        for input in agent_inputs {
+                            let value: Value =
+                                serde_json::from_str(&input).expect("agent input should be json");
+                            assert_eq!(value["run_in_background"], false);
+                        }
+                        let tool_messages = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == MessageRole::Tool)
+                            .collect::<Vec<_>>();
+                        assert_eq!(tool_messages.len(), 3);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("aggregated".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        struct InputCapturingToolExecutor {
+            batches: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        impl ToolExecutor for InputCapturingToolExecutor {
+            fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+                Ok(format!("{tool_name}:{input}"))
+            }
+
+            fn execute_many(
+                &mut self,
+                invocations: &[ToolInvocation],
+            ) -> Vec<Result<String, ToolError>> {
+                self.batches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(
+                        invocations
+                            .iter()
+                            .map(|invocation| invocation.input.clone())
+                            .collect(),
+                    );
+                invocations
+                    .iter()
+                    .map(|invocation| Ok(format!("agent-result:{}", invocation.input)))
+                    .collect()
+            }
+
+            fn supports_parallel_execution(&self, tool_name: &str) -> bool {
+                tool_name == "Agent"
+            }
+        }
+
+        let batches = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let tool_executor = InputCapturingToolExecutor {
+            batches: Arc::clone(&batches),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimplifyApiClient { calls: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn_with_messages_and_policy(
+                "/simplify",
+                vec![
+                    crate::session::ConversationMessage::user_text(
+                        "<command-message>simplify</command-message>\n<command-name>/simplify</command-name>",
+                    ),
+                    crate::session::ConversationMessage::user_text("# Simplify: Code Review and Cleanup"),
+                ],
+                None,
+                TurnExecutionPolicy::synchronous_agents(),
+            )
+            .expect("simplify turn should complete");
+
+        let captured = batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 3);
+        for input in &captured[0] {
+            let value: Value = serde_json::from_str(input).expect("agent input should be json");
+            assert_eq!(value["run_in_background"], false);
+        }
+    }
+
+    #[test]
+    fn empty_streamed_tool_input_is_normalized_before_dispatch_and_context() {
+        struct EmptyToolInputApi {
+            calls: usize,
+        }
+
+        impl ApiClient for EmptyToolInputApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        assert!(!request.suppress_background_task_tools);
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "tool-1".to_string(),
+                                name: "TaskList".to_string(),
+                                input: String::new(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        let tool_use_inputs = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| message.blocks.iter())
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolUse { input, .. } => Some(input.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(tool_use_inputs, vec!["{}"]);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_for_tool = Arc::clone(&captured);
+        let tool_executor = StaticToolExecutor::new().register("TaskList", move |input| {
+            captured_for_tool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(input.to_string());
+            Ok("[]".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EmptyToolInputApi { calls: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("list tasks", None)
+            .expect("empty object tool input should be valid");
+
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &["{}".to_string()]
         );
     }
 

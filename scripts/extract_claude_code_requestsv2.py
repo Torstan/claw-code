@@ -24,6 +24,12 @@ TOKEN_KEYS = (
     "cache_read_input_tokens",
 )
 
+SUBAGENT_SYSTEM_MARKERS = (
+    "You are an agent for Claude Code",
+    "You are a background sub-agent",
+    "Work only on the delegated task",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -104,6 +110,199 @@ def parse_json(text: str) -> Any | None:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
+
+
+def parse_json_value(raw_value: Any) -> Any | None:
+    if isinstance(raw_value, (dict, list)):
+        return raw_value
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "agent"
+
+
+def normalize_agent_name(raw_name: str | None, prompt: str | None = None) -> str:
+    text = " ".join(part for part in (raw_name, prompt) if part)
+    lower = text.lower()
+    if "quality" in lower:
+        return "Code Quality Review"
+    if "efficiency" in lower or "efficient" in lower:
+        return "Efficiency Review"
+    if "reuse" in lower:
+        return "Code Reuse Review"
+    return raw_name or "Subagent"
+
+
+def content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        nested_content = item.get("content")
+        if nested_content is not None:
+            parts.append(content_text(nested_content))
+    return "\n".join(part for part in parts if part)
+
+
+def request_system_text(request_json: Any) -> str:
+    if not isinstance(request_json, dict):
+        return ""
+    system = request_json.get("system")
+    if isinstance(system, str):
+        return system
+    if not isinstance(system, list):
+        return ""
+    return "\n".join(
+        content_text(item.get("text", "")) for item in system if isinstance(item, dict)
+    )
+
+
+def request_user_text(request_json: Any) -> str:
+    if not isinstance(request_json, dict):
+        return ""
+    messages = request_json.get("messages")
+    if not isinstance(messages, list):
+        return ""
+
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = content_text(message.get("content"))
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def iter_message_content(request_json: Any) -> list[dict[str, Any]]:
+    if not isinstance(request_json, dict):
+        return []
+    messages = request_json.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    content_items: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict):
+                content_items.append(item)
+    return content_items
+
+
+def is_subagent_request(request_json: Any) -> bool:
+    system_text = request_system_text(request_json)
+    return any(marker in system_text for marker in SUBAGENT_SYSTEM_MARKERS)
+
+
+def collect_agent_launches(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    launches: list[dict[str, Any]] = []
+
+    for record in records:
+        for item in iter_message_content(record.get("llm_req")):
+            if item.get("type") != "tool_use" or item.get("name") != "Agent":
+                continue
+
+            tool_use_id = item.get("id")
+            tool_input = parse_json_value(item.get("input"))
+            if not isinstance(tool_use_id, str) or not isinstance(tool_input, dict):
+                continue
+
+            description = tool_input.get("description")
+            if not isinstance(description, str):
+                description = None
+            prompt = tool_input.get("prompt")
+            if not isinstance(prompt, str):
+                prompt = None
+            if description is None and prompt is None:
+                continue
+            raw_name = tool_input.get("name")
+            if not isinstance(raw_name, str):
+                raw_name = description
+            agent_name = normalize_agent_name(raw_name, prompt)
+
+            launches.append(
+                {
+                    "agent_id": tool_use_id,
+                    "agent_name": agent_name,
+                    "agent_launcher_tool_use_id": tool_use_id,
+                    "agent_description": description,
+                    "agent_prompt": prompt,
+                }
+            )
+
+    return launches
+
+
+def find_matching_launch(
+    user_text: str, launches: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for launch in reversed(launches):
+        prompt = launch.get("agent_prompt")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+        prompt_head = prompt[:200]
+        if prompt_head and prompt_head in user_text:
+            return launch
+        user_head = user_text[:200]
+        if user_head and user_head in prompt:
+            return launch
+    return None
+
+
+def annotate_agent_metadata(records: list[dict[str, Any]]) -> None:
+    launches = collect_agent_launches(records)
+    rounds_by_agent: dict[str, int] = defaultdict(int)
+
+    for record in records:
+        request_json = record.get("llm_req")
+
+        if is_subagent_request(request_json):
+            user_text = request_user_text(request_json)
+            launch = find_matching_launch(user_text, launches)
+            if launch:
+                agent_name = str(launch["agent_name"])
+                record["agent_name"] = agent_name
+                record["agent_launcher_tool_use_id"] = launch[
+                    "agent_launcher_tool_use_id"
+                ]
+                record["agent_description"] = launch.get("agent_description")
+                record["agent_prompt"] = launch.get("agent_prompt")
+            else:
+                agent_name = normalize_agent_name(None, user_text)
+                record["agent_name"] = agent_name
+                record["agent_launcher_tool_use_id"] = None
+            agent_id = "agent-" + slugify(agent_name)
+            record["agent_id"] = agent_id
+            record["agent_role"] = "subagent"
+        else:
+            agent_id = "main"
+            record["agent_role"] = "main"
+            record["agent_id"] = agent_id
+            record["agent_name"] = "Main"
+            record["agent_launcher_tool_use_id"] = None
+
+        rounds_by_agent[agent_id] += 1
+        record["agent_round"] = rounds_by_agent[agent_id]
 
 
 def collect_cache_controls(obj: Any, found: list[dict[str, Any]]) -> None:
@@ -290,9 +489,14 @@ def build_prompt_cache(request_json: Any, usage: dict[str, Any]) -> dict[str, An
 
 def build_record(
     request_index: int,
+    connection: str | None,
+    host: str | None,
+    path: str | None,
     session_id: str | None,
     iteration: int,
     request_body: str,
+    status_code: int | None,
+    status_text: str | None,
     response_body: str,
     response_headers: dict[str, str],
 ) -> dict[str, Any]:
@@ -302,8 +506,18 @@ def build_record(
 
     return {
         "request_index": request_index,
+        "connection": connection,
+        "host": host,
+        "path": path,
         "session_id": session_id,
         "iteration": iteration,
+        "agent_role": None,
+        "agent_id": None,
+        "agent_name": None,
+        "agent_round": None,
+        "agent_launcher_tool_use_id": None,
+        "status_code": status_code,
+        "status_text": status_text,
         "request_ts": None,
         "response_ts": response_headers.get("Date"),
         "llm_req": request_json if request_json is not None else request_body or None,
@@ -337,10 +551,14 @@ def extract_records(text: str) -> list[dict[str, Any]]:
 
         response_headers: dict[str, str] = {}
         response_body = ""
+        status_code: int | None = None
+        status_text: str | None = None
 
         if index < len(lines):
             response_match = RESPONSE_LINE_RE.match(lines[index].rstrip("\n"))
             if response_match:
+                status_code = int(response_match.group("status_code"))
+                status_text = response_match.group("status_text")
                 index += 1
                 response_headers, index = parse_headers(lines, index)
                 index = skip_blank_lines(lines, index)
@@ -350,14 +568,20 @@ def extract_records(text: str) -> list[dict[str, Any]]:
         iteration_by_session[session_id] += 1
         record = build_record(
             request_index=len(records) + 1,
+            connection=request_match.group("connection"),
+            host=request_match.group("host"),
+            path=request_match.group("path"),
             session_id=session_id,
             iteration=iteration_by_session[session_id],
             request_body=request_body,
+            status_code=status_code,
+            status_text=status_text,
             response_body=response_body,
             response_headers=response_headers,
         )
         records.append(record)
 
+    annotate_agent_metadata(records)
     return records
 
 

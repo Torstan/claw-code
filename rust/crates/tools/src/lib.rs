@@ -580,7 +580,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata. For independent work, you may launch multiple Agent calls in the same assistant message. After launching background agents, briefly tell the user what you launched and end your response. Do not predict agent results; they arrive later as notifications.",
+            description: "Launch a specialized agent task. For independent work, you may launch multiple Agent calls in the same assistant message; non-background Agent calls run concurrently and return results before you continue. Use run_in_background only when the user explicitly asks for background work or when you do not need the result in the current turn. After launching background agents, briefly tell the user what you launched and end your response. Do not predict background agent results; they arrive later as notifications.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1169,6 +1169,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+#[must_use]
+pub fn is_background_task_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "TaskCreate"
+            | "RunTaskPacket"
+            | "TaskGet"
+            | "TaskList"
+            | "TaskStop"
+            | "TaskUpdate"
+            | "TaskOutput"
+    )
+}
+
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
     enforcer: &PermissionEnforcer,
@@ -1192,6 +1206,9 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
 pub fn render_tool_result_for_model(tool_name: &str, output: &str) -> String {
     if tool_name == "Agent" {
         if let Some(rendered) = render_async_agent_launch_for_model(output) {
+            return rendered;
+        }
+        if let Some(rendered) = render_completed_agent_result_for_model(output) {
             return rendered;
         }
     }
@@ -2115,6 +2132,38 @@ fn render_async_agent_launch_for_model(output: &str) -> Option<String> {
             "If asked, you can check progress before completion with TaskOutput or by reading the output file.",
         ));
     }
+    Some(lines.join("\n"))
+}
+
+fn render_completed_agent_result_for_model(output: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(output).ok()?;
+    if parsed.get("status")?.as_str()? != "completed" {
+        return None;
+    }
+
+    let description = parsed
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Agent");
+    let result = parsed
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut lines = vec![
+        format!("Agent completed: {description}"),
+        String::from(
+            "This is the completed sub-agent result; no background task lookup is needed.",
+        ),
+        String::new(),
+    ];
+    lines.push(
+        result
+            .unwrap_or("(No final result text was produced.)")
+            .to_string(),
+    );
     Some(lines.join("\n"))
 }
 
@@ -3455,7 +3504,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
+const FALLBACK_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
@@ -3865,8 +3914,9 @@ fn build_agent_runtime(
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+    let session = new_agent_session(&job.manifest.agent_id);
     Ok(ConversationRuntime::new(
-        Session::new(),
+        session,
         api_client,
         tool_executor,
         permission_policy,
@@ -3874,19 +3924,38 @@ fn build_agent_runtime(
     ))
 }
 
+fn new_agent_session(agent_id: &str) -> Session {
+    let mut session = Session::new();
+    session.session_id = agent_id.to_string();
+    session
+}
+
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
-        cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
-        std::env::consts::OS,
-        "unknown",
-    )
-    .map_err(|error| error.to_string())?;
+    let mut prompt = load_system_prompt(cwd, agent_system_date(), std::env::consts::OS, "unknown")
+        .map_err(|error| error.to_string())?;
     prompt.push(format!(
-        "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
+        "You are a delegated sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
     Ok(prompt)
+}
+
+fn agent_system_date() -> String {
+    if let Ok(date) = std::env::var("CLAWD_AGENT_SYSTEM_DATE") {
+        let trimmed = date.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output() {
+        if output.status.success() {
+            let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !date.is_empty() {
+                return date;
+            }
+        }
+    }
+    FALLBACK_AGENT_SYSTEM_DATE.to_string()
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
@@ -4209,6 +4278,7 @@ struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
+    session_id: String,
 }
 
 impl ProviderRuntimeClient {
@@ -4266,6 +4336,7 @@ impl ProviderRuntimeClient {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
+            session_id: session_id.to_string(),
         })
     }
 }
@@ -4336,15 +4407,10 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
-            .into_iter()
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
-                input_schema: spec.input_schema,
-                cache_control: None,
-            })
-            .collect::<Vec<_>>();
+        let tools = tool_definitions_for_request_tools(
+            &self.allowed_tools,
+            request.suppress_background_task_tools,
+        );
         let messages = convert_messages(&request.messages);
         let system = if request.system_prompt.is_empty() {
             None
@@ -4357,7 +4423,7 @@ impl ApiClient for ProviderRuntimeClient {
                     .collect(),
             )
         };
-        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+        let tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
         let chain = &self.chain;
@@ -4387,7 +4453,12 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            let attempt = runtime.block_on(stream_with_provider(
+                &entry.client,
+                &message_request,
+                &self.session_id,
+                &entry.model,
+            ));
             match attempt {
                 Ok(events) => {
                     agent_debug_log(
@@ -4444,20 +4515,48 @@ impl ApiClient for ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
+    session_id: &str,
+    model: &str,
 ) -> Result<Vec<AssistantEvent>, ApiError> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut tool_block_indices: BTreeSet<u32> = BTreeSet::new();
     let mut saw_stop = false;
+    let mut stream_event_seq = 0_u64;
 
     while let Some(event) = stream.next_event().await? {
+        stream_event_seq += 1;
+        if should_log_stream_event_for_tool_diagnostics(&event) {
+            agent_debug_log(
+                "agent.provider.stream.event",
+                format!(
+                    "session_id={session_id}\nmodel={model}\nevent_seq={stream_event_seq}\n{}\n{}",
+                    stream_event_debug_summary(&event, 4000),
+                    pending_tools_debug_summary(&pending_tools, 240)
+                ),
+            );
+        }
         match event {
             ApiStreamEvent::MessageStart(start) => {
-                for block in start.message.content {
-                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
+                for (index, block) in start.message.content.into_iter().enumerate() {
+                    let index = u32::try_from(index).expect("stream message block index overflow");
+                    track_tool_block_index(&block, index, &mut tool_block_indices);
+                    push_output_block(block, index, &mut events, &mut pending_tools, true);
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                track_tool_block_index(&start.content_block, start.index, &mut tool_block_indices);
+                if let OutputContentBlock::ToolUse { id, name, input } = &start.content_block {
+                    agent_debug_log(
+                        "agent.provider.stream.tool_start",
+                        format!(
+                            "session_id={session_id}\nmodel={model}\nindex={}\ntool_id={id}\ntool_name={name}\n{}",
+                            start.index,
+                            debug_json_value_summary(input, 160)
+                        ),
+                    );
+                }
                 push_output_block(
                     start.content_block,
                     start.index,
@@ -4473,8 +4572,32 @@ async fn stream_with_provider(
                     }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                    if let Some((id, name, input)) = pending_tools.get_mut(&delta.index) {
                         input.push_str(&partial_json);
+                        agent_debug_log(
+                            "agent.provider.stream.tool_input_delta",
+                            format!(
+                                "session_id={session_id}\nmodel={model}\nindex={}\ntool_id={id}\ntool_name={name}\npartial_bytes={}\npartial_chars={}\naccumulated_bytes={}\naccumulated_chars={}\npartial={}\naccumulated_suffix={}",
+                                delta.index,
+                                partial_json.len(),
+                                partial_json.chars().count(),
+                                input.len(),
+                                input.chars().count(),
+                                json_debug_string(&partial_json, 160),
+                                json_debug_suffix(input, 160)
+                            ),
+                        );
+                    } else {
+                        agent_debug_log(
+                            "agent.provider.stream.tool_input_delta_without_start",
+                            format!(
+                                "session_id={session_id}\nmodel={model}\nindex={}\npartial_bytes={}\npartial_chars={}\npartial={}",
+                                delta.index,
+                                partial_json.len(),
+                                partial_json.chars().count(),
+                                json_debug_string(&partial_json, 160)
+                            ),
+                        );
                     }
                 }
                 ContentBlockDelta::ThinkingDelta { .. }
@@ -4482,7 +4605,29 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                    tool_block_indices.remove(&stop.index);
+                    let normalized_empty_to_object = input.trim().is_empty();
+                    let raw_summary = debug_labeled_json_input_summary("raw_input", &input, 240);
+                    let input = normalize_tool_input_string(input);
+                    agent_debug_log(
+                        "agent.provider.stream.tool_stop",
+                        format!(
+                            "session_id={session_id}\nmodel={model}\nindex={}\ntool_id={id}\ntool_name={name}\nnormalized_empty_to_object={normalized_empty_to_object}\n{}\n{}",
+                            stop.index,
+                            raw_summary,
+                            debug_labeled_json_input_summary("normalized_input", &input, 240)
+                        ),
+                    );
                     events.push(AssistantEvent::ToolUse { id, name, input });
+                } else if should_log_tool_stop_without_start(&mut tool_block_indices, stop.index) {
+                    agent_debug_log(
+                        "agent.provider.stream.tool_stop_without_start",
+                        format!(
+                            "session_id={session_id}\nmodel={model}\nindex={}\n{}",
+                            stop.index,
+                            pending_tools_debug_summary(&pending_tools, 240)
+                        ),
+                    );
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
@@ -4490,9 +4635,28 @@ async fn stream_with_provider(
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
+                if !pending_tools.is_empty() {
+                    agent_debug_log(
+                        "agent.provider.stream.message_stop_with_pending_tools",
+                        format!(
+                            "session_id={session_id}\nmodel={model}\n{}",
+                            pending_tools_debug_summary(&pending_tools, 240)
+                        ),
+                    );
+                }
                 events.push(AssistantEvent::MessageStop);
             }
         }
+    }
+
+    if !pending_tools.is_empty() {
+        agent_debug_log(
+            "agent.provider.stream.ended_with_pending_tools",
+            format!(
+                "session_id={session_id}\nmodel={model}\nsaw_stop={saw_stop}\n{}",
+                pending_tools_debug_summary(&pending_tools, 240)
+            ),
+        );
     }
 
     push_prompt_cache_record(client, &mut events);
@@ -4550,18 +4714,207 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let normalized_input = normalize_tool_input_json(input);
+        let value = match serde_json::from_str(normalized_input) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = ToolError::new(format!("invalid tool input JSON: {error}"));
+                agent_debug_log(
+                    "subagent.tool.execute.input_json_parse_error",
+                    format!(
+                        "tool_name={tool_name}\n{}\nerror={error}",
+                        debug_json_input_summary(normalized_input, 500)
+                    ),
+                );
+                return Err(error);
+            }
+        };
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
 }
 
-fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
+fn tool_specs_for_allowed_tools(
+    allowed_tools: Option<&BTreeSet<String>>,
+    suppress_background_task_tools: bool,
+) -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
-        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+        .filter(|spec| {
+            allowed_tools.is_none_or(|allowed| allowed.contains(spec.name))
+                && !(suppress_background_task_tools && is_background_task_tool_name(spec.name))
+        })
         .collect()
+}
+
+fn tool_definitions_for_request_tools(
+    allowed_tools: &BTreeSet<String>,
+    suppress_background_task_tools: bool,
+) -> Vec<ToolDefinition> {
+    tool_specs_for_allowed_tools(Some(allowed_tools), suppress_background_task_tools)
+        .into_iter()
+        .map(|spec| ToolDefinition {
+            name: spec.name.to_string(),
+            description: Some(spec.description.to_string()),
+            input_schema: spec.input_schema,
+            cache_control: None,
+        })
+        .collect()
+}
+
+fn normalize_tool_input_json(input: &str) -> &str {
+    if input.trim().is_empty() {
+        "{}"
+    } else {
+        input
+    }
+}
+
+fn normalize_tool_input_string(input: String) -> String {
+    if input.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        input
+    }
+}
+
+fn debug_json_value_summary(value: &serde_json::Value, limit: usize) -> String {
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    debug_json_input_summary(&rendered, limit)
+}
+
+fn debug_json_input_summary(input: &str, limit: usize) -> String {
+    debug_labeled_json_input_summary("input", input, limit)
+}
+
+fn debug_labeled_json_input_summary(label: &str, input: &str, limit: usize) -> String {
+    format!(
+        "{label}_bytes={}\n{label}_chars={}\n{label}_trimmed_empty={}\n{label}_full_available={}\n{label}_prefix={}\n{label}_suffix={}",
+        input.len(),
+        input.chars().count(),
+        input.trim().is_empty(),
+        input.chars().count() <= limit,
+        json_debug_string(input, limit),
+        json_debug_suffix(input, limit)
+    )
+}
+
+fn should_log_stream_event_for_tool_diagnostics(event: &ApiStreamEvent) -> bool {
+    !matches!(
+        event,
+        ApiStreamEvent::ContentBlockDelta(api::ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { .. },
+            ..
+        })
+    )
+}
+
+fn stream_event_debug_summary(event: &ApiStreamEvent, limit: usize) -> String {
+    match event {
+        ApiStreamEvent::MessageStart(start) => format!(
+            "event=message_start\ncontent_blocks={}",
+            start.message.content.len()
+        ),
+        ApiStreamEvent::ContentBlockStart(start) => match &start.content_block {
+            OutputContentBlock::ToolUse { id, name, input } => format!(
+                "event=content_block_start\nindex={}\nblock_type=tool_use\ntool_id={id}\ntool_name={name}\n{}",
+                start.index,
+                debug_json_value_summary(input, limit)
+            ),
+            OutputContentBlock::Text { text } => format!(
+                "event=content_block_start\nindex={}\nblock_type=text\ntext_bytes={}\ntext_chars={}",
+                start.index,
+                text.len(),
+                text.chars().count()
+            ),
+            OutputContentBlock::Thinking { thinking, .. } => format!(
+                "event=content_block_start\nindex={}\nblock_type=thinking\nthinking_chars={}",
+                start.index,
+                thinking.chars().count()
+            ),
+            OutputContentBlock::RedactedThinking { .. } => format!(
+                "event=content_block_start\nindex={}\nblock_type=redacted_thinking",
+                start.index
+            ),
+        },
+        ApiStreamEvent::ContentBlockDelta(delta) => match &delta.delta {
+            ContentBlockDelta::InputJsonDelta { partial_json } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=input_json_delta\n{}",
+                delta.index,
+                debug_labeled_json_input_summary("partial_json", partial_json, limit)
+            ),
+            ContentBlockDelta::TextDelta { text } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=text_delta\ntext_bytes={}\ntext_chars={}",
+                delta.index,
+                text.len(),
+                text.chars().count()
+            ),
+            ContentBlockDelta::ThinkingDelta { thinking } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=thinking_delta\nthinking_chars={}",
+                delta.index,
+                thinking.chars().count()
+            ),
+            ContentBlockDelta::SignatureDelta { signature } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=signature_delta\nsignature_chars={}",
+                delta.index,
+                signature.chars().count()
+            ),
+        },
+        ApiStreamEvent::ContentBlockStop(stop) => {
+            format!("event=content_block_stop\nindex={}", stop.index)
+        }
+        ApiStreamEvent::MessageDelta(delta) => format!(
+            "event=message_delta\nstop_reason={}\nstop_sequence={}\ninput_tokens={}\noutput_tokens={}\ncache_creation_input_tokens={}\ncache_read_input_tokens={}",
+            delta.delta.stop_reason.as_deref().unwrap_or("none"),
+            delta.delta.stop_sequence.as_deref().unwrap_or("none"),
+            delta.usage.input_tokens,
+            delta.usage.output_tokens,
+            delta.usage.cache_creation_input_tokens,
+            delta.usage.cache_read_input_tokens
+        ),
+        ApiStreamEvent::MessageStop(_) => "event=message_stop".to_string(),
+    }
+}
+
+fn pending_tools_debug_summary(
+    pending_tools: &BTreeMap<u32, (String, String, String)>,
+    limit: usize,
+) -> String {
+    let indices = pending_tools
+        .keys()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let entries = pending_tools
+        .iter()
+        .map(|(index, (id, name, input))| {
+            format!(
+                "index={index} id={id} name={name} bytes={} chars={} suffix={}",
+                input.len(),
+                input.chars().count(),
+                json_debug_suffix(input, limit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "pending_tool_count={}\npending_tool_indices={}\npending_tool_entries={}",
+        pending_tools.len(),
+        json_debug_string(&indices, limit),
+        json_debug_string(&entries, limit * pending_tools.len().max(1))
+    )
+}
+
+fn json_debug_string(input: &str, limit: usize) -> String {
+    let value = input.chars().take(limit).collect::<String>();
+    serde_json::to_string(&value).unwrap_or_else(|_| "\"<unprintable>\"".to_string())
+}
+
+fn json_debug_suffix(input: &str, limit: usize) -> String {
+    let mut suffix = input.chars().rev().take(limit).collect::<Vec<_>>();
+    suffix.reverse();
+    let value = suffix.into_iter().collect::<String>();
+    serde_json::to_string(&value).unwrap_or_else(|_| "\"<unprintable>\"".to_string())
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -4635,6 +4988,23 @@ fn push_output_block(
         }
         OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
+}
+
+fn track_tool_block_index(
+    block: &OutputContentBlock,
+    block_index: u32,
+    tool_block_indices: &mut BTreeSet<u32>,
+) {
+    if matches!(block, OutputContentBlock::ToolUse { .. }) {
+        tool_block_indices.insert(block_index);
+    }
+}
+
+fn should_log_tool_stop_without_start(
+    tool_block_indices: &mut BTreeSet<u32>,
+    block_index: u32,
+) -> bool {
+    tool_block_indices.remove(&block_index)
 }
 
 fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
@@ -5961,14 +6331,16 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, render_tool_result_for_model,
-        run_task_output, run_task_packet, AgentInput, AgentJob, AgentToolOutput,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor, TaskOutputInput,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
+        classify_lane_failure, debug_json_input_summary, derive_agent_state,
+        enqueue_background_agent_notification, execute_agent_with_mode, execute_agent_with_spawn,
+        execute_tool, final_assistant_text, global_task_registry, maybe_commit_provenance,
+        mvp_tool_specs, new_agent_session, normalize_tool_input_string,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        render_tool_result_for_model, run_task_output, run_task_packet,
+        should_log_tool_stop_without_start, tool_specs_for_allowed_tools, track_tool_block_index,
+        AgentInput, AgentJob, AgentToolOutput, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, TaskOutputInput,
     };
     use api::{AuthSource, OutputContentBlock, ProviderClient};
     use runtime::ProviderFallbackConfig;
@@ -6059,6 +6431,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_specs_can_hide_background_task_tools_for_sync_agent_turns() {
+        let names = tool_specs_for_allowed_tools(None, true)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"Agent"));
+        assert!(!names.contains(&"TaskCreate"));
+        assert!(!names.contains(&"TaskList"));
+        assert!(!names.contains(&"TaskOutput"));
+        assert!(!names.contains(&"RunTaskPacket"));
+    }
+
+    #[test]
+    fn agent_tool_description_scopes_background_mode() {
+        let agent = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "Agent")
+            .expect("Agent tool should be present");
+
+        assert!(agent
+            .description
+            .contains("non-background Agent calls run concurrently"));
+        assert!(agent
+            .description
+            .contains("Use run_in_background only when the user explicitly asks"));
+    }
+
+    #[test]
     fn render_tool_result_for_model_formats_async_agent_launches() {
         let rendered = render_tool_result_for_model(
             "Agent",
@@ -6080,9 +6481,32 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_result_for_model_preserves_non_async_outputs() {
+    fn render_tool_result_for_model_formats_completed_agent_results() {
+        let rendered = render_tool_result_for_model(
+            "Agent",
+            r#"{
+  "status": "completed",
+  "agentId": "agent-123",
+  "description": "Code Quality Review",
+  "outputFile": "/tmp/agent-123.md",
+  "manifestFile": "/tmp/agent-123.json",
+  "laneEvents": [{"event":"lane.started"}],
+  "derivedState": "finished_cleanable",
+  "result": "No quality issues found."
+}"#,
+        );
+
+        assert!(rendered.contains("Agent completed: Code Quality Review"));
+        assert!(rendered.contains("No quality issues found."));
+        assert!(rendered.contains("no background task lookup is needed"));
+        assert!(!rendered.contains("agent-123"));
+        assert!(!rendered.contains("manifestFile"));
+        assert!(!rendered.contains("laneEvents"));
+    }
+
+    #[test]
+    fn render_tool_result_for_model_preserves_non_agent_outputs() {
         let raw = r#"{"status":"completed","agentId":"agent-123"}"#;
-        assert_eq!(render_tool_result_for_model("Agent", raw), raw);
         assert_eq!(render_tool_result_for_model("bash", raw), raw);
     }
 
@@ -7031,6 +7455,83 @@ mod tests {
     }
 
     #[test]
+    fn tool_stop_without_start_diagnostic_ignores_text_block_stop() {
+        let mut tool_block_indices = BTreeSet::new();
+        track_tool_block_index(
+            &OutputContentBlock::Text {
+                text: String::new(),
+            },
+            0,
+            &mut tool_block_indices,
+        );
+
+        assert!(!should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            0
+        ));
+    }
+
+    #[test]
+    fn tool_stop_without_start_diagnostic_flags_tracked_tool_block_stop_once() {
+        let mut tool_block_indices = BTreeSet::new();
+        track_tool_block_index(
+            &OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            1,
+            &mut tool_block_indices,
+        );
+
+        assert!(should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            1
+        ));
+        assert!(!should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            1
+        ));
+    }
+
+    #[test]
+    fn empty_streaming_tool_input_normalizes_to_empty_object_on_stop() {
+        assert_eq!(normalize_tool_input_string(String::new()), "{}");
+        assert_eq!(normalize_tool_input_string("   ".to_string()), "{}");
+        assert_eq!(
+            normalize_tool_input_string(r#"{"path":"src/main.rs"}"#.to_string()),
+            r#"{"path":"src/main.rs"}"#
+        );
+    }
+
+    #[test]
+    fn debug_json_input_summary_includes_lengths_prefix_and_suffix() {
+        let summary = debug_json_input_summary(r#"{"description":"abc","name":"Review""#, 12);
+
+        assert!(summary.contains("input_bytes=36"));
+        assert!(summary.contains("input_chars=36"));
+        assert!(summary.contains("input_prefix="));
+        assert!(summary.contains("descript"));
+        assert!(summary.contains("input_suffix="));
+        assert!(summary.contains("Review"));
+    }
+
+    #[test]
+    fn subagent_executor_accepts_empty_input_for_empty_object_tools() {
+        let mut executor = SubagentToolExecutor::new(
+            ["TaskList".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+        );
+
+        let output = executor
+            .execute("TaskList", "")
+            .expect("empty string should be treated as empty object JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert!(parsed["tasks"].is_array());
+    }
+
+    #[test]
     fn todo_write_persists_and_returns_previous_state() {
         let _guard = env_lock()
             .lock()
@@ -7651,6 +8152,32 @@ mod tests {
         .expect("Agent should normalize explicit names");
         assert_eq!(named.name, "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_system_prompt_uses_runtime_date_override() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("CLAWD_AGENT_SYSTEM_DATE");
+        std::env::set_var("CLAWD_AGENT_SYSTEM_DATE", "2026-05-03");
+
+        let prompt = build_agent_system_prompt("Explore").expect("system prompt should build");
+
+        match previous {
+            Some(value) => std::env::set_var("CLAWD_AGENT_SYSTEM_DATE", value),
+            None => std::env::remove_var("CLAWD_AGENT_SYSTEM_DATE"),
+        }
+        let joined = prompt.join("\n");
+        assert!(joined.contains("Date: 2026-05-03"));
+        assert!(joined.contains("You are a delegated sub-agent of type `Explore`"));
+        assert!(!joined.contains("background sub-agent"));
+    }
+
+    #[test]
+    fn agent_runtime_session_uses_manifest_agent_id_for_llm_logs() {
+        let session = new_agent_session("agent-test-123");
+        assert_eq!(session.session_id, "agent-test-123");
     }
 
     #[test]

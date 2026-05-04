@@ -372,19 +372,22 @@ impl AnthropicClient {
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
+        let request_id = request_id_from_headers(response.headers());
         agent_debug_log(
             "anthropic.stream_message.response_ready",
             format!(
                 "model={}\nelapsed_ms={}\nrequest_id={:?}",
                 request.model,
                 started_at.elapsed().as_millis(),
-                request_id_from_headers(response.headers())
+                request_id
             ),
         );
         Ok(MessageStream {
-            request_id: request_id_from_headers(response.headers()),
+            request_id: request_id.clone(),
             response,
-            parser: SseParser::new().with_context("Anthropic", request.model.clone()),
+            parser: SseParser::new()
+                .with_context("Anthropic", request.model.clone())
+                .with_trace_id(request_id.as_deref().unwrap_or("unknown")),
             pending: VecDeque::new(),
             done: false,
             request: request.clone(),
@@ -1140,13 +1143,20 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    self.pending.extend(self.parser.push(&chunk)?);
-                }
-                None => {
-                    self.done = true;
-                }
+            if let Some(chunk) = self.response.chunk().await? {
+                self.pending.extend(self.parser.push(&chunk)?);
+            } else {
+                agent_debug_log(
+                    "anthropic.stream_message.eof",
+                    format!(
+                        "model={}\nrequest_id={}\npending_events={}\ndone_before={}",
+                        self.request.model,
+                        self.request_id.as_deref().unwrap_or("unknown"),
+                        self.pending.len(),
+                        self.done
+                    ),
+                );
+                self.done = true;
             }
         }
     }

@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -54,13 +54,14 @@ use runtime::{
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
     OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, ToolInvocation, UsageTracker, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    ToolError, ToolExecutor, ToolInvocation, TurnExecutionPolicy, UsageTracker,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, render_tool_result_for_model, GlobalToolRegistry,
-    RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, is_background_task_tool_name, mvp_tool_specs, render_tool_result_for_model,
+    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -232,6 +233,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            turn_policy,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
@@ -248,7 +250,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, turn_policy)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -337,6 +339,7 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+        turn_policy: TurnExecutionPolicy,
     },
     Login {
         output_format: CliOutputFormat,
@@ -543,6 +546,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit: base_commit.clone(),
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    turn_policy: TurnExecutionPolicy::default(),
                 });
             }
             "--print" => {
@@ -615,6 +619,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort,
                     allow_broad_cwd,
+                    turn_policy: TurnExecutionPolicy::default(),
                 });
             }
         }
@@ -665,6 +670,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    turn_policy: TurnExecutionPolicy::default(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -692,6 +698,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
+                turn_policy: TurnExecutionPolicy::default(),
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -715,6 +722,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            turn_policy: TurnExecutionPolicy::default(),
         }),
     }
 }
@@ -840,6 +848,7 @@ fn parse_direct_slash_cli_action(
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    turn_policy: TurnExecutionPolicy::default(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -859,6 +868,7 @@ fn parse_direct_slash_cli_action(
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
+                turn_policy: TurnExecutionPolicy::synchronous_agents(),
             })
         }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
@@ -877,6 +887,14 @@ fn parse_direct_slash_cli_action(
 
 fn normalized_prompt_slash_args(args: Option<&str>) -> Option<&str> {
     args.map(str::trim).filter(|args| !args.is_empty())
+}
+
+fn prompt_slash_turn_policy(command_name: &str) -> TurnExecutionPolicy {
+    if command_name == "simplify" {
+        TurnExecutionPolicy::synchronous_agents()
+    } else {
+        TurnExecutionPolicy::default()
+    }
 }
 
 fn format_prompt_slash_command_input(command_name: &str, args: Option<&str>) -> String {
@@ -1218,7 +1236,21 @@ fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
+    filter_tool_specs_for_request(tool_registry, allowed_tools, false)
+}
+
+fn filter_tool_specs_for_request(
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+    suppress_background_task_tools: bool,
+) -> Vec<ToolDefinition> {
+    tool_registry
+        .definitions(allowed_tools)
+        .into_iter()
+        .filter(|definition| {
+            !(suppress_background_task_tools && is_background_task_tool_name(&definition.name))
+        })
+        .collect()
 }
 
 fn parse_system_prompt_args(
@@ -3960,6 +3992,14 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn_with_policy(input, TurnExecutionPolicy::default())
+    }
+
+    fn run_turn_with_policy(
+        &mut self,
+        input: &str,
+        turn_policy: TurnExecutionPolicy,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -3969,7 +4009,8 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result =
+            runtime.run_turn_with_policy(input, turn_policy, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -4007,6 +4048,7 @@ impl LiveCli {
         args: Option<&str>,
         prompt: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let turn_policy = prompt_slash_turn_policy(command_name);
         let slash_input = format_prompt_slash_command_input(command_name, args);
         self.record_prompt_history(&slash_input);
 
@@ -4032,10 +4074,11 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn_with_messages(
+        let result = runtime.run_turn_with_messages_and_policy(
             slash_input,
             initial_messages,
             Some(&mut permission_prompter),
+            turn_policy,
         );
         hook_abort_monitor.stop();
         match result {
@@ -4073,18 +4116,24 @@ impl LiveCli {
         input: &str,
         output_format: CliOutputFormat,
         compact: bool,
+        turn_policy: TurnExecutionPolicy,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
+            CliOutputFormat::Text if compact => self.run_prompt_compact(input, turn_policy),
+            CliOutputFormat::Text => self.run_turn_with_policy(input, turn_policy),
+            CliOutputFormat::Json => self.run_prompt_json(input, turn_policy),
         }
     }
 
-    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_prompt_compact(
+        &mut self,
+        input: &str,
+        turn_policy: TurnExecutionPolicy,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result =
+            runtime.run_turn_with_policy(input, turn_policy, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -4094,10 +4143,15 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_prompt_json(
+        &mut self,
+        input: &str,
+        turn_policy: TurnExecutionPolicy,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result =
+            runtime.run_turn_with_policy(input, turn_policy, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -7321,9 +7375,13 @@ impl ApiClient for AnthropicRuntimeClient {
             }
             Some(blocks)
         };
-        let mut tools = self
-            .enable_tools
-            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
+        let mut tools = self.enable_tools.then(|| {
+            filter_tool_specs_for_request(
+                &self.tool_registry,
+                self.allowed_tools.as_ref(),
+                request.suppress_background_task_tools,
+            )
+        });
         apply_tool_cache_controls(&mut tools);
         let mut messages = convert_messages(&request.messages);
         apply_message_cache_controls(&mut messages);
@@ -7490,10 +7548,13 @@ impl AnthropicRuntimeClient {
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
+        let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+        let mut tool_block_indices: BTreeSet<u32> = BTreeSet::new();
+        let mut tool_input_delta_counts: BTreeMap<u32, usize> = BTreeMap::new();
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut stream_event_seq = 0_u64;
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -7525,6 +7586,7 @@ impl AnthropicRuntimeClient {
             let Some(event) = next else {
                 break;
             };
+            stream_event_seq += 1;
             if !received_any_event {
                 let event_name = match &event {
                     ApiStreamEvent::MessageStart(_) => "message_start",
@@ -7544,27 +7606,67 @@ impl AnthropicRuntimeClient {
                     ),
                 );
             }
+            if should_log_stream_event_for_tool_diagnostics(&event) {
+                cli_agent_debug_log(
+                    "cli.provider.stream.event",
+                    format!(
+                        "session_id={}\nmodel={}\nevent_seq={}\nelapsed_ms={}\n{}\n{}",
+                        self.session_id,
+                        self.model,
+                        stream_event_seq,
+                        consume_started_at.elapsed().as_millis(),
+                        stream_event_debug_summary(&event, 4000),
+                        pending_tools_debug_summary(&pending_tools, 240)
+                    ),
+                );
+            }
             received_any_event = true;
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
-                    for block in start.message.content {
+                    for (index, block) in start.message.content.into_iter().enumerate() {
+                        let index =
+                            u32::try_from(index).expect("stream message block index overflow");
+                        if matches!(&block, OutputContentBlock::ToolUse { .. }) {
+                            tool_input_delta_counts.insert(index, 0);
+                        }
+                        track_tool_block_index(&block, index, &mut tool_block_indices);
                         push_output_block(
                             block,
+                            index,
                             out,
                             &mut events,
-                            &mut pending_tool,
+                            &mut pending_tools,
                             true,
                             &mut block_has_thinking_summary,
                         )?;
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    track_tool_block_index(
+                        &start.content_block,
+                        start.index,
+                        &mut tool_block_indices,
+                    );
+                    if let OutputContentBlock::ToolUse { id, name, input } = &start.content_block {
+                        tool_input_delta_counts.insert(start.index, 0);
+                        cli_agent_debug_log(
+                            "cli.provider.stream.tool_start",
+                            format!(
+                                "session_id={}\nmodel={}\nindex={}\ntool_id={id}\ntool_name={name}\n{}",
+                                self.session_id,
+                                self.model,
+                                start.index,
+                                debug_json_value_summary(input, 160)
+                            ),
+                        );
+                    }
                     push_output_block(
                         start.content_block,
+                        start.index,
                         out,
                         &mut events,
-                        &mut pending_tool,
+                        &mut pending_tools,
                         true,
                         &mut block_has_thinking_summary,
                     )?;
@@ -7584,8 +7686,43 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
+                        if let Some((id, name, input)) = pending_tools.get_mut(&delta.index) {
                             input.push_str(&partial_json);
+                            let delta_count = tool_input_delta_counts
+                                .entry(delta.index)
+                                .and_modify(|count| *count += 1)
+                                .or_insert(1);
+                            if should_log_streamed_tool_input_delta(*delta_count) {
+                                cli_agent_debug_log(
+                                    "cli.provider.stream.tool_input_delta",
+                                    format!(
+                                        "session_id={}\nmodel={}\nindex={}\ntool_id={id}\ntool_name={name}\ndelta_count={}\npartial_bytes={}\npartial_chars={}\naccumulated_bytes={}\naccumulated_chars={}\npartial={}\naccumulated_suffix={}",
+                                        self.session_id,
+                                        self.model,
+                                        delta.index,
+                                        delta_count,
+                                        partial_json.len(),
+                                        partial_json.chars().count(),
+                                        input.len(),
+                                        input.chars().count(),
+                                        json_debug_string(&partial_json, 160),
+                                        json_debug_suffix(input, 160)
+                                    ),
+                                );
+                            }
+                        } else {
+                            cli_agent_debug_log(
+                                "cli.provider.stream.tool_input_delta_without_start",
+                                format!(
+                                    "session_id={}\nmodel={}\nindex={}\npartial_bytes={}\npartial_chars={}\npartial={}",
+                                    self.session_id,
+                                    self.model,
+                                    delta.index,
+                                    partial_json.len(),
+                                    partial_json.chars().count(),
+                                    json_debug_string(&partial_json, 160)
+                                ),
+                            );
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { .. } => {
@@ -7596,14 +7733,54 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
-                ApiStreamEvent::ContentBlockStop(_) => {
+                ApiStreamEvent::ContentBlockStop(stop) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
-                    if let Some((id, name, input)) = pending_tool.take() {
+                    if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                        tool_block_indices.remove(&stop.index);
+                        tool_input_delta_counts.remove(&stop.index);
+                        let normalized_empty_to_object = input.trim().is_empty();
+                        let raw_summary =
+                            debug_labeled_json_input_summary("raw_input", &input, 240);
+                        let input = normalize_tool_input_string(input);
+                        cli_agent_debug_log(
+                            "cli.provider.stream.tool_stop",
+                            format!(
+                                "session_id={}\nmodel={}\nindex={}\ntool_id={id}\ntool_name={name}\nnormalized_empty_to_object={}\n{}\n{}",
+                                self.session_id,
+                                self.model,
+                                stop.index,
+                                normalized_empty_to_object,
+                                raw_summary,
+                                debug_labeled_json_input_summary("normalized_input", &input, 240)
+                            ),
+                        );
+                        if let Err(error) = validate_tool_input_json(&input) {
+                            cli_agent_debug_log(
+                                "cli.provider.stream.tool_input_json_invalid",
+                                format!(
+                                    "session_id={}\nmodel={}\nindex={}\ntool_id={id}\ntool_name={name}\nerror={error}\n{}\n{}",
+                                    self.session_id,
+                                    self.model,
+                                    stop.index,
+                                    debug_labeled_json_input_summary("invalid_input", &input, 4000),
+                                    pending_tools_debug_summary(&pending_tools, 240)
+                                ),
+                            );
+                            return self
+                                .non_streaming_fallback(
+                                    message_request,
+                                    out,
+                                    &format!(
+                                        "invalid_streamed_tool_input_json tool_id={id} tool_name={name} error={error}"
+                                    ),
+                                )
+                                .await;
+                        }
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
@@ -7612,6 +7789,21 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         events.push(AssistantEvent::ToolUse { id, name, input });
+                    } else if should_log_tool_stop_without_start(
+                        &mut tool_block_indices,
+                        stop.index,
+                    ) {
+                        tool_input_delta_counts.remove(&stop.index);
+                        cli_agent_debug_log(
+                            "cli.provider.stream.tool_stop_without_start",
+                            format!(
+                                "session_id={}\nmodel={}\nindex={}\n{}",
+                                self.session_id,
+                                self.model,
+                                stop.index,
+                                pending_tools_debug_summary(&pending_tools, 240)
+                            ),
+                        );
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
@@ -7634,6 +7826,17 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
+                    if !pending_tools.is_empty() {
+                        cli_agent_debug_log(
+                            "cli.provider.stream.message_stop_with_pending_tools",
+                            format!(
+                                "session_id={}\nmodel={}\n{}",
+                                self.session_id,
+                                self.model,
+                                pending_tools_debug_summary(&pending_tools, 240)
+                            ),
+                        );
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
@@ -7642,6 +7845,19 @@ impl AnthropicRuntimeClient {
                     events.push(AssistantEvent::MessageStop);
                 }
             }
+        }
+
+        if !pending_tools.is_empty() {
+            cli_agent_debug_log(
+                "cli.provider.stream.ended_with_pending_tools",
+                format!(
+                    "session_id={}\nmodel={}\nsaw_stop={}\n{}",
+                    self.session_id,
+                    self.model,
+                    saw_stop,
+                    pending_tools_debug_summary(&pending_tools, 240)
+                ),
+            );
         }
 
         push_prompt_cache_record(&self.client, &mut events);
@@ -7662,6 +7878,23 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
+        self.non_streaming_fallback(message_request, out, "stream_ended_without_message_stop")
+            .await
+    }
+
+    async fn non_streaming_fallback(
+        &self,
+        message_request: &MessageRequest,
+        out: &mut (impl Write + ?Sized),
+        reason: &str,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        agent_debug_log(
+            "cli.provider.stream.fallback_non_streaming",
+            format!(
+                "session_id={}\nmodel={}\nreason={}",
+                self.session_id, self.model, reason
+            ),
+        );
         let response = self
             .client
             .send_message(&MessageRequest {
@@ -8505,9 +8738,10 @@ fn render_thinking_block_summary(
 
 fn push_output_block(
     block: OutputContentBlock,
+    block_index: u32,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
+    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
@@ -8533,7 +8767,7 @@ fn push_output_block(
             } else {
                 input.to_string()
             };
-            *pending_tool = Some((id, name, initial_input));
+            pending_tools.insert(block_index, (id, name, initial_input));
         }
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
@@ -8547,24 +8781,43 @@ fn push_output_block(
     Ok(())
 }
 
+fn track_tool_block_index(
+    block: &OutputContentBlock,
+    block_index: u32,
+    tool_block_indices: &mut BTreeSet<u32>,
+) {
+    if matches!(block, OutputContentBlock::ToolUse { .. }) {
+        tool_block_indices.insert(block_index);
+    }
+}
+
+fn should_log_tool_stop_without_start(
+    tool_block_indices: &mut BTreeSet<u32>,
+    block_index: u32,
+) -> bool {
+    tool_block_indices.remove(&block_index)
+}
+
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
-    let mut pending_tool = None;
+    let mut pending_tools = BTreeMap::new();
 
-    for block in response.content {
+    for (index, block) in response.content.into_iter().enumerate() {
+        let index = u32::try_from(index).expect("response block index overflow");
         let mut block_has_thinking_summary = false;
         push_output_block(
             block,
+            index,
             out,
             &mut events,
-            &mut pending_tool,
+            &mut pending_tools,
             false,
             &mut block_has_thinking_summary,
         )?;
-        if let Some((id, name, input)) = pending_tool.take() {
+        if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
@@ -8572,6 +8825,171 @@ fn response_to_events(
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     Ok(events)
+}
+
+fn normalize_tool_input_json(input: &str) -> &str {
+    if input.trim().is_empty() {
+        "{}"
+    } else {
+        input
+    }
+}
+
+fn normalize_tool_input_string(input: String) -> String {
+    if input.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        input
+    }
+}
+
+fn validate_tool_input_json(input: &str) -> Result<(), String> {
+    serde_json::from_str::<Value>(normalize_tool_input_json(input))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn debug_json_value_summary(value: &serde_json::Value, limit: usize) -> String {
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    debug_json_input_summary(&rendered, limit)
+}
+
+fn debug_json_input_summary(input: &str, limit: usize) -> String {
+    debug_labeled_json_input_summary("input", input, limit)
+}
+
+fn debug_labeled_json_input_summary(label: &str, input: &str, limit: usize) -> String {
+    format!(
+        "{label}_bytes={}\n{label}_chars={}\n{label}_trimmed_empty={}\n{label}_full_available={}\n{label}_prefix={}\n{label}_suffix={}",
+        input.len(),
+        input.chars().count(),
+        input.trim().is_empty(),
+        input.chars().count() <= limit,
+        json_debug_string(input, limit),
+        json_debug_suffix(input, limit)
+    )
+}
+
+fn should_log_stream_event_for_tool_diagnostics(event: &ApiStreamEvent) -> bool {
+    !matches!(
+        event,
+        ApiStreamEvent::ContentBlockDelta(api::ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { .. } | ContentBlockDelta::InputJsonDelta { .. },
+            ..
+        })
+    )
+}
+
+fn should_log_streamed_tool_input_delta(delta_count: usize) -> bool {
+    delta_count > 0 && (delta_count == 1 || delta_count.is_multiple_of(32))
+}
+
+fn stream_event_debug_summary(event: &ApiStreamEvent, limit: usize) -> String {
+    match event {
+        ApiStreamEvent::MessageStart(start) => format!(
+            "event=message_start\ncontent_blocks={}",
+            start.message.content.len()
+        ),
+        ApiStreamEvent::ContentBlockStart(start) => match &start.content_block {
+            OutputContentBlock::ToolUse { id, name, input } => format!(
+                "event=content_block_start\nindex={}\nblock_type=tool_use\ntool_id={id}\ntool_name={name}\n{}",
+                start.index,
+                debug_json_value_summary(input, limit)
+            ),
+            OutputContentBlock::Text { text } => format!(
+                "event=content_block_start\nindex={}\nblock_type=text\ntext_bytes={}\ntext_chars={}",
+                start.index,
+                text.len(),
+                text.chars().count()
+            ),
+            OutputContentBlock::Thinking { thinking, .. } => format!(
+                "event=content_block_start\nindex={}\nblock_type=thinking\nthinking_chars={}",
+                start.index,
+                thinking.chars().count()
+            ),
+            OutputContentBlock::RedactedThinking { .. } => format!(
+                "event=content_block_start\nindex={}\nblock_type=redacted_thinking",
+                start.index
+            ),
+        },
+        ApiStreamEvent::ContentBlockDelta(delta) => match &delta.delta {
+            ContentBlockDelta::InputJsonDelta { partial_json } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=input_json_delta\n{}",
+                delta.index,
+                debug_labeled_json_input_summary("partial_json", partial_json, limit)
+            ),
+            ContentBlockDelta::TextDelta { text } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=text_delta\ntext_bytes={}\ntext_chars={}",
+                delta.index,
+                text.len(),
+                text.chars().count()
+            ),
+            ContentBlockDelta::ThinkingDelta { thinking } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=thinking_delta\nthinking_chars={}",
+                delta.index,
+                thinking.chars().count()
+            ),
+            ContentBlockDelta::SignatureDelta { signature } => format!(
+                "event=content_block_delta\nindex={}\ndelta_type=signature_delta\nsignature_chars={}",
+                delta.index,
+                signature.chars().count()
+            ),
+        },
+        ApiStreamEvent::ContentBlockStop(stop) => {
+            format!("event=content_block_stop\nindex={}", stop.index)
+        }
+        ApiStreamEvent::MessageDelta(delta) => format!(
+            "event=message_delta\nstop_reason={}\nstop_sequence={}\ninput_tokens={}\noutput_tokens={}\ncache_creation_input_tokens={}\ncache_read_input_tokens={}",
+            delta.delta.stop_reason.as_deref().unwrap_or("none"),
+            delta.delta.stop_sequence.as_deref().unwrap_or("none"),
+            delta.usage.input_tokens,
+            delta.usage.output_tokens,
+            delta.usage.cache_creation_input_tokens,
+            delta.usage.cache_read_input_tokens
+        ),
+        ApiStreamEvent::MessageStop(_) => "event=message_stop".to_string(),
+    }
+}
+
+fn pending_tools_debug_summary(
+    pending_tools: &BTreeMap<u32, (String, String, String)>,
+    limit: usize,
+) -> String {
+    let indices = pending_tools
+        .keys()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let entries = pending_tools
+        .iter()
+        .map(|(index, (id, name, input))| {
+            format!(
+                "index={index} id={id} name={name} bytes={} chars={} suffix={}",
+                input.len(),
+                input.chars().count(),
+                json_debug_suffix(input, limit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "pending_tool_count={}\npending_tool_indices={}\npending_tool_entries={}",
+        pending_tools.len(),
+        json_debug_string(&indices, limit),
+        json_debug_string(&entries, limit * pending_tools.len().max(1))
+    )
+}
+
+fn json_debug_string(input: &str, limit: usize) -> String {
+    let value = input.chars().take(limit).collect::<String>();
+    serde_json::to_string(&value).unwrap_or_else(|_| "\"<unprintable>\"".to_string())
+}
+
+fn json_debug_suffix(input: &str, limit: usize) -> String {
+    let mut suffix = input.chars().rev().take(limit).collect::<Vec<_>>();
+    suffix.reverse();
+    let value = suffix.into_iter().collect::<String>();
+    serde_json::to_string(&value).unwrap_or_else(|_| "\"<unprintable>\"".to_string())
 }
 
 fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
@@ -8690,9 +9108,10 @@ impl CliToolExecutor {
 
     fn execute_raw(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let started_at = Instant::now();
+        let normalized_input = normalize_tool_input_json(input);
         cli_agent_debug_log(
             "tool.execute.begin",
-            format!("tool_name={tool_name}\ninput={input}"),
+            format!("tool_name={tool_name}\ninput={normalized_input}"),
         );
         if self
             .allowed_tools
@@ -8711,10 +9130,17 @@ impl CliToolExecutor {
             );
             return Err(error);
         }
-        let value = match serde_json::from_str(input) {
+        let value = match serde_json::from_str(normalized_input) {
             Ok(value) => value,
             Err(error) => {
                 let error = ToolError::new(format!("invalid tool input JSON: {error}"));
+                cli_agent_debug_log(
+                    "tool.execute.input_json_parse_error",
+                    format!(
+                        "tool_name={tool_name}\n{}\nerror={error}",
+                        debug_json_input_summary(normalized_input, 500)
+                    ),
+                );
                 cli_agent_debug_log(
                     "tool.execute.done",
                     format!(
@@ -8954,48 +9380,66 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text {
-                        text: text.clone(),
-                        cache_control: None,
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        tool_name,
-                        output,
-                        is_error,
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: render_tool_result_for_model(tool_name, output),
-                        }],
-                        is_error: *is_error,
-                        cache_control: None,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
+    let mut converted: Vec<InputMessage> = Vec::new();
+    let mut previous_source_was_tool = false;
+
+    for message in messages {
+        let source_is_tool = message.role == MessageRole::Tool;
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => InputContentBlock::Text {
+                    text: text.clone(),
+                    cache_control: None,
+                },
+                ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => InputContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: render_tool_result_for_model(tool_name, output),
+                    }],
+                    is_error: *is_error,
+                    cache_control: None,
+                },
             })
-        })
-        .collect()
+            .collect::<Vec<_>>();
+        if content.is_empty() {
+            continue;
+        }
+
+        if source_is_tool && previous_source_was_tool {
+            if let Some(last) = converted.last_mut() {
+                if last.role == "user" {
+                    last.content.extend(content);
+                    previous_source_was_tool = true;
+                    continue;
+                }
+            }
+        }
+
+        converted.push(InputMessage {
+            role: role.to_string(),
+            content,
+        });
+        previous_source_was_tool = source_is_tool;
+    }
+
+    converted
 }
 
 fn apply_message_cache_controls(messages: &mut [InputMessage]) {
@@ -9275,9 +9719,10 @@ mod tests {
     use super::{
         build_prompt_slash_command_initial_messages, build_runtime_plugin_state_with_loader,
         build_runtime_with_plugin_state, collect_session_prompt_history,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        create_managed_session_handle, debug_json_input_summary, describe_tool_progress,
+        filter_tool_specs, filter_tool_specs_for_request, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_prompt_slash_command_input, format_prompt_slash_command_metadata,
@@ -9285,20 +9730,24 @@ mod tests {
         format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        normalize_tool_input_string, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        should_log_stream_event_for_tool_diagnostics, should_log_streamed_tool_input_delta,
+        should_log_tool_stop_without_start, slash_command_completion_candidates_with_sessions,
+        status_context, summarize_tool_payload_for_markdown, track_tool_block_index,
+        validate_no_args, validate_tool_input_json, write_mcp_server_fixture, ApiStreamEvent,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, ContentBlockDeltaEvent, MessageResponse, OutputContentBlock, Usage};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -9306,8 +9755,10 @@ mod tests {
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
         ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        TurnExecutionPolicy,
     };
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -9824,6 +10275,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -9915,6 +10367,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -9946,6 +10399,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -9989,6 +10443,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -10119,6 +10574,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -10257,6 +10713,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
         assert_eq!(
@@ -10634,6 +11091,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
     }
@@ -10702,6 +11160,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
         assert_eq!(
@@ -10729,12 +11188,30 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                turn_policy: TurnExecutionPolicy::default(),
             }
         );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
+    }
+
+    #[test]
+    fn direct_simplify_prompt_sets_synchronous_agent_policy() {
+        let parsed = parse_args(&["/simplify".to_string(), "focus".to_string()])
+            .expect("/simplify should parse as prompt");
+        let CliAction::Prompt {
+            prompt,
+            turn_policy,
+            ..
+        } = parsed
+        else {
+            panic!("expected prompt action");
+        };
+
+        assert!(prompt.contains("# Simplify: Code Review and Cleanup"));
+        assert_eq!(turn_policy, TurnExecutionPolicy::synchronous_agents());
     }
 
     #[test]
@@ -11016,6 +11493,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"plugin_echo".to_string()));
+    }
+
+    #[test]
+    fn filtered_tool_specs_can_hide_background_task_tools() {
+        let filtered = filter_tool_specs_for_request(&GlobalToolRegistry::builtin(), None, true);
+        let names = filtered
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"Agent".to_string()));
+        assert!(!names.contains(&"TaskList".to_string()));
+        assert!(!names.contains(&"TaskOutput".to_string()));
+        assert!(!names.contains(&"TaskCreate".to_string()));
+        assert!(!names.contains(&"RunTaskPacket".to_string()));
     }
 
     #[test]
@@ -11846,6 +12338,48 @@ UU conflicted.rs",
         assert_eq!(converted[2].role, "user");
     }
 
+    #[test]
+    fn convert_messages_groups_consecutive_tool_results() {
+        let messages = vec![
+            ConversationMessage::user_text("launch reviews"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "Agent".to_string(),
+                    input: r#"{"prompt":"reuse"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "Agent".to_string(),
+                    input: r#"{"prompt":"quality"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-3".to_string(),
+                    name: "Agent".to_string(),
+                    input: r#"{"prompt":"efficiency"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("tool-1", "Agent", "reuse result", false),
+            ConversationMessage::tool_result("tool-2", "Agent", "quality result", false),
+            ConversationMessage::tool_result("tool-3", "Agent", "efficiency result", false),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[2].role, "user");
+        assert_eq!(converted[2].content.len(), 3);
+        let tool_result_ids = converted[2]
+            .content
+            .iter()
+            .map(|block| match block {
+                api::InputContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                other => panic!("expected only tool_result blocks, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_result_ids, vec!["tool-1", "tool-2", "tool-3"]);
+    }
+
     fn checkpoint_indices(messages: &[api::InputMessage]) -> Vec<usize> {
         messages
             .iter()
@@ -12044,17 +12578,20 @@ UU conflicted.rs",
                 let mut cli =
                     LiveCli::new("sonnet".to_string(), true, None, PermissionMode::ReadOnly)
                         .expect("live cli should initialize");
-                cli.run_prompt_json(&format!(
-                    "{SCENARIO_PREFIX}streaming_text turn-1 cache probe"
-                ))
+                cli.run_prompt_json(
+                    &format!("{SCENARIO_PREFIX}streaming_text turn-1 cache probe"),
+                    TurnExecutionPolicy::default(),
+                )
                 .expect("turn 1 should succeed");
-                cli.run_prompt_json(&format!(
-                    "{SCENARIO_PREFIX}streaming_text turn-2 cache probe"
-                ))
+                cli.run_prompt_json(
+                    &format!("{SCENARIO_PREFIX}streaming_text turn-2 cache probe"),
+                    TurnExecutionPolicy::default(),
+                )
                 .expect("turn 2 should succeed");
-                cli.run_prompt_json(&format!(
-                    "{SCENARIO_PREFIX}streaming_text turn-3 cache probe"
-                ))
+                cli.run_prompt_json(
+                    &format!("{SCENARIO_PREFIX}streaming_text turn-3 cache probe"),
+                    TurnExecutionPolicy::default(),
+                )
                 .expect("turn 3 should succeed");
             });
         }));
@@ -12496,16 +13033,17 @@ UU conflicted.rs",
     fn push_output_block_renders_markdown_text() {
         let mut out = Vec::new();
         let mut events = Vec::new();
-        let mut pending_tool = None;
+        let mut pending_tools = BTreeMap::new();
         let mut block_has_thinking_summary = false;
 
         push_output_block(
             OutputContentBlock::Text {
                 text: "# Heading".to_string(),
             },
+            0,
             &mut out,
             &mut events,
-            &mut pending_tool,
+            &mut pending_tools,
             false,
             &mut block_has_thinking_summary,
         )
@@ -12520,7 +13058,7 @@ UU conflicted.rs",
     fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
         let mut out = Vec::new();
         let mut events = Vec::new();
-        let mut pending_tool = None;
+        let mut pending_tools = BTreeMap::new();
         let mut block_has_thinking_summary = false;
 
         push_output_block(
@@ -12529,9 +13067,10 @@ UU conflicted.rs",
                 name: "read_file".to_string(),
                 input: json!({}),
             },
+            7,
             &mut out,
             &mut events,
-            &mut pending_tool,
+            &mut pending_tools,
             true,
             &mut block_has_thinking_summary,
         )
@@ -12539,9 +13078,192 @@ UU conflicted.rs",
 
         assert!(events.is_empty());
         assert_eq!(
-            pending_tool,
+            pending_tools.remove(&7),
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
         );
+    }
+
+    #[test]
+    fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tools = BTreeMap::new();
+        let mut block_has_thinking_summary = false;
+
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            1,
+            &mut out,
+            &mut events,
+            &mut pending_tools,
+            true,
+            &mut block_has_thinking_summary,
+        )
+        .expect("first tool block should accumulate");
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "tool-2".to_string(),
+                name: "grep_search".to_string(),
+                input: json!({}),
+            },
+            2,
+            &mut out,
+            &mut events,
+            &mut pending_tools,
+            true,
+            &mut block_has_thinking_summary,
+        )
+        .expect("second tool block should accumulate");
+
+        pending_tools
+            .get_mut(&1)
+            .expect("first tool pending")
+            .2
+            .push_str(r#"{"path":"src/main.rs"}"#);
+        pending_tools
+            .get_mut(&2)
+            .expect("second tool pending")
+            .2
+            .push_str(r#"{"pattern":"TODO"}"#);
+
+        assert_eq!(
+            pending_tools.remove(&1),
+            Some((
+                "tool-1".to_string(),
+                "read_file".to_string(),
+                r#"{"path":"src/main.rs"}"#.to_string(),
+            ))
+        );
+        assert_eq!(
+            pending_tools.remove(&2),
+            Some((
+                "tool-2".to_string(),
+                "grep_search".to_string(),
+                r#"{"pattern":"TODO"}"#.to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn tool_stop_without_start_diagnostic_ignores_text_block_stop() {
+        let mut tool_block_indices = BTreeSet::new();
+        track_tool_block_index(
+            &OutputContentBlock::Text {
+                text: String::new(),
+            },
+            0,
+            &mut tool_block_indices,
+        );
+
+        assert!(!should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            0
+        ));
+    }
+
+    #[test]
+    fn tool_stop_without_start_diagnostic_flags_tracked_tool_block_stop_once() {
+        let mut tool_block_indices = BTreeSet::new();
+        track_tool_block_index(
+            &OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            1,
+            &mut tool_block_indices,
+        );
+
+        assert!(should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            1
+        ));
+        assert!(!should_log_tool_stop_without_start(
+            &mut tool_block_indices,
+            1
+        ));
+    }
+
+    #[test]
+    fn stream_event_diagnostics_skip_high_volume_tool_input_deltas() {
+        let input_delta = ApiStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: api::ContentBlockDelta::InputJsonDelta {
+                partial_json: r#"{"path":"#.to_string(),
+            },
+        });
+        let text_delta = ApiStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: api::ContentBlockDelta::TextDelta {
+                text: "hello".to_string(),
+            },
+        });
+        let block_stop = ApiStreamEvent::ContentBlockStop(api::ContentBlockStopEvent { index: 0 });
+
+        assert!(!should_log_stream_event_for_tool_diagnostics(&input_delta));
+        assert!(!should_log_stream_event_for_tool_diagnostics(&text_delta));
+        assert!(should_log_stream_event_for_tool_diagnostics(&block_stop));
+    }
+
+    #[test]
+    fn streamed_tool_input_delta_diagnostics_are_sampled() {
+        assert!(!should_log_streamed_tool_input_delta(0));
+        assert!(should_log_streamed_tool_input_delta(1));
+        assert!(!should_log_streamed_tool_input_delta(2));
+        assert!(!should_log_streamed_tool_input_delta(31));
+        assert!(should_log_streamed_tool_input_delta(32));
+        assert!(!should_log_streamed_tool_input_delta(33));
+        assert!(should_log_streamed_tool_input_delta(64));
+    }
+
+    #[test]
+    fn streamed_empty_tool_input_normalizes_to_empty_object_on_stop() {
+        assert_eq!(normalize_tool_input_string(String::new()), "{}");
+        assert_eq!(normalize_tool_input_string("  ".to_string()), "{}");
+        assert_eq!(
+            normalize_tool_input_string(r#"{"path":"src/main.rs"}"#.to_string()),
+            r#"{"path":"src/main.rs"}"#
+        );
+    }
+
+    #[test]
+    fn streamed_tool_input_validation_rejects_truncated_json() {
+        let error = validate_tool_input_json(r#"{"path": "/mnt/d/ginobili/code/cpp_uti"#)
+            .expect_err("truncated input should be invalid");
+        assert!(error.contains("EOF") || error.contains("unterminated"));
+    }
+
+    #[test]
+    fn streamed_tool_input_validation_accepts_empty_after_normalization() {
+        validate_tool_input_json("").expect("empty streamed tool input normalizes to object");
+        validate_tool_input_json("  ").expect("blank streamed tool input normalizes to object");
+        validate_tool_input_json(r#"{"path":"src/main.rs"}"#).expect("valid JSON");
+    }
+
+    #[test]
+    fn debug_json_input_summary_includes_lengths_prefix_and_suffix() {
+        let summary = debug_json_input_summary(r#"{"description":"abc","name":"Review""#, 12);
+
+        assert!(summary.contains("input_bytes=36"));
+        assert!(summary.contains("input_chars=36"));
+        assert!(summary.contains("input_prefix="));
+        assert!(summary.contains("descript"));
+        assert!(summary.contains("input_suffix="));
+        assert!(summary.contains("Review"));
+    }
+
+    #[test]
+    fn cli_tool_executor_accepts_empty_input_for_empty_object_tools() {
+        let executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+        let output = executor
+            .execute_raw("TaskList", "")
+            .expect("empty input should be normalized to empty object JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert!(parsed["tasks"].is_array());
     }
 
     #[test]

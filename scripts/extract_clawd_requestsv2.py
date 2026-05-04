@@ -17,7 +17,19 @@ ENTRY_RE = re.compile(
     re.S,
 )
 
+ENTRY_HEADER_RE = re.compile(
+    r"^\[clawd-agent-debug ts=(?P<ts>.+?) "
+    r"pid=(?P<pid>\d+) "
+    r"thread=(?P<thread>.*?) "
+    r"tid=(?P<tid>ThreadId\(\d+\)) "
+    r"caller=(?P<caller>[^\]]+)\] "
+    r"(?P<event>\S+)"
+    r"(?: (?P<detail>.*))?$",
+    re.S,
+)
+
 TS_RE = re.compile(r"\[clawd-agent-debug ts=(?P<ts>.+?) pid=")
+THREAD_AGENT_RE = re.compile(r"thread=clawd-agent-(?P<agent_id>agent-\d+)")
 
 REQUEST_RE = re.compile(
     r"\] llm\.request "
@@ -72,6 +84,20 @@ PROMPT_CACHE_BREAK_RE = re.compile(
     r"\] cli\.provider\.stream\.prompt_cache_break (?P<body>.*)\s*$",
     re.S,
 )
+
+TOOL_STREAM_EVENTS = {
+    "cli.provider.stream.tool_start",
+    "cli.provider.stream.tool_input_delta",
+    "cli.provider.stream.tool_stop",
+    "agent.provider.stream.tool_start",
+    "agent.provider.stream.tool_input_delta",
+    "agent.provider.stream.tool_stop",
+}
+
+TOOL_INPUT_PARSE_ERROR_EVENTS = {
+    "tool.execute.input_json_parse_error",
+    "subagent.tool.execute.input_json_parse_error",
+}
 
 
 class RustDebugParser:
@@ -271,9 +297,337 @@ def split_entries(text: str) -> list[str]:
     return [match.group(1).strip() for match in ENTRY_RE.finditer(text)]
 
 
+def parse_entry_header(entry: str) -> dict[str, str] | None:
+    match = ENTRY_HEADER_RE.match(entry)
+    if not match:
+        return None
+    return {
+        key: value
+        for key, value in match.groupdict().items()
+        if value is not None
+    }
+
+
+def group_entries(entries: list[str]) -> list[str]:
+    grouped: list[str] = []
+    current_header: dict[str, str] | None = None
+    current_details: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_header, current_details
+        if current_header is None:
+            return
+        prefix = (
+            f"[clawd-agent-debug ts={current_header['ts']} "
+            f"pid={current_header['pid']} "
+            f"thread={current_header['thread']} "
+            f"tid={current_header['tid']} "
+            f"caller={current_header['caller']}] "
+            f"{current_header['event']}"
+        )
+        if current_details:
+            grouped.append(f"{prefix} " + "\n".join(current_details))
+        else:
+            grouped.append(prefix)
+        current_header = None
+        current_details = []
+
+    for entry in entries:
+        header = parse_entry_header(entry)
+        if header is None:
+            flush()
+            grouped.append(entry)
+            continue
+
+        signature = (
+            header["ts"],
+            header["pid"],
+            header["thread"],
+            header["tid"],
+            header["caller"],
+            header["event"],
+        )
+        current_signature = None
+        if current_header is not None:
+            current_signature = (
+                current_header["ts"],
+                current_header["pid"],
+                current_header["thread"],
+                current_header["tid"],
+                current_header["caller"],
+                current_header["event"],
+            )
+        if current_signature != signature:
+            flush()
+            current_header = header
+
+        current_details.append(header.get("detail", ""))
+
+    flush()
+    return grouped
+
+
 def parse_timestamp(entry: str) -> str | None:
     match = TS_RE.search(entry)
     return match.group("ts") if match else None
+
+
+def parse_thread_agent_id(entry: str) -> str | None:
+    match = THREAD_AGENT_RE.search(entry)
+    return match.group("agent_id") if match else None
+
+
+def parse_json_value(raw_value: Any) -> Any | None:
+    if isinstance(raw_value, (dict, list)):
+        return raw_value
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_rust_debug_value(raw_value: Any) -> Any | None:
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    try:
+        return RustDebugParser(raw_value).parse()
+    except ValueError:
+        return None
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "agent"
+
+
+def normalize_agent_name(raw_name: str | None, prompt: str | None = None) -> str:
+    text = " ".join(part for part in (raw_name, prompt) if part)
+    lower = text.lower()
+    if "quality" in lower:
+        return "Code Quality Review"
+    if "efficiency" in lower or "efficient" in lower:
+        return "Efficiency Review"
+    if "reuse" in lower:
+        return "Code Reuse Review"
+    return raw_name or "Subagent"
+
+
+def iter_request_blocks(llm_req: Any) -> list[dict[str, Any]]:
+    if not isinstance(llm_req, dict):
+        return []
+
+    blocks: list[dict[str, Any]] = []
+    messages = llm_req.get("messages")
+    if not isinstance(messages, list):
+        return blocks
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        message_blocks = message.get("blocks")
+        if not isinstance(message_blocks, list):
+            continue
+        for block in message_blocks:
+            if isinstance(block, dict):
+                blocks.append(block)
+    return blocks
+
+
+def iter_response_events(llm_resp: Any) -> list[dict[str, Any]]:
+    parsed = parse_rust_debug_value(llm_resp)
+    if not isinstance(parsed, list):
+        return []
+    return [event for event in parsed if isinstance(event, dict)]
+
+
+def request_system_text(llm_req: Any) -> str:
+    if not isinstance(llm_req, dict):
+        return ""
+    system_prompt = llm_req.get("system_prompt")
+    if not isinstance(system_prompt, list):
+        return ""
+    return "\n".join(part for part in system_prompt if isinstance(part, str))
+
+
+def request_user_text(llm_req: Any) -> str:
+    if not isinstance(llm_req, dict):
+        return ""
+    messages = llm_req.get("messages")
+    if not isinstance(messages, list):
+        return ""
+
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "User":
+            continue
+        blocks = message.get("blocks")
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "Text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def is_subagent_request(llm_req: Any) -> bool:
+    system_text = request_system_text(llm_req)
+    return "You are a background sub-agent" in system_text or (
+        "Work only on the delegated task" in system_text
+    )
+
+
+def collect_agent_launch_intents(
+    records: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    launches: list[dict[str, object]] = []
+
+    for record in records:
+        for event in iter_response_events(record.get("llm_resp")):
+            if event.get("type") != "ToolUse" or event.get("name") != "Agent":
+                continue
+            tool_use_id = event.get("id")
+            tool_input = parse_json_value(event.get("input"))
+            if not isinstance(tool_use_id, str) or not isinstance(tool_input, dict):
+                continue
+
+            description = tool_input.get("description")
+            if not isinstance(description, str):
+                description = None
+            prompt = tool_input.get("prompt")
+            if not isinstance(prompt, str):
+                prompt = None
+            raw_name = tool_input.get("name")
+            if not isinstance(raw_name, str):
+                raw_name = description
+
+            agent_name = normalize_agent_name(raw_name, prompt)
+            launches.append(
+                {
+                    "agent_name": agent_name,
+                    "agent_launcher_tool_use_id": tool_use_id,
+                    "agent_description": description,
+                    "agent_prompt": prompt,
+                }
+            )
+
+    return launches
+
+
+def find_matching_launch(
+    user_text: str, launches: list[dict[str, object]]
+) -> dict[str, object] | None:
+    for launch in reversed(launches):
+        prompt = launch.get("agent_prompt")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+        prompt_head = prompt[:200]
+        user_head = user_text[:200]
+        if (prompt_head and prompt_head in user_text) or (
+            user_head and user_head in prompt
+        ):
+            return launch
+    return None
+
+
+def collect_agent_launches(records: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    tool_inputs: dict[str, dict[str, object]] = {}
+    launches: dict[str, dict[str, object]] = {}
+
+    for record in records:
+        for block in iter_request_blocks(record.get("llm_req")):
+            block_type = block.get("type")
+
+            if block_type == "ToolUse" and block.get("name") == "Agent":
+                tool_use_id = block.get("id")
+                tool_input = parse_json_value(block.get("input"))
+                if isinstance(tool_use_id, str) and isinstance(tool_input, dict):
+                    tool_inputs[tool_use_id] = tool_input
+                continue
+
+            if block_type != "ToolResult" or block.get("tool_name") != "Agent":
+                continue
+
+            tool_use_id = block.get("tool_use_id")
+            output = parse_json_value(block.get("output"))
+            if not isinstance(tool_use_id, str) or not isinstance(output, dict):
+                continue
+
+            agent_id = output.get("agentId") or output.get("agent_id")
+            if not isinstance(agent_id, str):
+                continue
+
+            launch_input = tool_inputs.get(tool_use_id, {})
+            raw_name = launch_input.get("name")
+            if not isinstance(raw_name, str):
+                raw_name = output.get("name") if isinstance(output.get("name"), str) else None
+            prompt = launch_input.get("prompt")
+            if not isinstance(prompt, str):
+                prompt = output.get("prompt") if isinstance(output.get("prompt"), str) else None
+            description = launch_input.get("description")
+            if not isinstance(description, str):
+                description = (
+                    output.get("description")
+                    if isinstance(output.get("description"), str)
+                    else None
+                )
+
+            launches[agent_id] = {
+                "agent_id": agent_id,
+                "agent_name": normalize_agent_name(raw_name or description, prompt),
+                "agent_launcher_tool_use_id": tool_use_id,
+                "agent_description": description,
+                "agent_prompt": prompt,
+                "agent_output_file": output.get("outputFile"),
+            }
+
+    return launches
+
+
+def annotate_agent_metadata(records: list[dict[str, object]]) -> None:
+    launches = collect_agent_launches(records)
+    launch_intents = collect_agent_launch_intents(records)
+    rounds_by_agent: dict[str, int] = defaultdict(int)
+
+    for record in records:
+        agent_id = record.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            agent_id = "main"
+            record["agent_id"] = agent_id
+
+        if agent_id == "main" and is_subagent_request(record.get("llm_req")):
+            user_text = request_user_text(record.get("llm_req"))
+            launch = find_matching_launch(user_text, launch_intents)
+            if launch:
+                for key, value in launch.items():
+                    record[key] = value
+                agent_name = str(launch["agent_name"])
+            else:
+                agent_name = normalize_agent_name(None, user_text)
+                record["agent_name"] = agent_name
+                record["agent_launcher_tool_use_id"] = None
+
+            session_id = record.get("session_id")
+            agent_id = session_id if isinstance(session_id, str) else f"agent-{slugify(agent_name)}"
+            record["agent_id"] = agent_id
+            record["agent_role"] = "subagent"
+        elif agent_id == "main":
+            record["agent_role"] = "main"
+            record["agent_name"] = "Main"
+        else:
+            record["agent_role"] = "subagent"
+            metadata = launches.get(agent_id)
+            if metadata:
+                for key, value in metadata.items():
+                    record[key] = value
+            else:
+                record["agent_name"] = "Subagent"
+
+        rounds_by_agent[agent_id] += 1
+        record["agent_round"] = rounds_by_agent[agent_id]
 
 
 def parse_usage(response_text: str) -> dict[str, int | None]:
@@ -372,6 +726,242 @@ def parse_scalar_fields(fields: dict[str, str]) -> dict[str, object]:
     return parsed
 
 
+def parse_debug_field_value(value: str) -> object:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value in {"null", "None"}:
+        return None
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def parse_debug_fields(body: str) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for line in body.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        fields[key] = parse_debug_field_value(value.strip())
+    return fields
+
+
+def parse_event_and_body(entry: str) -> tuple[str | None, str]:
+    header = parse_entry_header(entry)
+    if header is None:
+        return None, ""
+    return header["event"], header.get("detail", "")
+
+
+def json_parse_status(raw_input: object) -> dict[str, object]:
+    if not isinstance(raw_input, str):
+        return {
+            "input_json_valid": False,
+            "input_json_error": "tool input is not a string",
+        }
+    try:
+        json.loads(raw_input)
+    except json.JSONDecodeError as error:
+        return {
+            "input_json_valid": False,
+            "input_json_error": str(error),
+        }
+    return {
+        "input_json_valid": True,
+        "input_json_error": None,
+    }
+
+
+def full_input_from_debug_summary(
+    fields: dict[str, object], label: str = "input"
+) -> str | None:
+    prefix = fields.get(f"{label}_prefix")
+    suffix = fields.get(f"{label}_suffix")
+    input_bytes = fields.get(f"{label}_bytes")
+    if not isinstance(prefix, str) or not isinstance(suffix, str):
+        return None
+    if prefix != suffix:
+        return None
+    if isinstance(input_bytes, int) and len(prefix.encode("utf-8")) != input_bytes:
+        return None
+    return prefix
+
+
+def update_tool_stream_delta_summary(
+    stream_tool: dict[str, object], fields: dict[str, object]
+) -> None:
+    summary = stream_tool.get("delta_summary")
+    if not isinstance(summary, dict):
+        summary = {
+            "count": 0,
+            "partial_bytes_total": 0,
+            "partial_chars_total": 0,
+        }
+        stream_tool["delta_summary"] = summary
+
+    summary["count"] = int(summary.get("count", 0)) + 1
+    partial_bytes = fields.get("partial_bytes")
+    if isinstance(partial_bytes, int):
+        summary["partial_bytes_total"] = int(summary.get("partial_bytes_total", 0)) + partial_bytes
+    partial_chars = fields.get("partial_chars")
+    if isinstance(partial_chars, int):
+        summary["partial_chars_total"] = int(summary.get("partial_chars_total", 0)) + partial_chars
+
+    for key in (
+        "accumulated_bytes",
+        "accumulated_chars",
+        "partial",
+        "accumulated_suffix",
+    ):
+        if key in fields:
+            summary[f"last_{key}"] = fields[key]
+
+
+def collect_tool_stream_diagnostic(
+    entry: str,
+    stream_tools_by_id: dict[str, dict[str, object]],
+    parse_errors: list[dict[str, object]],
+) -> bool:
+    event, body = parse_event_and_body(entry)
+    if event is None:
+        return False
+
+    if event in TOOL_INPUT_PARSE_ERROR_EVENTS:
+        fields = parse_debug_fields(body)
+        fields["event"] = event
+        fields["ts"] = parse_timestamp(entry)
+        parse_errors.append(fields)
+        return True
+
+    if event not in TOOL_STREAM_EVENTS:
+        return False
+
+    fields = parse_debug_fields(body)
+    tool_id = fields.get("tool_id")
+    if not isinstance(tool_id, str):
+        return True
+
+    stream_scope = "cli" if event.startswith("cli.") else "agent"
+    phase = event.rsplit(".", 1)[-1].removeprefix("tool_")
+    stream_tool = stream_tools_by_id.setdefault(
+        tool_id,
+        {
+            "tool_id": tool_id,
+            "stream_scope": stream_scope,
+        },
+    )
+    stream_tool["stream_scope"] = stream_scope
+    if "tool_name" in fields:
+        stream_tool["tool_name"] = fields["tool_name"]
+    if "session_id" in fields:
+        stream_tool["session_id"] = fields["session_id"]
+    if "model" in fields:
+        stream_tool["model"] = fields["model"]
+
+    if phase == "input_delta":
+        update_tool_stream_delta_summary(stream_tool, fields)
+        return True
+
+    fields["ts"] = parse_timestamp(entry)
+    stream_tool[phase] = fields
+
+    if phase == "stop":
+        full_input = full_input_from_debug_summary(
+            fields, "normalized_input"
+        ) or full_input_from_debug_summary(fields)
+        if full_input is not None:
+            stream_tool["input_full_available"] = True
+            stream_tool["input"] = full_input
+            stream_tool.update(json_parse_status(full_input))
+        else:
+            stream_tool["input_full_available"] = False
+
+    return True
+
+
+def parse_error_matches_stream_tool(
+    parse_error: dict[str, object], stream_tool: dict[str, object]
+) -> bool:
+    stop = stream_tool.get("stop")
+    if not isinstance(stop, dict):
+        return False
+    if parse_error.get("tool_name") != stream_tool.get("tool_name"):
+        return False
+    for key in ("input_bytes", "input_chars", "input_prefix", "input_suffix"):
+        if key in parse_error and key in stop and parse_error[key] != stop[key]:
+            return False
+    return True
+
+
+def attach_parse_errors_to_stream_tools(
+    stream_tools_by_id: dict[str, dict[str, object]],
+    parse_errors: list[dict[str, object]],
+) -> None:
+    for parse_error in parse_errors:
+        matches = [
+            stream_tool
+            for stream_tool in stream_tools_by_id.values()
+            if parse_error_matches_stream_tool(parse_error, stream_tool)
+        ]
+        if not matches:
+            continue
+        matches[-1]["execution_parse_error"] = parse_error
+
+
+def extract_response_tool_uses(
+    response_text: object,
+    stream_tools_by_id: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    if not isinstance(response_text, str):
+        return []
+
+    tool_uses: list[dict[str, object]] = []
+    for event in iter_response_events(response_text):
+        if event.get("type") != "ToolUse":
+            continue
+        tool_use_id = event.get("id")
+        tool_name = event.get("name")
+        tool_input = event.get("input")
+        tool_use: dict[str, object] = {
+            "id": tool_use_id,
+            "name": tool_name,
+            "input": tool_input,
+        }
+        tool_use.update(json_parse_status(tool_input))
+        if isinstance(tool_use_id, str):
+            stream_tool = stream_tools_by_id.get(tool_use_id)
+            if stream_tool is not None:
+                tool_use["stream"] = stream_tool
+                if "execution_parse_error" in stream_tool:
+                    tool_use["execution_parse_error"] = stream_tool[
+                        "execution_parse_error"
+                    ]
+        tool_uses.append(tool_use)
+    return tool_uses
+
+
+def annotate_tool_uses(
+    records: list[dict[str, object]],
+    stream_tools_by_id: dict[str, dict[str, object]],
+) -> None:
+    for record in records:
+        tool_uses = extract_response_tool_uses(record.get("llm_resp"), stream_tools_by_id)
+        record["tool_uses"] = tool_uses
+        record["invalid_tool_use_count"] = sum(
+            1 for tool_use in tool_uses if tool_use.get("input_json_valid") is False
+        )
+
+
 def parse_prompt_cache_summary(entry: str) -> dict[str, object] | None:
     match = PROMPT_CACHE_SUMMARY_RE.search(entry)
     if not match:
@@ -458,10 +1048,17 @@ def make_empty_record(record_index: int, session_id: str, iteration: int) -> dic
         "request_index": record_index,
         "session_id": session_id,
         "iteration": iteration,
+        "agent_role": None,
+        "agent_id": None,
+        "agent_name": None,
+        "agent_round": None,
+        "agent_launcher_tool_use_id": None,
         "request_ts": None,
         "response_ts": None,
         "llm_req": None,
         "llm_resp": None,
+        "tool_uses": [],
+        "invalid_tool_use_count": 0,
         "input_tokens": None,
         "output_tokens": None,
         "cache_creation_input_tokens": None,
@@ -472,12 +1069,19 @@ def make_empty_record(record_index: int, session_id: str, iteration: int) -> dic
 
 
 def extract_records(text: str) -> list[dict[str, object]]:
-    entries = split_entries(text)
+    entries = group_entries(split_entries(text))
     records: list[dict[str, object]] = []
     pending_requests: dict[tuple[str, int], deque[int]] = defaultdict(deque)
     active_request_by_session: dict[str, int] = {}
+    stream_tools_by_id: dict[str, dict[str, object]] = {}
+    tool_input_parse_errors: list[dict[str, object]] = []
 
     for entry in entries:
+        if collect_tool_stream_diagnostic(
+            entry, stream_tools_by_id, tool_input_parse_errors
+        ):
+            continue
+
         fingerprint = parse_prompt_cache_fingerprint(entry)
         if fingerprint:
             session_id = fingerprint.get("session_id")
@@ -559,6 +1163,7 @@ def extract_records(text: str) -> list[dict[str, object]]:
             session_id = request_match.group("session_id")
             iteration = int(request_match.group("iteration"))
             record = make_empty_record(len(records) + 1, session_id, iteration)
+            record["agent_id"] = parse_thread_agent_id(entry) or "main"
             record["request_ts"] = parse_timestamp(entry)
             record["llm_req"] = parse_api_request(request_match.group("llm_req").strip())
             records.append(record)
@@ -580,6 +1185,7 @@ def extract_records(text: str) -> list[dict[str, object]]:
             record = records[record_idx]
         else:
             record = make_empty_record(len(records) + 1, session_id, iteration)
+            record["agent_id"] = parse_thread_agent_id(entry) or "main"
             records.append(record)
             record_idx = len(records) - 1
 
@@ -609,6 +1215,9 @@ def extract_records(text: str) -> list[dict[str, object]]:
         if active_idx is not None and active_idx == record_idx:
             active_request_by_session.pop(session_id, None)
 
+    attach_parse_errors_to_stream_tools(stream_tools_by_id, tool_input_parse_errors)
+    annotate_agent_metadata(records)
+    annotate_tool_uses(records, stream_tools_by_id)
     return records
 
 
