@@ -15,8 +15,11 @@ pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
 };
 pub use prompt_cache::{
-    CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
-    PromptCacheStats,
+    apply_message_cache_controls, log_prompt_cache_block_diagnostics,
+    prompt_cache_block_diagnostics, summarize_prompt_cache_controls, CacheBreakEvent, PromptCache,
+    PromptCacheBlockDiagnostics, PromptCacheBreakpointDiagnostic, PromptCacheConfig,
+    PromptCacheControlSummary, PromptCachePaths, PromptCacheRecord, PromptCacheStats,
+    ToolResultSizeDiagnostic,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};

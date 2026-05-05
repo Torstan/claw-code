@@ -17,6 +17,7 @@ use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::session_memory_compact::refresh_session_memory;
 use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
 use crate::snip_compact::{snip_compact_session, SnipCompactionConfig};
+use crate::tool_result_budget::{is_persisted_tool_result_output, stabilize_tool_result_output};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -854,7 +855,16 @@ where
         );
 
         if !is_error {
-            output = truncate_large_tool_output(&prepared.tool_name, output);
+            output = stabilize_tool_result_output(
+                &self.session,
+                &prepared.tool_use_id,
+                &prepared.tool_name,
+                output,
+                false,
+            );
+            if !is_persisted_tool_result_output(&output) {
+                output = truncate_large_tool_output(&prepared.tool_name, output);
+            }
         }
 
         ConversationMessage::tool_result(prepared.tool_use_id, prepared.tool_name, output, is_error)
@@ -1606,6 +1616,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stores_large_edit_file_tool_result_as_persisted_output() {
+        struct LargeEditApi {
+            calls: usize,
+        }
+
+        impl ApiClient for LargeEditApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-large-edit".to_string(),
+                            name: "edit_file".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let output = tool_result_outputs_from_messages(&request.messages)
+                            .pop()
+                            .expect("post-tool request should include a tool result");
+                        assert!(output.starts_with("<persisted-output>"));
+                        assert!(output.contains("Preview (first 2.0 KB):"));
+                        assert!(output.ends_with("</persisted-output>"));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let path = temp_session_path("large-edit-result");
+        let session = Session::new().with_persistence_path(path.clone());
+        let session_id = session.session_id.clone();
+        let large_output = "patched-line\n".repeat(2_000);
+        let mut runtime = ConversationRuntime::new(
+            session,
+            LargeEditApi { calls: 0 },
+            StaticToolExecutor::new().register("edit_file", {
+                let large_output = large_output.clone();
+                move |_input| Ok(large_output.clone())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("edit the file", None)
+            .expect("large edit_file result should not fail the turn");
+
+        let output = tool_result_outputs(runtime.session())
+            .pop()
+            .expect("session should contain persisted-output tool result");
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(output.starts_with("<persisted-output>"));
+        assert!(!output.contains(&large_output));
+
+        let persisted = path
+            .parent()
+            .expect("session path should have parent")
+            .join("tool-results")
+            .join(session_id)
+            .join("tool-large-edit.txt");
+        assert_eq!(
+            fs::read_to_string(&persisted).expect("persisted tool result should read"),
+            large_output
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(persisted).ok();
     }
 
     #[test]
@@ -2751,8 +2837,13 @@ mod tests {
     }
 
     fn tool_result_outputs(session: &Session) -> Vec<String> {
-        session
-            .messages
+        tool_result_outputs_from_messages(&session.messages)
+    }
+
+    fn tool_result_outputs_from_messages(
+        messages: &[crate::session::ConversationMessage],
+    ) -> Vec<String> {
+        messages
             .iter()
             .flat_map(|message| message.blocks.iter())
             .filter_map(|block| match block {

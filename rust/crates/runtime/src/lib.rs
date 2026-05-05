@@ -53,12 +53,13 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+mod tool_result_budget;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
-pub use agent_debug::agent_debug_log;
+pub use agent_debug::{agent_debug_enabled, agent_debug_log};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

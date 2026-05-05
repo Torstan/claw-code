@@ -93,7 +93,7 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> Option<String> {
     }
 }
 
-fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

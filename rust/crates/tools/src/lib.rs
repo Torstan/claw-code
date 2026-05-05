@@ -4,11 +4,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    detect_provider_kind, max_tokens_for_model, read_base_url, resolve_model_alias,
-    resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemContentBlock,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    apply_message_cache_controls, detect_provider_kind, log_prompt_cache_block_diagnostics,
+    max_tokens_for_model, read_base_url, resolve_model_alias, resolve_startup_auth_source,
+    summarize_prompt_cache_controls, AnthropicClient, ApiError, AuthSource, CacheControl,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
+    SystemContentBlock, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -4407,22 +4408,14 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_definitions_for_request_tools(
+        let mut tools = tool_definitions_for_request_tools(
             &self.allowed_tools,
             request.suppress_background_task_tools,
         );
-        let messages = convert_messages(&request.messages);
-        let system = if request.system_prompt.is_empty() {
-            None
-        } else {
-            Some(
-                request
-                    .system_prompt
-                    .iter()
-                    .map(|part| SystemContentBlock::text(part.clone()))
-                    .collect(),
-            )
-        };
+        apply_tool_cache_controls(&mut tools);
+        let mut messages = convert_messages(&request.messages);
+        apply_message_cache_controls(&mut messages);
+        let system = build_system_blocks_with_cache_controls(&request.system_prompt);
         let tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -4452,6 +4445,31 @@ impl ApiClient for ProviderRuntimeClient {
                 stream: true,
                 ..Default::default()
             };
+            let prompt_cache_summary = summarize_prompt_cache_controls(&message_request);
+            let cache_control_types_json =
+                serde_json::to_string(&prompt_cache_summary.cache_control_types)
+                    .unwrap_or_else(|_| "[]".to_string());
+            agent_debug_log(
+                "agent.provider.stream.prompt_cache",
+                format!(
+                    "session_id={} model={} message_count={} cache_enabled={} cache_control_count={} cache_control_types={} system_cache_control_count={} tool_cache_control_count={} message_cache_control_count={}",
+                    self.session_id,
+                    entry.model,
+                    message_request.messages.len(),
+                    prompt_cache_summary.enabled,
+                    prompt_cache_summary.cache_control_count,
+                    cache_control_types_json,
+                    prompt_cache_summary.system_cache_control_count,
+                    prompt_cache_summary.tool_cache_control_count,
+                    prompt_cache_summary.message_cache_control_count
+                ),
+            );
+            log_prompt_cache_block_diagnostics(
+                "agent",
+                &self.session_id,
+                &entry.model,
+                &message_request,
+            );
 
             let attempt = runtime.block_on(stream_with_provider(
                 &entry.client,
@@ -4960,6 +4978,26 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             })
         })
         .collect()
+}
+
+fn build_system_blocks_with_cache_controls(parts: &[String]) -> Option<Vec<SystemContentBlock>> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut blocks = parts
+        .iter()
+        .map(|part| SystemContentBlock::text(part.clone()))
+        .collect::<Vec<_>>();
+    if let Some(first) = blocks.first_mut() {
+        first.cache_control = Some(CacheControl::ephemeral());
+    }
+    Some(blocks)
+}
+
+fn apply_tool_cache_controls(tools: &mut [ToolDefinition]) {
+    if let Some(last_tool) = tools.last_mut() {
+        last_tool.cache_control = Some(CacheControl::ephemeral());
+    }
 }
 
 fn push_output_block(
@@ -6331,11 +6369,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, debug_json_input_summary, derive_agent_state,
-        enqueue_background_agent_notification, execute_agent_with_mode, execute_agent_with_spawn,
-        execute_tool, final_assistant_text, global_task_registry, maybe_commit_provenance,
-        mvp_tool_specs, new_agent_session, normalize_tool_input_string,
+        agent_permission_policy, allowed_tools_for_subagent, apply_message_cache_controls,
+        apply_tool_cache_controls, build_agent_system_prompt,
+        build_system_blocks_with_cache_controls, classify_lane_failure, debug_json_input_summary,
+        derive_agent_state, enqueue_background_agent_notification, execute_agent_with_mode,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, global_task_registry,
+        maybe_commit_provenance, mvp_tool_specs, new_agent_session, normalize_tool_input_string,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         render_tool_result_for_model, run_task_output, run_task_packet,
         should_log_tool_stop_without_start, tool_specs_for_allowed_tools, track_tool_block_index,
@@ -6346,8 +6385,9 @@ mod tests {
     use runtime::ProviderFallbackConfig;
     use runtime::{
         drain_session_notifications, permission_enforcer::PermissionEnforcer,
-        with_active_tool_session, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode,
-        PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        with_active_tool_session, ApiRequest, AssistantEvent, ConversationMessage,
+        ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -6442,6 +6482,63 @@ mod tests {
         assert!(!names.contains(&"TaskList"));
         assert!(!names.contains(&"TaskOutput"));
         assert!(!names.contains(&"RunTaskPacket"));
+    }
+
+    #[test]
+    fn subagent_provider_requests_get_prompt_cache_controls() {
+        let source_messages = vec![
+            ConversationMessage::user_text("first prompt"),
+            ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "assistant text".to_string(),
+            }]),
+            ConversationMessage::tool_result("tool-1", "bash", "tool output", false),
+        ];
+        let mut messages = super::convert_messages(&source_messages);
+        apply_message_cache_controls(&mut messages);
+
+        let mut tools = vec![api::ToolDefinition {
+            name: "bash".to_string(),
+            description: None,
+            input_schema: json!({}),
+            cache_control: None,
+        }];
+        apply_tool_cache_controls(&mut tools);
+
+        let system = build_system_blocks_with_cache_controls(&[
+            "stable system".to_string(),
+            "dynamic system".to_string(),
+        ])
+        .expect("system blocks should be built");
+
+        let request = api::MessageRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages,
+            system: Some(system),
+            tools: Some(tools),
+            stream: true,
+            ..Default::default()
+        };
+
+        let summary = api::summarize_prompt_cache_controls(&request);
+        assert!(summary.enabled);
+        assert_eq!(summary.system_cache_control_count, 1);
+        assert_eq!(summary.tool_cache_control_count, 1);
+        assert_eq!(summary.message_cache_control_count, 1);
+        assert_eq!(summary.cache_control_count, 3);
+
+        assert!(request
+            .system
+            .as_ref()
+            .expect("system blocks should exist")
+            .first()
+            .is_some_and(|block| block.cache_control.is_some()));
+        assert!(request
+            .tools
+            .as_ref()
+            .expect("tools should exist")
+            .last()
+            .is_some_and(|tool| tool.cache_control.is_some()));
     }
 
     #[test]

@@ -24,11 +24,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, CacheControl, ContentBlockDelta, ContextManagement, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputConfig, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    SystemContentBlock, ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    apply_message_cache_controls, detect_provider_kind, log_prompt_cache_block_diagnostics,
+    oauth_token_is_expired, resolve_startup_auth_source, summarize_prompt_cache_controls,
+    AnthropicClient, AuthSource, CacheControl, ContentBlockDelta, ContextManagement,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputConfig,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, SystemContentBlock, ThinkingConfig, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -7418,6 +7420,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 prompt_cache_summary.message_cache_control_count
             ),
         );
+        log_prompt_cache_block_diagnostics("cli", &self.session_id, &self.model, &message_request);
         let tool_count = message_request.tools.as_ref().map_or(0, Vec::len);
         let max_attempts: usize = if is_post_tool { 2 } else { 1 };
         let total_started_at = Instant::now();
@@ -9442,113 +9445,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     converted
 }
 
-fn apply_message_cache_controls(messages: &mut [InputMessage]) {
-    // Only mark the LAST user message.  Older user messages must never receive
-    // cache_control — not even temporarily — so the serialized prefix stays
-    // byte-identical as the conversation grows.  This matches Claude Code's
-    // strategy: 1 message breakpoint + 2 system breakpoints = 3 total.
-    if let Some(idx) = messages.iter().rposition(is_cacheable_user_message) {
-        set_user_cache_control(&mut messages[idx]);
-    }
-}
-
 fn apply_tool_cache_controls(tools: &mut Option<Vec<ToolDefinition>>) {
     let Some(tool_list) = tools.as_mut() else {
         return;
     };
     if let Some(last_tool) = tool_list.last_mut() {
         last_tool.cache_control = Some(CacheControl::ephemeral());
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PromptCacheControlSummary {
-    enabled: bool,
-    cache_control_count: usize,
-    cache_control_types: Vec<String>,
-    system_cache_control_count: usize,
-    tool_cache_control_count: usize,
-    message_cache_control_count: usize,
-}
-
-fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheControlSummary {
-    let mut cache_control_types = BTreeSet::new();
-
-    let mut record_cache_control = |cache_control: &Option<CacheControl>| -> usize {
-        let Some(cache_control) = cache_control else {
-            return 0;
-        };
-        cache_control_types.insert(cache_control.kind.clone());
-        1
-    };
-
-    let system_cache_control_count = request.system.as_ref().map_or(0, |blocks| {
-        blocks
-            .iter()
-            .map(|block| record_cache_control(&block.cache_control))
-            .sum()
-    });
-    let tool_cache_control_count = request.tools.as_ref().map_or(0, |tools| {
-        tools
-            .iter()
-            .map(|tool| record_cache_control(&tool.cache_control))
-            .sum()
-    });
-    let message_cache_control_count = request
-        .messages
-        .iter()
-        .map(|message| {
-            message
-                .content
-                .iter()
-                .map(|block| match block {
-                    InputContentBlock::Text { cache_control, .. }
-                    | InputContentBlock::ToolResult { cache_control, .. } => {
-                        record_cache_control(cache_control)
-                    }
-                    InputContentBlock::ToolUse { .. } => 0,
-                })
-                .sum::<usize>()
-        })
-        .sum::<usize>();
-
-    let cache_control_count =
-        system_cache_control_count + tool_cache_control_count + message_cache_control_count;
-    PromptCacheControlSummary {
-        enabled: cache_control_count > 0,
-        cache_control_count,
-        cache_control_types: cache_control_types.into_iter().collect(),
-        system_cache_control_count,
-        tool_cache_control_count,
-        message_cache_control_count,
-    }
-}
-
-fn is_cacheable_user_message(message: &InputMessage) -> bool {
-    message.role == "user"
-        && message
-            .content
-            .last()
-            .is_some_and(is_cacheable_user_content_block)
-}
-
-fn is_cacheable_user_content_block(block: &InputContentBlock) -> bool {
-    matches!(
-        block,
-        InputContentBlock::Text { .. } | InputContentBlock::ToolResult { .. }
-    )
-}
-
-fn set_user_cache_control(message: &mut InputMessage) {
-    let Some(last_block) = message.content.last_mut() else {
-        return;
-    };
-    match last_block {
-        InputContentBlock::Text { cache_control, .. }
-        | InputContentBlock::ToolResult { cache_control, .. } => {
-            *cache_control = Some(CacheControl::ephemeral());
-        }
-        InputContentBlock::ToolUse { .. } => {}
     }
 }
 

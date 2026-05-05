@@ -1,12 +1,16 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runtime::agent_debug_log;
+use runtime::{agent_debug_enabled, agent_debug_log};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{InputContentBlock, MessageRequest, MessageResponse, Usage};
+use crate::types::{
+    CacheControl, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    ToolResultContentBlock, Usage,
+};
 
 const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
@@ -16,6 +20,57 @@ const REQUEST_FINGERPRINT_VERSION: u32 = 1;
 const REQUEST_FINGERPRINT_PREFIX: &str = "v1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const OPUS_4_6_MIN_CACHE_TOKENS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptCacheControlSummary {
+    pub enabled: bool,
+    pub cache_control_count: usize,
+    pub cache_control_types: Vec<String>,
+    pub system_cache_control_count: usize,
+    pub tool_cache_control_count: usize,
+    pub message_cache_control_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromptCacheBlockDiagnostics {
+    pub total_content_blocks: usize,
+    pub cache_breakpoints: Vec<PromptCacheBreakpointDiagnostic>,
+    pub tool_results: Vec<ToolResultSizeDiagnostic>,
+    pub tool_result_model_visible_chars_total: usize,
+    pub tool_result_model_visible_bytes_total: usize,
+    pub max_tool_result_model_visible_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromptCacheBreakpointDiagnostic {
+    pub block_index: usize,
+    pub section: &'static str,
+    pub block_type: &'static str,
+    pub message_index: Option<usize>,
+    pub content_index: Option<usize>,
+    pub tool_name: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub distance_from_previous_breakpoint: Option<usize>,
+    pub prefix_serialized_chars_estimate: usize,
+    pub estimated_prefix_tokens: usize,
+    pub below_opus_4_6_min_cache_tokens: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolResultSizeDiagnostic {
+    pub block_index: usize,
+    pub message_index: usize,
+    pub content_index: usize,
+    pub tool_use_id: String,
+    pub tool_name: Option<String>,
+    pub model_visible_chars: usize,
+    pub model_visible_bytes: usize,
+    pub serialized_block_chars_estimate: usize,
+    pub is_error: bool,
+    pub has_cache_control: bool,
+    pub in_cached_prefix: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct PromptCacheConfig {
@@ -23,6 +78,343 @@ pub struct PromptCacheConfig {
     pub completion_ttl: Duration,
     pub prompt_ttl: Duration,
     pub cache_break_min_drop: u32,
+}
+
+#[must_use]
+pub fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheControlSummary {
+    let mut cache_control_types = BTreeSet::new();
+
+    let mut record_cache_control = |cache_control: &Option<CacheControl>| -> usize {
+        let Some(cache_control) = cache_control else {
+            return 0;
+        };
+        cache_control_types.insert(cache_control.kind.clone());
+        1
+    };
+
+    let system_cache_control_count = request.system.as_ref().map_or(0, |blocks| {
+        blocks
+            .iter()
+            .map(|block| record_cache_control(&block.cache_control))
+            .sum()
+    });
+    let tool_cache_control_count = request.tools.as_ref().map_or(0, |tools| {
+        tools
+            .iter()
+            .map(|tool| record_cache_control(&tool.cache_control))
+            .sum()
+    });
+    let message_cache_control_count = request
+        .messages
+        .iter()
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .map(|block| match block {
+                    InputContentBlock::Text { cache_control, .. }
+                    | InputContentBlock::ToolResult { cache_control, .. } => {
+                        record_cache_control(cache_control)
+                    }
+                    InputContentBlock::ToolUse { .. } => 0,
+                })
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+
+    let cache_control_count =
+        system_cache_control_count + tool_cache_control_count + message_cache_control_count;
+    PromptCacheControlSummary {
+        enabled: cache_control_count > 0,
+        cache_control_count,
+        cache_control_types: cache_control_types.into_iter().collect(),
+        system_cache_control_count,
+        tool_cache_control_count,
+        message_cache_control_count,
+    }
+}
+
+#[must_use]
+pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBlockDiagnostics {
+    let mut scanner = PromptCacheBlockScanner::default();
+    let mut tool_name_by_id: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            let block_index = scanner.next_block_index();
+            let block_chars = serialized_len(tool);
+            scanner.add_prefix_chars(block_chars);
+            if tool.cache_control.is_some() {
+                scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
+                    block_index,
+                    section: "tools",
+                    block_type: "tool",
+                    message_index: None,
+                    content_index: None,
+                    tool_name: Some(tool.name.clone()),
+                    tool_use_id: None,
+                    distance_from_previous_breakpoint: None,
+                    prefix_serialized_chars_estimate: 0,
+                    estimated_prefix_tokens: 0,
+                    below_opus_4_6_min_cache_tokens: false,
+                });
+            }
+        }
+    }
+
+    if let Some(system_blocks) = &request.system {
+        for block in system_blocks {
+            let block_index = scanner.next_block_index();
+            let block_chars = serialized_len(block);
+            scanner.add_prefix_chars(block_chars);
+            if block.cache_control.is_some() {
+                scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
+                    block_index,
+                    section: "system",
+                    block_type: "text",
+                    message_index: None,
+                    content_index: None,
+                    tool_name: None,
+                    tool_use_id: None,
+                    distance_from_previous_breakpoint: None,
+                    prefix_serialized_chars_estimate: 0,
+                    estimated_prefix_tokens: 0,
+                    below_opus_4_6_min_cache_tokens: false,
+                });
+            }
+        }
+    }
+
+    for (message_index, message) in request.messages.iter().enumerate() {
+        for (content_index, block) in message.content.iter().enumerate() {
+            let block_index = scanner.next_block_index();
+            let block_chars = serialized_len(block);
+            scanner.add_prefix_chars(block_chars);
+            match block {
+                InputContentBlock::Text { cache_control, .. } => {
+                    if cache_control.is_some() {
+                        scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
+                            block_index,
+                            section: "messages",
+                            block_type: "text",
+                            message_index: Some(message_index),
+                            content_index: Some(content_index),
+                            tool_name: None,
+                            tool_use_id: None,
+                            distance_from_previous_breakpoint: None,
+                            prefix_serialized_chars_estimate: 0,
+                            estimated_prefix_tokens: 0,
+                            below_opus_4_6_min_cache_tokens: false,
+                        });
+                    }
+                }
+                InputContentBlock::ToolUse { id, name, .. } => {
+                    tool_name_by_id.insert(id.clone(), name.clone());
+                }
+                InputContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    cache_control,
+                } => {
+                    let (model_visible_chars, model_visible_bytes) =
+                        tool_result_model_visible_size(content);
+                    scanner.tool_results.push(ToolResultSizeDiagnostic {
+                        block_index,
+                        message_index,
+                        content_index,
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name: tool_name_by_id.get(tool_use_id).cloned(),
+                        model_visible_chars,
+                        model_visible_bytes,
+                        serialized_block_chars_estimate: block_chars,
+                        is_error: *is_error,
+                        has_cache_control: cache_control.is_some(),
+                        in_cached_prefix: false,
+                    });
+                    if cache_control.is_some() {
+                        scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
+                            block_index,
+                            section: "messages",
+                            block_type: "tool_result",
+                            message_index: Some(message_index),
+                            content_index: Some(content_index),
+                            tool_name: tool_name_by_id.get(tool_use_id).cloned(),
+                            tool_use_id: Some(tool_use_id.clone()),
+                            distance_from_previous_breakpoint: None,
+                            prefix_serialized_chars_estimate: 0,
+                            estimated_prefix_tokens: 0,
+                            below_opus_4_6_min_cache_tokens: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    scanner.finish()
+}
+
+#[derive(Default)]
+struct PromptCacheBlockScanner {
+    total_content_blocks: usize,
+    prefix_serialized_chars_estimate: usize,
+    last_breakpoint_index: Option<usize>,
+    cache_breakpoints: Vec<PromptCacheBreakpointDiagnostic>,
+    tool_results: Vec<ToolResultSizeDiagnostic>,
+}
+
+impl PromptCacheBlockScanner {
+    fn next_block_index(&mut self) -> usize {
+        let block_index = self.total_content_blocks;
+        self.total_content_blocks += 1;
+        block_index
+    }
+
+    fn add_prefix_chars(&mut self, chars: usize) {
+        self.prefix_serialized_chars_estimate += chars;
+    }
+
+    fn push_breakpoint(&mut self, mut breakpoint: PromptCacheBreakpointDiagnostic) {
+        let estimated_prefix_tokens =
+            estimate_prompt_cache_tokens(self.prefix_serialized_chars_estimate);
+        breakpoint.distance_from_previous_breakpoint = self
+            .last_breakpoint_index
+            .map(|idx| breakpoint.block_index - idx);
+        breakpoint.prefix_serialized_chars_estimate = self.prefix_serialized_chars_estimate;
+        breakpoint.estimated_prefix_tokens = estimated_prefix_tokens;
+        breakpoint.below_opus_4_6_min_cache_tokens =
+            estimated_prefix_tokens < OPUS_4_6_MIN_CACHE_TOKENS;
+        self.last_breakpoint_index = Some(breakpoint.block_index);
+        self.cache_breakpoints.push(breakpoint);
+    }
+
+    fn finish(mut self) -> PromptCacheBlockDiagnostics {
+        if let Some(last_breakpoint_index) = self.last_breakpoint_index {
+            for tool_result in &mut self.tool_results {
+                tool_result.in_cached_prefix = tool_result.block_index <= last_breakpoint_index;
+            }
+        }
+        let tool_result_model_visible_chars_total = self
+            .tool_results
+            .iter()
+            .map(|result| result.model_visible_chars)
+            .sum();
+        let tool_result_model_visible_bytes_total = self
+            .tool_results
+            .iter()
+            .map(|result| result.model_visible_bytes)
+            .sum();
+        let max_tool_result_model_visible_chars = self
+            .tool_results
+            .iter()
+            .map(|result| result.model_visible_chars)
+            .max()
+            .unwrap_or(0);
+        PromptCacheBlockDiagnostics {
+            total_content_blocks: self.total_content_blocks,
+            cache_breakpoints: self.cache_breakpoints,
+            tool_results: self.tool_results,
+            tool_result_model_visible_chars_total,
+            tool_result_model_visible_bytes_total,
+            max_tool_result_model_visible_chars,
+        }
+    }
+}
+
+fn estimate_prompt_cache_tokens(chars: usize) -> usize {
+    chars.div_ceil(4)
+}
+
+fn serialized_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_string(value).map_or(0, |serialized| serialized.len())
+}
+
+fn tool_result_model_visible_size(content: &[ToolResultContentBlock]) -> (usize, usize) {
+    content.iter().fold((0, 0), |(chars, bytes), block| {
+        let rendered = match block {
+            ToolResultContentBlock::Text { text } => text.as_str().to_string(),
+            ToolResultContentBlock::Json { value } => {
+                serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+            }
+        };
+        (chars + rendered.chars().count(), bytes + rendered.len())
+    })
+}
+
+pub fn log_prompt_cache_block_diagnostics(
+    log_prefix: &str,
+    session_id: &str,
+    model: &str,
+    request: &MessageRequest,
+) {
+    if !agent_debug_enabled() {
+        return;
+    }
+    let diagnostics = prompt_cache_block_diagnostics(request);
+    let cache_breakpoints_json =
+        serde_json::to_string(&diagnostics.cache_breakpoints).unwrap_or_else(|_| "[]".to_string());
+    agent_debug_log(
+        &format!("{log_prefix}.provider.stream.prompt_cache_blocks"),
+        format!(
+            "session_id={} model={} total_content_blocks={} cache_breakpoints={} tool_result_count={} tool_result_model_visible_chars_total={} tool_result_model_visible_bytes_total={} max_tool_result_model_visible_chars={}",
+            session_id,
+            model,
+            diagnostics.total_content_blocks,
+            cache_breakpoints_json,
+            diagnostics.tool_results.len(),
+            diagnostics.tool_result_model_visible_chars_total,
+            diagnostics.tool_result_model_visible_bytes_total,
+            diagnostics.max_tool_result_model_visible_chars
+        ),
+    );
+
+    if diagnostics.tool_results.is_empty() {
+        return;
+    }
+    let tool_results_json =
+        serde_json::to_string(&diagnostics.tool_results).unwrap_or_else(|_| "[]".to_string());
+    agent_debug_log(
+        &format!("{log_prefix}.provider.stream.tool_result_sizes"),
+        format!(
+            "session_id={} model={} tool_results={}",
+            session_id, model, tool_results_json
+        ),
+    );
+}
+
+pub fn apply_message_cache_controls(messages: &mut [InputMessage]) {
+    if let Some(idx) = messages.iter().rposition(is_cacheable_user_message) {
+        set_user_cache_control(&mut messages[idx]);
+    }
+}
+
+fn is_cacheable_user_message(message: &InputMessage) -> bool {
+    message.role == "user"
+        && message
+            .content
+            .last()
+            .is_some_and(is_cacheable_user_content_block)
+}
+
+fn is_cacheable_user_content_block(block: &InputContentBlock) -> bool {
+    matches!(
+        block,
+        InputContentBlock::Text { .. } | InputContentBlock::ToolResult { .. }
+    )
+}
+
+fn set_user_cache_control(message: &mut InputMessage) {
+    let Some(last_block) = message.content.last_mut() else {
+        return;
+    };
+    match last_block {
+        InputContentBlock::Text { cache_control, .. }
+        | InputContentBlock::ToolResult { cache_control, .. } => {
+            *cache_control = Some(CacheControl::ephemeral());
+        }
+        InputContentBlock::ToolUse { .. } => {}
+    }
 }
 
 impl PromptCacheConfig {
@@ -741,12 +1133,13 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, PromptCache,
-        PromptCacheConfig, PromptCachePaths, TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
+        detect_cache_break, prompt_cache_block_diagnostics, read_json, request_hash_hex,
+        sanitize_path_segment, PromptCache, PromptCacheConfig, PromptCachePaths,
+        TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
     };
     use crate::types::{
-        InputMessage, MessageRequest, MessageResponse, OutputContentBlock, SystemContentBlock,
-        Usage,
+        CacheControl, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+        OutputContentBlock, SystemContentBlock, ToolDefinition, ToolResultContentBlock, Usage,
     };
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1004,6 +1397,76 @@ mod tests {
         let second = request_hash_hex(&request);
         assert_eq!(first, second);
         assert!(first.starts_with(REQUEST_FINGERPRINT_PREFIX));
+    }
+
+    #[test]
+    fn prompt_cache_block_diagnostics_reports_model_visible_tool_result_size() {
+        let request = MessageRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            tools: Some(vec![ToolDefinition {
+                name: "edit_file".to_string(),
+                description: Some("Edit a file".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: Some(CacheControl::ephemeral()),
+            }]),
+            system: Some(vec![SystemContentBlock::text("stable system")
+                .with_cache_control(CacheControl::ephemeral())]),
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "edit_file".to_string(),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "tool-1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "visible output".to_string(),
+                        }],
+                        is_error: false,
+                        cache_control: Some(CacheControl::ephemeral()),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let diagnostics = prompt_cache_block_diagnostics(&request);
+
+        assert_eq!(diagnostics.total_content_blocks, 4);
+        assert_eq!(
+            diagnostics
+                .cache_breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.block_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
+        assert_eq!(
+            diagnostics
+                .cache_breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.distance_from_previous_breakpoint)
+                .collect::<Vec<_>>(),
+            vec![None, Some(1), Some(2)]
+        );
+        assert_eq!(diagnostics.tool_results.len(), 1);
+        let result = diagnostics
+            .tool_results
+            .first()
+            .expect("tool result diagnostic should be recorded");
+        assert_eq!(result.block_index, 3);
+        assert_eq!(result.tool_use_id, "tool-1");
+        assert_eq!(result.tool_name.as_deref(), Some("edit_file"));
+        assert_eq!(result.model_visible_chars, "visible output".chars().count());
+        assert_eq!(result.model_visible_bytes, "visible output".len());
+        assert!(result.has_cache_control);
+        assert!(result.in_cached_prefix);
     }
 
     fn sample_request(text: &str) -> MessageRequest {

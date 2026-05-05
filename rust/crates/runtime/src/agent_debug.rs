@@ -50,6 +50,10 @@ fn agent_debug_dir() -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
+pub fn agent_debug_enabled() -> bool {
+    agent_debug_dir().is_some()
+}
+
 #[track_caller]
 pub fn agent_debug_log(event: &str, detail: impl AsRef<str>) {
     let Some(dir) = agent_debug_dir() else {

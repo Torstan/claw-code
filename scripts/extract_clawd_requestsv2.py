@@ -66,12 +66,12 @@ PROMPT_CACHE_FIELD_RE = re.compile(
 )
 
 PROMPT_CACHE_SUMMARY_RE = re.compile(
-    r"\] cli\.provider\.stream\.prompt_cache (?P<body>.*)\s*$",
+    r"\] (?:cli|agent)\.provider\.stream\.prompt_cache (?P<body>.*)\s*$",
     re.S,
 )
 
 PROMPT_CACHE_USAGE_RE = re.compile(
-    r"\] cli\.provider\.stream\.usage (?P<body>.*)\s*$",
+    r"\] (?:cli|agent)\.provider\.stream\.usage (?P<body>.*)\s*$",
     re.S,
 )
 
@@ -82,6 +82,16 @@ PROMPT_CACHE_FINGERPRINT_RE = re.compile(
 
 PROMPT_CACHE_BREAK_RE = re.compile(
     r"\] cli\.provider\.stream\.prompt_cache_break (?P<body>.*)\s*$",
+    re.S,
+)
+
+PROMPT_CACHE_BLOCKS_RE = re.compile(
+    r"\] (?:cli|agent)\.provider\.stream\.prompt_cache_blocks (?P<body>.*)\s*$",
+    re.S,
+)
+
+TOOL_RESULT_SIZES_RE = re.compile(
+    r"\] (?:cli|agent)\.provider\.stream\.tool_result_sizes (?P<body>.*)\s*$",
     re.S,
 )
 
@@ -1036,6 +1046,49 @@ def parse_prompt_cache_break(entry: str) -> dict[str, object] | None:
     return parsed if isinstance(parsed.get("session_id"), str) else None
 
 
+def parse_json_array_field(body: str, field_name: str) -> list[object] | None:
+    marker = f"{field_name}="
+    start = body.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    while start < len(body) and body[start].isspace():
+        start += 1
+    try:
+        value, _ = json.JSONDecoder().raw_decode(body[start:])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, list) else None
+
+
+def parse_prompt_cache_blocks(entry: str) -> dict[str, object] | None:
+    match = PROMPT_CACHE_BLOCKS_RE.search(entry)
+    if not match:
+        return None
+    body = match.group("body")
+    parsed = parse_scalar_fields(parse_key_value_body(body))
+    if not isinstance(parsed.get("session_id"), str):
+        return None
+
+    breakpoints = parse_json_array_field(body, "cache_breakpoints")
+    parsed["cache_breakpoints"] = breakpoints if breakpoints is not None else []
+    return parsed
+
+
+def parse_tool_result_sizes(entry: str) -> dict[str, object] | None:
+    match = TOOL_RESULT_SIZES_RE.search(entry)
+    if not match:
+        return None
+    body = match.group("body")
+    parsed = parse_scalar_fields(parse_key_value_body(body))
+    if not isinstance(parsed.get("session_id"), str):
+        return None
+
+    tool_results = parse_json_array_field(body, "tool_results")
+    parsed["tool_results"] = tool_results if tool_results is not None else []
+    return parsed
+
+
 def parse_api_request(raw_request: str) -> Any:
     try:
         return RustDebugParser(raw_request).parse()
@@ -1113,6 +1166,42 @@ def extract_records(text: str) -> list[dict[str, object]]:
                     prompt_cache["break_diagnostics"] = {
                         key: value
                         for key, value in break_diagnostics.items()
+                        if key != "session_id"
+                    }
+                    record["PromptCache"] = prompt_cache
+            continue
+
+        block_diagnostics = parse_prompt_cache_blocks(entry)
+        if block_diagnostics:
+            session_id = block_diagnostics.get("session_id")
+            if isinstance(session_id, str):
+                active_idx = active_request_by_session.get(session_id)
+                if active_idx is not None:
+                    record = records[active_idx]
+                    prompt_cache = (
+                        record["PromptCache"] if isinstance(record["PromptCache"], dict) else {}
+                    )
+                    prompt_cache["block_diagnostics"] = {
+                        key: value
+                        for key, value in block_diagnostics.items()
+                        if key != "session_id"
+                    }
+                    record["PromptCache"] = prompt_cache
+            continue
+
+        tool_result_sizes = parse_tool_result_sizes(entry)
+        if tool_result_sizes:
+            session_id = tool_result_sizes.get("session_id")
+            if isinstance(session_id, str):
+                active_idx = active_request_by_session.get(session_id)
+                if active_idx is not None:
+                    record = records[active_idx]
+                    prompt_cache = (
+                        record["PromptCache"] if isinstance(record["PromptCache"], dict) else {}
+                    )
+                    prompt_cache["tool_result_sizes"] = {
+                        key: value
+                        for key, value in tool_result_sizes.items()
                         if key != "session_id"
                     }
                     record["PromptCache"] = prompt_cache
