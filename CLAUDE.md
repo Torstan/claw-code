@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Frameworks: none detected from the supported starter markers.
 
 ## Verification
-- Run Rust verification from `rust/`: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+- Run Rust verifications step by step on finishing coding from `rust/`: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+- Run Rust all test cases before committing code, `./scripts/run_all_tests.sh`
 - `src/` and `tests/` are both present; update both surfaces together when behavior changes.
 
 ## Repository shape
