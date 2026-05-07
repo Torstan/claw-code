@@ -103,6 +103,8 @@ pub struct MessageRequest {
     pub max_tokens: u32,
     pub messages: Vec<InputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<Vec<SystemContentBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,

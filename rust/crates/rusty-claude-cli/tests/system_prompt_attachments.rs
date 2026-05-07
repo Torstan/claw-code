@@ -61,8 +61,8 @@ fn project_attachments_stay_in_dynamic_system_blocks() {
     assert!(
         system
             .iter()
-            .any(|block| block.text.contains("__SYSTEM_PROMPT_ATTACHMENT_BOUNDARY__")),
-        "attachment boundary marker should remain in serialized system blocks: {system:#?}"
+            .all(|block| !block.text.contains("__SYSTEM_PROMPT_ATTACHMENT_BOUNDARY__")),
+        "attachment boundary marker should be removed from serialized system blocks: {system:#?}"
     );
 
     assert_eq!(
@@ -186,38 +186,43 @@ fn cacheable_system_blocks_are_split_by_scope_and_ttl() {
     let system = request.system.expect("system blocks should be present");
     assert_eq!(
         system.len(),
-        2,
-        "expected static and dynamic system blocks, got {system:#?}"
+        3,
+        "expected prefix, static, and dynamic system blocks, got {system:#?}"
     );
 
     assert!(system[0].text.contains("You are an interactive agent"));
-    assert!(system[0].text.contains("# Tone and style"));
-    assert!(system[0].text.contains("short and concise"));
-    assert!(system[0].text.contains("# Claude instructions"));
-    assert!(system[0].text.contains("# Project summary"));
+    assert!(!system[0].text.contains("# Tone and style"));
     assert!(!system[0].text.contains("# Runtime config"));
     assert!(!system[0].text.contains("# Project attachments"));
 
-    assert!(system[1].text.contains("# Environment context"));
-    assert!(system[1].text.contains("# Runtime config"));
-    assert!(system[1].text.contains("# Project attachments"));
-    assert!(system[1]
+    assert!(system[1].text.contains("# Tone and style"));
+    assert!(system[1].text.contains("short and concise"));
+    assert!(system[1].text.contains("# Claude instructions"));
+    assert!(system[1].text.contains("# Project summary"));
+    assert!(!system[1].text.contains("# Runtime config"));
+    assert!(!system[1].text.contains("# Project attachments"));
+
+    assert!(system[2].text.contains("# Environment context"));
+    assert!(system[2].text.contains("# Runtime config"));
+    assert!(system[2].text.contains("# Project attachments"));
+    assert!(!system[2]
         .text
         .contains("__SYSTEM_PROMPT_ATTACHMENT_BOUNDARY__"));
 
     let system_json = serde_json::to_value(&system).expect("system blocks should serialize");
     assert_eq!(system_json[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(system_json[1]["cache_control"]["type"], "ephemeral");
     assert!(
         system_json[0]["cache_control"].get("ttl").is_none(),
-        "static block should not set an explicit ttl in current payload"
+        "first stable block should not set an explicit ttl in current payload"
     );
     assert!(
         system_json[0]["cache_control"].get("scope").is_none(),
-        "static block should not set an explicit scope in current payload"
+        "first stable block should not set an explicit scope in current payload"
     );
 
     assert!(
-        system_json[1]["cache_control"].is_null(),
+        system_json[2]["cache_control"].is_null(),
         "dynamic block should stay uncached to preserve marker budget"
     );
 

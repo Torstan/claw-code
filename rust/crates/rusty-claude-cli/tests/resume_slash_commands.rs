@@ -187,20 +187,26 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     let newer_path = sessions_dir.join("session-newer.jsonl");
 
     let mut older = Session::new().with_persistence_path(&older_path);
+    older.created_at_ms = 1_000;
+    older.updated_at_ms = 1_000;
     older
         .push_user_text("older session")
         .expect("older session write should succeed");
+    older.updated_at_ms = 1_000;
     older
         .save_to_path(&older_path)
         .expect("older session should persist");
 
     let mut newer = Session::new().with_persistence_path(&newer_path);
+    newer.created_at_ms = 2_000;
+    newer.updated_at_ms = 2_000;
     newer
         .push_user_text("newer session")
         .expect("newer session write should succeed");
     newer
         .push_user_text("resume me")
         .expect("newer session write should succeed");
+    newer.updated_at_ms = 2_000;
     newer
         .save_to_path(&newer_path)
         .expect("newer session should persist");

@@ -4,12 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runtime::{agent_debug_enabled, agent_debug_log};
+use runtime::{
+    agent_debug_enabled, agent_debug_log, SYSTEM_PROMPT_ATTACHMENT_BOUNDARY,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
     CacheControl, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    ToolResultContentBlock, Usage,
+    SystemContentBlock, ToolResultContentBlock, Usage,
 };
 
 const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
@@ -21,12 +24,14 @@ const REQUEST_FINGERPRINT_PREFIX: &str = "v1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const OPUS_4_6_MIN_CACHE_TOKENS: usize = 4096;
+const ANTHROPIC_BREAKPOINT_LOOKBACK_BLOCKS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCacheControlSummary {
     pub enabled: bool,
     pub cache_control_count: usize,
     pub cache_control_types: Vec<String>,
+    pub automatic_cache_control_count: usize,
     pub system_cache_control_count: usize,
     pub tool_cache_control_count: usize,
     pub message_cache_control_count: usize,
@@ -47,6 +52,7 @@ pub struct PromptCacheBreakpointDiagnostic {
     pub block_index: usize,
     pub section: &'static str,
     pub block_type: &'static str,
+    pub cache_control_source: &'static str,
     pub message_index: Option<usize>,
     pub content_index: Option<usize>,
     pub tool_name: Option<String>,
@@ -55,6 +61,7 @@ pub struct PromptCacheBreakpointDiagnostic {
     pub prefix_serialized_chars_estimate: usize,
     pub estimated_prefix_tokens: usize,
     pub below_opus_4_6_min_cache_tokens: bool,
+    pub exceeds_anthropic_20_block_lookback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,6 +99,7 @@ pub fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheC
         1
     };
 
+    let automatic_cache_control_count = record_cache_control(&request.cache_control);
     let system_cache_control_count = request.system.as_ref().map_or(0, |blocks| {
         blocks
             .iter()
@@ -122,12 +130,15 @@ pub fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheC
         })
         .sum::<usize>();
 
-    let cache_control_count =
-        system_cache_control_count + tool_cache_control_count + message_cache_control_count;
+    let cache_control_count = automatic_cache_control_count
+        + system_cache_control_count
+        + tool_cache_control_count
+        + message_cache_control_count;
     PromptCacheControlSummary {
         enabled: cache_control_count > 0,
         cache_control_count,
         cache_control_types: cache_control_types.into_iter().collect(),
+        automatic_cache_control_count,
         system_cache_control_count,
         tool_cache_control_count,
         message_cache_control_count,
@@ -138,17 +149,34 @@ pub fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheC
 pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBlockDiagnostics {
     let mut scanner = PromptCacheBlockScanner::default();
     let mut tool_name_by_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut automatic_breakpoint: Option<PromptCacheBreakpointDiagnostic> = None;
 
     if let Some(tools) = &request.tools {
         for tool in tools {
             let block_index = scanner.next_block_index();
             let block_chars = serialized_len(tool);
             scanner.add_prefix_chars(block_chars);
+            automatic_breakpoint = Some(PromptCacheBreakpointDiagnostic {
+                block_index,
+                section: "tools",
+                block_type: "tool",
+                cache_control_source: "automatic",
+                message_index: None,
+                content_index: None,
+                tool_name: Some(tool.name.clone()),
+                tool_use_id: None,
+                distance_from_previous_breakpoint: None,
+                prefix_serialized_chars_estimate: 0,
+                estimated_prefix_tokens: 0,
+                below_opus_4_6_min_cache_tokens: false,
+                exceeds_anthropic_20_block_lookback: false,
+            });
             if tool.cache_control.is_some() {
                 scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
                     block_index,
                     section: "tools",
                     block_type: "tool",
+                    cache_control_source: "block",
                     message_index: None,
                     content_index: None,
                     tool_name: Some(tool.name.clone()),
@@ -157,6 +185,7 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
                     prefix_serialized_chars_estimate: 0,
                     estimated_prefix_tokens: 0,
                     below_opus_4_6_min_cache_tokens: false,
+                    exceeds_anthropic_20_block_lookback: false,
                 });
             }
         }
@@ -167,11 +196,27 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
             let block_index = scanner.next_block_index();
             let block_chars = serialized_len(block);
             scanner.add_prefix_chars(block_chars);
+            automatic_breakpoint = Some(PromptCacheBreakpointDiagnostic {
+                block_index,
+                section: "system",
+                block_type: "text",
+                cache_control_source: "automatic",
+                message_index: None,
+                content_index: None,
+                tool_name: None,
+                tool_use_id: None,
+                distance_from_previous_breakpoint: None,
+                prefix_serialized_chars_estimate: 0,
+                estimated_prefix_tokens: 0,
+                below_opus_4_6_min_cache_tokens: false,
+                exceeds_anthropic_20_block_lookback: false,
+            });
             if block.cache_control.is_some() {
                 scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
                     block_index,
                     section: "system",
                     block_type: "text",
+                    cache_control_source: "block",
                     message_index: None,
                     content_index: None,
                     tool_name: None,
@@ -180,6 +225,7 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
                     prefix_serialized_chars_estimate: 0,
                     estimated_prefix_tokens: 0,
                     below_opus_4_6_min_cache_tokens: false,
+                    exceeds_anthropic_20_block_lookback: false,
                 });
             }
         }
@@ -192,11 +238,27 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
             scanner.add_prefix_chars(block_chars);
             match block {
                 InputContentBlock::Text { cache_control, .. } => {
+                    automatic_breakpoint = Some(PromptCacheBreakpointDiagnostic {
+                        block_index,
+                        section: "messages",
+                        block_type: "text",
+                        cache_control_source: "automatic",
+                        message_index: Some(message_index),
+                        content_index: Some(content_index),
+                        tool_name: None,
+                        tool_use_id: None,
+                        distance_from_previous_breakpoint: None,
+                        prefix_serialized_chars_estimate: 0,
+                        estimated_prefix_tokens: 0,
+                        below_opus_4_6_min_cache_tokens: false,
+                        exceeds_anthropic_20_block_lookback: false,
+                    });
                     if cache_control.is_some() {
                         scanner.push_breakpoint(PromptCacheBreakpointDiagnostic {
                             block_index,
                             section: "messages",
                             block_type: "text",
+                            cache_control_source: "block",
                             message_index: Some(message_index),
                             content_index: Some(content_index),
                             tool_name: None,
@@ -205,10 +267,26 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
                             prefix_serialized_chars_estimate: 0,
                             estimated_prefix_tokens: 0,
                             below_opus_4_6_min_cache_tokens: false,
+                            exceeds_anthropic_20_block_lookback: false,
                         });
                     }
                 }
                 InputContentBlock::ToolUse { id, name, .. } => {
+                    automatic_breakpoint = Some(PromptCacheBreakpointDiagnostic {
+                        block_index,
+                        section: "messages",
+                        block_type: "tool_use",
+                        cache_control_source: "automatic",
+                        message_index: Some(message_index),
+                        content_index: Some(content_index),
+                        tool_name: Some(name.clone()),
+                        tool_use_id: Some(id.clone()),
+                        distance_from_previous_breakpoint: None,
+                        prefix_serialized_chars_estimate: 0,
+                        estimated_prefix_tokens: 0,
+                        below_opus_4_6_min_cache_tokens: false,
+                        exceeds_anthropic_20_block_lookback: false,
+                    });
                     tool_name_by_id.insert(id.clone(), name.clone());
                 }
                 InputContentBlock::ToolResult {
@@ -219,12 +297,28 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
                 } => {
                     let (model_visible_chars, model_visible_bytes) =
                         tool_result_model_visible_size(content);
+                    let tool_name = tool_name_by_id.get(tool_use_id).cloned();
+                    automatic_breakpoint = Some(PromptCacheBreakpointDiagnostic {
+                        block_index,
+                        section: "messages",
+                        block_type: "tool_result",
+                        cache_control_source: "automatic",
+                        message_index: Some(message_index),
+                        content_index: Some(content_index),
+                        tool_name: tool_name.clone(),
+                        tool_use_id: Some(tool_use_id.clone()),
+                        distance_from_previous_breakpoint: None,
+                        prefix_serialized_chars_estimate: 0,
+                        estimated_prefix_tokens: 0,
+                        below_opus_4_6_min_cache_tokens: false,
+                        exceeds_anthropic_20_block_lookback: false,
+                    });
                     scanner.tool_results.push(ToolResultSizeDiagnostic {
                         block_index,
                         message_index,
                         content_index,
                         tool_use_id: tool_use_id.clone(),
-                        tool_name: tool_name_by_id.get(tool_use_id).cloned(),
+                        tool_name: tool_name.clone(),
                         model_visible_chars,
                         model_visible_bytes,
                         serialized_block_chars_estimate: block_chars,
@@ -237,18 +331,26 @@ pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBl
                             block_index,
                             section: "messages",
                             block_type: "tool_result",
+                            cache_control_source: "block",
                             message_index: Some(message_index),
                             content_index: Some(content_index),
-                            tool_name: tool_name_by_id.get(tool_use_id).cloned(),
+                            tool_name,
                             tool_use_id: Some(tool_use_id.clone()),
                             distance_from_previous_breakpoint: None,
                             prefix_serialized_chars_estimate: 0,
                             estimated_prefix_tokens: 0,
                             below_opus_4_6_min_cache_tokens: false,
+                            exceeds_anthropic_20_block_lookback: false,
                         });
                     }
                 }
             }
+        }
+    }
+
+    if request.cache_control.is_some() {
+        if let Some(breakpoint) = automatic_breakpoint {
+            scanner.push_breakpoint(breakpoint);
         }
     }
 
@@ -278,9 +380,12 @@ impl PromptCacheBlockScanner {
     fn push_breakpoint(&mut self, mut breakpoint: PromptCacheBreakpointDiagnostic) {
         let estimated_prefix_tokens =
             estimate_prompt_cache_tokens(self.prefix_serialized_chars_estimate);
-        breakpoint.distance_from_previous_breakpoint = self
+        let distance_from_previous_breakpoint = self
             .last_breakpoint_index
             .map(|idx| breakpoint.block_index - idx);
+        breakpoint.exceeds_anthropic_20_block_lookback = distance_from_previous_breakpoint
+            .is_some_and(|distance| distance > ANTHROPIC_BREAKPOINT_LOOKBACK_BLOCKS);
+        breakpoint.distance_from_previous_breakpoint = distance_from_previous_breakpoint;
         breakpoint.prefix_serialized_chars_estimate = self.prefix_serialized_chars_estimate;
         breakpoint.estimated_prefix_tokens = estimated_prefix_tokens;
         breakpoint.below_opus_4_6_min_cache_tokens =
@@ -381,6 +486,74 @@ pub fn log_prompt_cache_block_diagnostics(
             session_id, model, tool_results_json
         ),
     );
+}
+
+#[must_use]
+pub fn build_system_blocks_with_cache_controls(
+    parts: &[String],
+) -> Option<Vec<SystemContentBlock>> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    let boundary_pos = parts
+        .iter()
+        .position(|part| part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+    let (stable_parts, dynamic_parts) = if let Some(boundary) = boundary_pos {
+        (
+            system_prompt_parts(&parts[..boundary]),
+            system_prompt_parts(&parts[boundary + 1..]),
+        )
+    } else {
+        (system_prompt_parts(parts), Vec::new())
+    };
+
+    let mut blocks = Vec::new();
+    push_cacheable_system_blocks(&mut blocks, &stable_parts);
+
+    let dynamic = dynamic_parts.join("\n\n");
+    if !dynamic.is_empty() {
+        blocks.push(SystemContentBlock::text(dynamic));
+    }
+
+    (!blocks.is_empty()).then_some(blocks)
+}
+
+fn system_prompt_parts(parts: &[String]) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(|part| system_prompt_part_text(part))
+        .collect()
+}
+
+fn system_prompt_part_text(part: &str) -> Option<String> {
+    if part.is_empty()
+        || part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+        || part == SYSTEM_PROMPT_ATTACHMENT_BOUNDARY
+    {
+        return None;
+    }
+    Some(part.to_string())
+}
+
+fn push_cacheable_system_blocks(blocks: &mut Vec<SystemContentBlock>, stable_parts: &[String]) {
+    let Some(first) = stable_parts.first() else {
+        return;
+    };
+
+    blocks.push(
+        SystemContentBlock::text(first.clone()).with_cache_control(CacheControl::ephemeral()),
+    );
+
+    let rest = stable_parts
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !rest.is_empty() {
+        blocks.push(SystemContentBlock::text(rest).with_cache_control(CacheControl::ephemeral()));
+    }
 }
 
 pub fn apply_message_cache_controls(messages: &mut [InputMessage]) {
@@ -1133,9 +1306,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        detect_cache_break, prompt_cache_block_diagnostics, read_json, request_hash_hex,
-        sanitize_path_segment, PromptCache, PromptCacheConfig, PromptCachePaths,
-        TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
+        build_system_blocks_with_cache_controls, detect_cache_break,
+        prompt_cache_block_diagnostics, read_json, request_hash_hex, sanitize_path_segment,
+        PromptCache, PromptCacheConfig, PromptCachePaths, TrackedPromptState,
+        REQUEST_FINGERPRINT_PREFIX,
     };
     use crate::types::{
         CacheControl, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
@@ -1397,6 +1571,80 @@ mod tests {
         let second = request_hash_hex(&request);
         assert_eq!(first, second);
         assert!(first.starts_with(REQUEST_FINGERPRINT_PREFIX));
+    }
+
+    #[test]
+    fn system_blocks_use_two_stable_cache_markers_and_uncached_dynamic_tail() {
+        let parts = vec![
+            "stable prefix".to_string(),
+            "stable instructions".to_string(),
+            runtime::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "dynamic environment".to_string(),
+            runtime::SYSTEM_PROMPT_ATTACHMENT_BOUNDARY.to_string(),
+            "dynamic attachments".to_string(),
+        ];
+
+        let blocks =
+            build_system_blocks_with_cache_controls(&parts).expect("system blocks should build");
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, "stable prefix");
+        assert!(blocks[0].cache_control.is_some());
+        assert_eq!(blocks[1].text, "stable instructions");
+        assert!(blocks[1].cache_control.is_some());
+        assert_eq!(blocks[2].text, "dynamic environment\n\ndynamic attachments");
+        assert!(blocks[2].cache_control.is_none());
+        assert!(!blocks
+            .iter()
+            .any(|block| block.text.contains("SYSTEM_PROMPT")));
+    }
+
+    #[test]
+    fn prompt_cache_block_diagnostics_flags_breakpoints_beyond_twenty_block_lookback() {
+        let mut messages = (0..42)
+            .map(|index| InputMessage::user_text(format!("message-{index}")))
+            .collect::<Vec<_>>();
+        for index in [0usize, 20, 41] {
+            let Some(InputContentBlock::Text { cache_control, .. }) =
+                messages[index].content.first_mut()
+            else {
+                panic!("test messages should contain text blocks");
+            };
+            *cache_control = Some(CacheControl::ephemeral());
+        }
+        let request = MessageRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages,
+            ..Default::default()
+        };
+
+        let diagnostics = prompt_cache_block_diagnostics(&request);
+
+        assert_eq!(
+            diagnostics
+                .cache_breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.block_index)
+                .collect::<Vec<_>>(),
+            vec![0, 20, 41]
+        );
+        assert_eq!(
+            diagnostics
+                .cache_breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.distance_from_previous_breakpoint)
+                .collect::<Vec<_>>(),
+            vec![None, Some(20), Some(21)]
+        );
+        assert_eq!(
+            diagnostics
+                .cache_breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.exceeds_anthropic_20_block_lookback)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
     }
 
     #[test]

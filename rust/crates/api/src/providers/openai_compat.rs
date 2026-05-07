@@ -1533,6 +1533,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
             messages: vec![],
+            cache_control: None,
             system: None,
             tools: None,
             tool_choice: None,

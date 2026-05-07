@@ -24,12 +24,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    apply_message_cache_controls, detect_provider_kind, log_prompt_cache_block_diagnostics,
-    oauth_token_is_expired, resolve_startup_auth_source, summarize_prompt_cache_controls,
-    AnthropicClient, AuthSource, CacheControl, ContentBlockDelta, ContextManagement,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputConfig,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, SystemContentBlock, ThinkingConfig, ToolChoice, ToolDefinition,
+    apply_message_cache_controls, build_system_blocks_with_cache_controls, detect_provider_kind,
+    log_prompt_cache_block_diagnostics, oauth_token_is_expired, resolve_startup_auth_source,
+    summarize_prompt_cache_controls, AnthropicClient, AuthSource, CacheControl, ContentBlockDelta,
+    ContextManagement, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputConfig, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
 
@@ -57,7 +57,6 @@ use runtime::{
     OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, ToolInvocation, TurnExecutionPolicy, UsageTracker,
-    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -7325,58 +7324,7 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
-        let system_blocks = if request.system_prompt.is_empty() {
-            None
-        } else {
-            let boundary_pos = request
-                .system_prompt
-                .iter()
-                .position(|part| part == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
-            let mut blocks = Vec::new();
-            if let Some(bp) = boundary_pos {
-                let static_parts = request.system_prompt[..bp]
-                    .iter()
-                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                let dynamic_parts = request.system_prompt[bp + 1..]
-                    .iter()
-                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-
-                if !static_parts.is_empty() {
-                    blocks.push(
-                        SystemContentBlock::text(static_parts)
-                            .with_cache_control(CacheControl::ephemeral()),
-                    );
-                }
-                if !dynamic_parts.is_empty() {
-                    // Keep dynamic/attachment context outside the stable
-                    // cache marker budget so tools + first user + latest
-                    // user can still fit within Anthropic's breakpoint
-                    // limits.
-                    blocks.push(SystemContentBlock::text(dynamic_parts));
-                }
-            } else {
-                let merged = request
-                    .system_prompt
-                    .iter()
-                    .filter(|part| part.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !merged.is_empty() {
-                    blocks.push(
-                        SystemContentBlock::text(merged)
-                            .with_cache_control(CacheControl::ephemeral()),
-                    );
-                }
-            }
-            Some(blocks)
-        };
+        let system_blocks = build_system_blocks_with_cache_controls(&request.system_prompt);
         let mut tools = self.enable_tools.then(|| {
             filter_tool_specs_for_request(
                 &self.tool_registry,
@@ -7385,12 +7333,12 @@ impl ApiClient for AnthropicRuntimeClient {
             )
         });
         apply_tool_cache_controls(&mut tools);
-        let mut messages = convert_messages(&request.messages);
-        apply_message_cache_controls(&mut messages);
+        let messages = convert_messages(&request.messages);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages,
+            cache_control: Some(CacheControl::ephemeral()),
             system: system_blocks,
             tools,
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
@@ -7408,13 +7356,14 @@ impl ApiClient for AnthropicRuntimeClient {
         agent_debug_log(
             "cli.provider.stream.prompt_cache",
             format!(
-                "session_id={} model={} message_count={} cache_enabled={} cache_control_count={} cache_control_types={} system_cache_control_count={} tool_cache_control_count={} message_cache_control_count={}",
+                "session_id={} model={} message_count={} cache_enabled={} cache_control_count={} cache_control_types={} automatic_cache_control_count={} system_cache_control_count={} tool_cache_control_count={} message_cache_control_count={}",
                 self.session_id,
                 self.model,
                 message_request.messages.len(),
                 prompt_cache_summary.enabled,
                 prompt_cache_summary.cache_control_count,
                 cache_control_types_json,
+                prompt_cache_summary.automatic_cache_control_count,
                 prompt_cache_summary.system_cache_control_count,
                 prompt_cache_summary.tool_cache_control_count,
                 prompt_cache_summary.message_cache_control_count
@@ -12330,6 +12279,7 @@ UU conflicted.rs",
     }
 
     fn cache_control_marker_count(request: &api::MessageRequest) -> usize {
+        let automatic_marker = usize::from(request.cache_control.is_some());
         let system_markers = request.system.as_ref().map_or(0, |blocks| {
             blocks.iter().filter(|b| b.cache_control.is_some()).count()
         });
@@ -12353,7 +12303,7 @@ UU conflicted.rs",
                     .count()
             })
             .sum::<usize>();
-        system_markers + tool_markers + message_markers
+        automatic_marker + system_markers + tool_markers + message_markers
     }
 
     #[test]
@@ -12540,8 +12490,8 @@ UU conflicted.rs",
                 .as_ref()
                 .expect("system blocks should be present");
             assert!(
-                !system.is_empty(),
-                "system blocks should not be empty: {request:#?}"
+                system.len() >= 2,
+                "system blocks should include two stable cache blocks: {request:#?}"
             );
             assert!(
                 system
@@ -12551,10 +12501,16 @@ UU conflicted.rs",
             );
             assert!(
                 system
+                    .get(1)
+                    .is_some_and(|second_block| second_block.cache_control.is_some()),
+                "second system block should carry cache_control for stable static context: {system:#?}"
+            );
+            assert!(
+                system
                     .iter()
-                    .skip(1)
+                    .skip(2)
                     .all(|block| block.cache_control.is_none()),
-                "dynamic system blocks should stay uncached to preserve cache marker budget: {system:#?}"
+                "dynamic system blocks should stay uncached after the two stable markers: {system:#?}"
             );
             let tools = request
                 .tools
@@ -12571,13 +12527,26 @@ UU conflicted.rs",
                 cache_control_marker_count(request) <= 4,
                 "provider request should stay within the 4-marker cache breakpoint budget: {request:#?}"
             );
+            assert!(
+                request.cache_control.is_some(),
+                "provider request should use top-level automatic cache_control for the moving conversation breakpoint: {request:#?}"
+            );
         }
 
-        // Only the last user message gets cache_control — older ones stay unmarked.
-        assert_eq!(checkpoint_indices(&requests[0].messages), vec![0]);
-        assert_eq!(checkpoint_indices(&requests[1].messages), vec![2]);
-        assert_eq!(checkpoint_indices(&requests[2].messages), vec![4]);
-        // u1 must stay identical across turns (prefix stability — no cache_control either time).
+        // The moving conversation breakpoint is top-level automatic
+        // cache_control, so historical message blocks stay byte-identical.
+        assert_eq!(
+            checkpoint_indices(&requests[0].messages),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            checkpoint_indices(&requests[1].messages),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            checkpoint_indices(&requests[2].messages),
+            Vec::<usize>::new()
+        );
         assert_eq!(
             requests[1].messages[0], requests[2].messages[0],
             "first user message must stay identical across turn growth"
@@ -12593,7 +12562,7 @@ UU conflicted.rs",
             turn_three_user_three,
             format!("{SCENARIO_PREFIX}streaming_text turn-3 cache probe")
         );
-        assert!(turn_three_user_three_cached);
+        assert!(!turn_three_user_three_cached);
     }
 
     #[test]
