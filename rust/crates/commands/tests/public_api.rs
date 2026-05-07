@@ -1,16 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command,
-    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
-    handle_slash_command, render_plugins_report, render_slash_command_help,
-    render_slash_command_help_detail, render_slash_command_help_filtered,
-    resolve_skill_invocation, resolve_skill_path, resume_supported_slash_commands,
-    slash_command_specs, suggest_slash_commands, validate_slash_command_input,
-    CommandManifestEntry, CommandRegistry, CommandSource, PluginsCommandResult,
-    SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandResult,
-    SlashCommandSpec,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json, handle_slash_command,
+    render_plugins_report, render_slash_command_help, render_slash_command_help_detail,
+    render_slash_command_help_filtered, resolve_skill_invocation, resolve_skill_path,
+    resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+    validate_slash_command_input, CommandManifestEntry, CommandRegistry, CommandSource,
+    PluginsCommandResult, SkillSlashDispatch, SlashCommand, SlashCommandParseError,
+    SlashCommandResult, SlashCommandSpec,
 };
 use plugins::{PluginError, PluginManager};
 
