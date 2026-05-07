@@ -10,10 +10,10 @@ REPL handling, managed sessions, status and doctor reports, runtime/plugin/MCP
 construction, provider streaming, tool execution, tool display formatting, and
 unit tests.
 
-The approved approach is conservative mechanical splitting. This phase should
-move code into focused private modules while preserving behavior. It should not
-redesign slash-command handling, parser semantics, provider routing, runtime
-construction, or public crate shape.
+The approved approach is conservative coarse-grained mechanical splitting. This
+phase should move code into focused private modules while preserving behavior.
+It should not redesign slash-command handling, parser semantics, provider
+routing, runtime construction, or public crate shape.
 
 ## Goals
 
@@ -30,9 +30,9 @@ construction, or public crate shape.
 - Do not add `src/lib.rs` or create a public library API.
 - Do not rewrite argument parsing.
 - Do not unify CLI, REPL, and resume slash-command dispatch in this pass.
-- Do not rename behavior-sensitive symbols unless needed for module visibility.
-- Do not rename `AnthropicRuntimeClient` in this pass, even though the name is
-  stale, because the approved scope prioritizes safe movement over cleanup.
+- Do not rename core private symbols as cleanup. In particular, keep existing
+  names such as `AnthropicRuntimeClient` and `STUB_COMMANDS` even where they are
+  imperfect, because the approved scope prioritizes safe movement over cleanup.
 - Do not change tool output formatting, ANSI rendering, JSON shapes, tool
   schemas, permission semantics, prompt-cache behavior, or MCP protocol behavior.
 
@@ -47,24 +47,34 @@ Add private sibling modules:
 
 - `args.rs`: `CliAction`, `CliOutputFormat`, `LocalHelpTopic`, `parse_args`,
   and CLI option helpers.
+- `help.rs`: `print_help_to`, `print_help`, `render_repl_help`,
+  `STUB_COMMANDS`, and slash-command completion candidates.
 - `doctor.rs`: diagnostic checks and doctor report rendering.
-- `status.rs`: status, sandbox, git summary types, and renderers.
+- `status.rs`: status, sandbox, config, memory, diff, git summary types, and
+  renderers.
 - `sessions.rs`: managed session path/reference/list/delete helpers.
 - `resume.rs`: `resume_session`, `run_resume_command`, and resume command
   outcome handling.
 - `repl.rs`: `run_repl`, `LiveCli`, REPL command handling, and prompt history.
-- `runtime_bridge.rs`: runtime/plugin/MCP construction glue, `BuiltRuntime`,
-  hook progress reporting, and permission prompting.
+- `auth.rs`: OAuth config, login/logout, browser callback handling, and CLI auth
+  source resolution.
+- `runtime_host.rs`: runtime/plugin construction glue, `BuiltRuntime`, hook
+  progress reporting, permission prompting, and `permission_policy`.
+- `mcp_runtime.rs`: `RuntimeMcpState`, MCP wrapper tool definitions, MCP runtime
+  tool calls, and MCP permission derivation.
 - `provider_client.rs`: current `AnthropicRuntimeClient` provider-streaming
   implementation and API error formatting.
 - `tool_display.rs`: tool call/result formatting, truncation, and JSON display
   helpers.
 - `tool_executor.rs`: `CliToolExecutor`, parallel execution, debug logging, and
   permission policy.
-- `reports.rs`: small text report formatters shared by commands.
 
 Use `pub(crate)` only where cross-module access or existing unit tests require
 it. Avoid making internals `pub`.
+
+`main.rs` should keep module declarations, `main()`, top-level error formatting,
+`run()` action dispatch, and only the small process-level glue that directly
+serves dispatch.
 
 ## Data Flow
 
@@ -80,8 +90,8 @@ One-shot prompt and REPL flows keep the current runtime path:
 2. `run()` dispatches to `repl::run_repl`, `resume::resume_session`,
    `doctor::run_doctor`, `status::print_status_snapshot`, and similar module
    entrypoints.
-3. `repl::LiveCli` uses `runtime_bridge::build_runtime`.
-4. `runtime_bridge` constructs
+3. `repl::LiveCli` uses `runtime_host::build_runtime`.
+4. `runtime_host` constructs
    `ConversationRuntime<provider_client::AnthropicRuntimeClient,
    tool_executor::CliToolExecutor>`.
 5. `provider_client` streams API events and calls `tool_display` helpers for
@@ -92,6 +102,23 @@ One-shot prompt and REPL flows keep the current runtime path:
 The tests currently inside `main.rs` may stay in `main.rs` with imports adjusted
 or move in small groups next to their modules. Choose the lower-risk option per
 module during implementation.
+
+## Migration Strategy
+
+Split in dependency order:
+
+1. Move lower-coupling logic first: `args.rs`, `help.rs`, `sessions.rs`,
+   `status.rs`, `doctor.rs`, and `auth.rs`.
+2. Move runtime glue next: `mcp_runtime.rs` and `runtime_host.rs`.
+3. Move the high-coupling execution path last: `tool_display.rs`,
+   `tool_executor.rs`, `provider_client.rs`, `repl.rs`, and `resume.rs`.
+4. After each major batch, run `cargo check -p rusty-claude-cli` from `rust/`.
+5. Adjust only imports and `pub(crate)` visibility needed for compilation and
+   tests.
+
+This migration should be mechanical. Do not rename core types or functions,
+change output text, change JSON shapes, or introduce new abstractions while
+moving code.
 
 ## Error Handling And Behavior Preservation
 
@@ -121,8 +148,8 @@ cargo check -p rusty-claude-cli
 cargo test -p rusty-claude-cli
 ```
 
-On finishing coding, run the required Rust verification sequence from `rust/` in
-order:
+On finishing coding, run the required Rust verification sequence step by step
+from `rust/` in order:
 
 ```bash
 cargo fmt --all
@@ -130,8 +157,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Before committing code, run the repository test wrapper from the repository
-root:
+Before committing code, run all Rust test cases with the repository test wrapper
+from the repository root:
 
 ```bash
 ./scripts/run_all_tests.sh
