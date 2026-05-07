@@ -3,7 +3,7 @@
 This repo already had **container detection** in the Rust runtime before this document was added:
 
 - `rust/crates/runtime/src/sandbox.rs` detects Docker/Podman/container markers such as `/.dockerenv`, `/run/.containerenv`, matching env vars, and `/proc/1/cgroup` hints.
-- `rust/crates/rusty-claude-cli/src/main.rs` exposes that state through the `claw sandbox` / `cargo run -p rusty-claude-cli -- sandbox` report.
+- The `claw sandbox` / `cargo run -p rusty-claude-cli -- sandbox` report exposes that state.
 - `.github/workflows/rust-ci.yml` runs on `ubuntu-latest`, but it does **not** define a Docker or Podman container job.
 - Before this change, the repo did **not** have a checked-in `Dockerfile`, `Containerfile`, or `.devcontainer/` config.
 
@@ -18,6 +18,10 @@ It does **not** copy the repository into the image. Instead, the recommended flo
 ## Build the image
 
 From the repository root:
+
+The first build needs Docker Hub access for the `rust:bookworm` base image. If
+Docker Hub is blocked or slow in your environment, pre-pull or load that image
+from an accessible registry mirror before running the build command.
 
 ### Docker
 

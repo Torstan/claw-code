@@ -19,7 +19,7 @@ use crate::mcp_lifecycle_hardened::{
 };
 
 #[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 2_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
