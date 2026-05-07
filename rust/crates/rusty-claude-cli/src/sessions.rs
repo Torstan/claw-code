@@ -29,7 +29,7 @@ pub(crate) struct ManagedSessionSummary {
     pub(crate) session_counter: Option<u64>,
 }
 
-pub(crate) fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let store = runtime::SessionStore::from_cwd(&cwd)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -79,7 +79,7 @@ pub(crate) fn resolve_session_reference(
     Ok(SessionHandle { id, path })
 }
 
-pub(crate) fn resolve_managed_session_path(
+fn resolve_managed_session_path(
     session_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let directory = sessions_dir()?;
@@ -108,7 +108,7 @@ pub(crate) fn resolve_managed_session_path(
     Err(format_missing_session_reference(session_id).into())
 }
 
-pub(crate) fn is_managed_session_file(path: &Path) -> bool {
+fn is_managed_session_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|extension| {
@@ -116,7 +116,7 @@ pub(crate) fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
-pub(crate) fn collect_sessions_from_dir(
+fn collect_sessions_from_dir(
     directory: &Path,
     sessions: &mut Vec<ManagedSessionSummary>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -194,7 +194,7 @@ pub(crate) fn collect_sessions_from_dir(
     Ok(())
 }
 
-pub(crate) fn sort_managed_session_summaries(sessions: &mut [ManagedSessionSummary]) {
+fn sort_managed_session_summaries(sessions: &mut [ManagedSessionSummary]) {
     sessions.sort_by(|left, right| {
         right
             .modified_epoch_millis
@@ -205,15 +205,15 @@ pub(crate) fn sort_managed_session_summaries(sessions: &mut [ManagedSessionSumma
     });
 }
 
-pub(crate) fn session_created_at_from_id(session_id: &str) -> Option<u64> {
+fn session_created_at_from_id(session_id: &str) -> Option<u64> {
     parse_session_id_components(session_id).map(|(created_at_ms, _)| created_at_ms)
 }
 
-pub(crate) fn session_counter_from_id(session_id: &str) -> Option<u64> {
+fn session_counter_from_id(session_id: &str) -> Option<u64> {
     parse_session_id_components(session_id).map(|(_, counter)| counter)
 }
 
-pub(crate) fn parse_session_id_components(session_id: &str) -> Option<(u64, u64)> {
+fn parse_session_id_components(session_id: &str) -> Option<(u64, u64)> {
     let suffix = session_id.strip_prefix("session-")?;
     let (created_at_ms, counter) = suffix.rsplit_once('-')?;
     Some((created_at_ms.parse().ok()?, counter.parse().ok()?))
@@ -265,13 +265,13 @@ pub(crate) fn confirm_session_deletion(session_id: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
-pub(crate) fn format_missing_session_reference(reference: &str) -> String {
+fn format_missing_session_reference(reference: &str) -> String {
     format!(
         "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
     )
 }
 
-pub(crate) fn format_no_managed_sessions() -> String {
+fn format_no_managed_sessions() -> String {
     format!(
         "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
@@ -318,7 +318,7 @@ pub(crate) fn render_session_list(
     Ok(lines.join("\n"))
 }
 
-pub(crate) fn format_session_modified_age(modified_epoch_millis: u128) -> String {
+fn format_session_modified_age(modified_epoch_millis: u128) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -345,7 +345,7 @@ pub(crate) fn write_session_clear_backup(
     Ok(backup_path)
 }
 
-pub(crate) fn session_clear_backup_path(session_path: &Path) -> PathBuf {
+fn session_clear_backup_path(session_path: &Path) -> PathBuf {
     let timestamp = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

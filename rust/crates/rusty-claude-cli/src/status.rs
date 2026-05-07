@@ -445,7 +445,7 @@ pub(crate) fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     }
 }
 
-pub(crate) fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
+fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -457,7 +457,7 @@ pub(crate) fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-pub(crate) fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
@@ -481,7 +481,7 @@ pub(crate) fn parse_git_status_metadata_for(
     (project_root, branch)
 }
 
-pub(crate) fn detect_broad_cwd() -> Option<PathBuf> {
+fn detect_broad_cwd() -> Option<PathBuf> {
     let Ok(cwd) = env::current_dir() else {
         return None;
     };
@@ -1141,7 +1141,7 @@ pub(crate) fn render_diff_json_for(
     }))
 }
 
-pub(crate) fn run_git_diff_command_in(
+fn run_git_diff_command_in(
     cwd: &Path,
     args: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1262,7 +1262,7 @@ pub(crate) fn render_last_tool_debug_report(
     Ok(lines.join("\n"))
 }
 
-pub(crate) fn indent_block(value: &str, spaces: usize) -> String {
+fn indent_block(value: &str, spaces: usize) -> String {
     let indent = " ".repeat(spaces);
     value
         .lines()
@@ -1337,7 +1337,7 @@ pub(crate) fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Er
     Ok(String::from_utf8(output.stdout)?)
 }
 
-pub(crate) fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .args(args)
         .current_dir(env::current_dir()?)
@@ -1349,7 +1349,7 @@ pub(crate) fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-pub(crate) fn command_exists(name: &str) -> bool {
+fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
@@ -1357,7 +1357,7 @@ pub(crate) fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn write_temp_text_file(
+fn write_temp_text_file(
     filename: &str,
     contents: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1400,7 +1400,7 @@ pub(crate) fn format_history_timestamp(timestamp_ms: u64) -> String {
     clippy::cast_sign_loss
 )]
 
-pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 {
         z / 146_097
@@ -1504,7 +1504,7 @@ pub(crate) fn recent_user_context(session: &Session, limit: usize) -> String {
     }
 }
 
-pub(crate) fn truncate_for_prompt(value: &str, limit: usize) -> String {
+fn truncate_for_prompt(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         value.trim().to_string()
     } else {
@@ -1513,11 +1513,11 @@ pub(crate) fn truncate_for_prompt(value: &str, limit: usize) -> String {
     }
 }
 
-pub(crate) fn sanitize_generated_message(value: &str) -> String {
+fn sanitize_generated_message(value: &str) -> String {
     value.trim().trim_matches('`').trim().replace("\r\n", "\n")
 }
 
-pub(crate) fn parse_titled_body(value: &str) -> Option<(String, String)> {
+fn parse_titled_body(value: &str) -> Option<(String, String)> {
     let normalized = sanitize_generated_message(value);
     let title = normalized
         .lines()
@@ -1568,7 +1568,7 @@ pub(crate) fn render_export_text(session: &Session) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn default_export_filename(session: &Session) -> String {
+fn default_export_filename(session: &Session) -> String {
     let stem = session
         .messages
         .iter()
