@@ -20,8 +20,9 @@ use tools::{render_tool_result_for_model, GlobalToolRegistry};
 use crate::args::filter_tool_specs_for_request;
 use crate::auth::resolve_cli_auth_source;
 use crate::render::{MarkdownStreamState, TerminalRenderer};
+use crate::repl::InternalPromptProgressReporter;
 use crate::tool_display::{format_tool_call_start, truncate_for_summary};
-use crate::{AllowedToolSet, InternalPromptProgressReporter};
+use crate::AllowedToolSet;
 
 fn max_tokens_for_model(_model: &str) -> u32 {
     64_000

@@ -16,11 +16,12 @@ use serde_json::json;
 
 use crate::args::{default_permission_mode, permission_mode_from_label, CliOutputFormat};
 use crate::init::initialize_repo;
+use crate::repl::PromptHistoryEntry;
 use crate::sessions::resolve_session_reference;
 use crate::{
-    truncate_for_summary, PromptHistoryEntry, BUILD_TARGET, DEFAULT_DATE, DEFAULT_HISTORY_LIMIT,
-    GIT_SHA, LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION,
-    SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT, VERSION,
+    truncate_for_summary, BUILD_TARGET, DEFAULT_DATE, DEFAULT_HISTORY_LIMIT, GIT_SHA,
+    LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
+    VERSION,
 };
 
 pub(crate) fn run_worker_state(
