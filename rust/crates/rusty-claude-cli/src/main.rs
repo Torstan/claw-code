@@ -25,7 +25,9 @@ mod tool_executor;
 
 pub(crate) use tool_executor::CliToolExecutor;
 
-use resume::{resume_session, run_resume_command};
+#[cfg(test)]
+use resume::run_resume_command;
+use resume::resume_session;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
