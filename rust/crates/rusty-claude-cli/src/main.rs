@@ -7,8 +7,21 @@
     clippy::unused_self
 )]
 mod init;
+mod args;
+mod auth;
+mod doctor;
+mod help;
 mod input;
+mod mcp_runtime;
+mod provider_client;
 mod render;
+mod repl;
+mod resume;
+mod runtime_host;
+mod sessions;
+mod status;
+mod tool_display;
+mod tool_executor;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
