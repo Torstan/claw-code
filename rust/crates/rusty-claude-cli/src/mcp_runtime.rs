@@ -281,7 +281,7 @@ fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDef
     }
 }
 
-pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
+fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
             name: "MCPTool".to_string(),
