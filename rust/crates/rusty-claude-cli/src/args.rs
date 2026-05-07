@@ -730,7 +730,9 @@ pub(crate) fn format_unknown_slash_command(name: &str) -> String {
     message
 }
 
-fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
+pub(crate) fn omc_compatibility_note_for_unknown_slash_command(
+    name: &str,
+) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
             "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
@@ -741,7 +743,7 @@ fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String>
     (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", "),))
 }
 
-fn suggest_slash_commands(input: &str) -> Vec<String> {
+pub(crate) fn suggest_slash_commands(input: &str) -> Vec<String> {
     let mut candidates = slash_command_specs()
         .iter()
         .flat_map(|spec| {
@@ -1006,7 +1008,10 @@ fn parse_system_prompt_args(
     })
 }
 
-fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_export_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;

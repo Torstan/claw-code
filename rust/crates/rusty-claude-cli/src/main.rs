@@ -55,12 +55,13 @@ use commands::{
     SkillSlashDispatch, SlashCommand,
 };
 use args::{
-    default_permission_mode, filter_tool_specs_for_request, format_connected_line,
-    format_prompt_slash_command_input, format_prompt_slash_command_metadata,
-    format_prompt_slash_skill_listing, format_unknown_slash_command, parse_args,
-    permission_mode_from_label, prompt_slash_turn_policy, resolve_model_alias,
-    resolve_model_alias_with_config, resolve_repl_model, CliAction, CliOutputFormat,
-    LocalHelpTopic,
+    default_permission_mode, filter_tool_specs, filter_tool_specs_for_request,
+    format_connected_line, format_prompt_slash_command_input,
+    format_prompt_slash_command_metadata, format_prompt_slash_skill_listing,
+    format_unknown_slash_command, omc_compatibility_note_for_unknown_slash_command, parse_args,
+    parse_export_args, permission_mode_from_label, prompt_slash_turn_policy,
+    resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+    suggest_slash_commands, CliAction, CliOutputFormat, LocalHelpTopic,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
