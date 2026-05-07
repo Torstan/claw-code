@@ -23,6 +23,8 @@ mod status;
 mod tool_display;
 mod tool_executor;
 
+pub(crate) use tool_executor::CliToolExecutor;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -73,7 +75,7 @@ use help::{
     slash_command_completion_candidates_with_sessions, STUB_COMMANDS,
 };
 use init::initialize_repo;
-use mcp_runtime::{run_mcp_serve, RuntimeMcpState};
+use mcp_runtime::run_mcp_serve;
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime_host::{
     build_plugin_manager, build_runtime, build_runtime_plugin_state_with_loader,
@@ -81,18 +83,16 @@ use runtime_host::{
     CliPermissionPrompter, HookAbortMonitor,
 };
 use runtime::{
-    active_tool_session_id, agent_debug_log, check_base_commit, clear_oauth_credentials,
-    compact_session_with_memory, format_stale_base_warning, format_usd, generate_pkce_pair,
-    generate_state, load_oauth_credentials, parse_oauth_callback_request_target,
-    partial_compact_session, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    save_oauth_credentials, with_active_tool_session, ApiClient, ApiRequest, AssistantEvent,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PartialCompactMode, PermissionMode, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, ToolInvocation,
+    agent_debug_log, check_base_commit, clear_oauth_credentials, compact_session_with_memory,
+    format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
+    load_oauth_credentials, parse_oauth_callback_request_target, partial_compact_session,
+    pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     TurnExecutionPolicy, UsageTracker,
 };
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sessions::{
     confirm_session_deletion, create_managed_session_handle, delete_managed_session,
@@ -996,31 +996,6 @@ struct LiveCli {
 struct PromptHistoryEntry {
     timestamp_ms: u64,
     text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolSearchRequest {
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpToolRequest {
-    #[serde(rename = "qualifiedName")]
-    qualified_name: Option<String>,
-    tool: Option<String>,
-    arguments: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListMcpResourcesRequest {
-    server: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadMcpResourceRequest {
-    server: String,
-    uri: String,
 }
 
 impl LiveCli {
@@ -3388,7 +3363,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn normalize_tool_input_json(input: &str) -> &str {
+pub(crate) fn normalize_tool_input_json(input: &str) -> &str {
     if input.trim().is_empty() {
         "{}"
     } else {
@@ -3415,7 +3390,7 @@ fn debug_json_value_summary(value: &serde_json::Value, limit: usize) -> String {
     debug_json_input_summary(&rendered, limit)
 }
 
-fn debug_json_input_summary(input: &str, limit: usize) -> String {
+pub(crate) fn debug_json_input_summary(input: &str, limit: usize) -> String {
     debug_labeled_json_input_summary("input", input, limit)
 }
 
@@ -3583,348 +3558,9 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
-pub(crate) struct CliToolExecutor {
-    renderer: TerminalRenderer,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-}
-
-impl CliToolExecutor {
-    pub(crate) fn new(
-        allowed_tools: Option<AllowedToolSet>,
-        emit_output: bool,
-        tool_registry: GlobalToolRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    ) -> Self {
-        Self {
-            renderer: TerminalRenderer::new(),
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            mcp_state,
-        }
-    }
-
-    fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
-        let input: ToolSearchRequest = serde_json::from_value(value)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.pending_servers(), state.degraded_report())
-            });
-        serde_json::to_string_pretty(&self.tool_registry.search(
-            &input.query,
-            input.max_results.unwrap_or(5),
-            pending_mcp_servers,
-            mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn execute_runtime_tool(
-        &self,
-        tool_name: &str,
-        value: serde_json::Value,
-    ) -> Result<String, ToolError> {
-        let Some(mcp_state) = &self.mcp_state else {
-            return Err(ToolError::new(format!(
-                "runtime tool `{tool_name}` is unavailable without configured MCP servers"
-            )));
-        };
-        let mut mcp_state = mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        match tool_name {
-            "MCPTool" => {
-                let input: McpToolRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                let qualified_name = input
-                    .qualified_name
-                    .or(input.tool)
-                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                mcp_state.call_tool(&qualified_name, input.arguments)
-            }
-            "ListMcpResourcesTool" => {
-                let input: ListMcpResourcesRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                match input.server {
-                    Some(server_name) => mcp_state.list_resources_for_server(&server_name),
-                    None => mcp_state.list_resources_for_all_servers(),
-                }
-            }
-            "ReadMcpResourceTool" => {
-                let input: ReadMcpResourceRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                mcp_state.read_resource(&input.server, &input.uri)
-            }
-            _ => mcp_state.call_tool(tool_name, Some(value)),
-        }
-    }
-
-    fn execute_raw(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        let started_at = Instant::now();
-        let normalized_input = normalize_tool_input_json(input);
-        cli_agent_debug_log(
-            "tool.execute.begin",
-            format!("tool_name={tool_name}\ninput={normalized_input}"),
-        );
-        if self
-            .allowed_tools
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
-        {
-            let error = ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            ));
-            cli_agent_debug_log(
-                "tool.execute.done",
-                format!(
-                    "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
-                    started_at.elapsed().as_micros()
-                ),
-            );
-            return Err(error);
-        }
-        let value = match serde_json::from_str(normalized_input) {
-            Ok(value) => value,
-            Err(error) => {
-                let error = ToolError::new(format!("invalid tool input JSON: {error}"));
-                cli_agent_debug_log(
-                    "tool.execute.input_json_parse_error",
-                    format!(
-                        "tool_name={tool_name}\n{}\nerror={error}",
-                        debug_json_input_summary(normalized_input, 500)
-                    ),
-                );
-                cli_agent_debug_log(
-                    "tool.execute.done",
-                    format!(
-                        "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
-                        started_at.elapsed().as_micros()
-                    ),
-                );
-                return Err(error);
-            }
-        };
-        let result = if tool_name == "ToolSearch" {
-            self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
-        } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
-        };
-        match &result {
-            Ok(output) => cli_agent_debug_log(
-                "tool.execute.done",
-                format!(
-                    "tool_name={tool_name}\nok=true\nelapsed_us={}\noutput={output}",
-                    started_at.elapsed().as_micros()
-                ),
-            ),
-            Err(error) => cli_agent_debug_log(
-                "tool.execute.done",
-                format!(
-                    "tool_name={tool_name}\nok=false\nelapsed_us={}\nerror={error}",
-                    started_at.elapsed().as_micros()
-                ),
-            ),
-        }
-        result
-    }
-
-    fn render_result(
-        &self,
-        tool_name: &str,
-        result: &Result<String, ToolError>,
-    ) -> Result<(), ToolError> {
-        if !self.emit_output {
-            return Ok(());
-        }
-        let (markdown, is_error) = match result {
-            Ok(output) => (format_tool_result(tool_name, output, false), false),
-            Err(error) => (
-                format_tool_result(tool_name, &error.to_string(), true),
-                true,
-            ),
-        };
-        self.renderer
-            .stream_markdown(&markdown, &mut io::stdout())
-            .map_err(|error| {
-                let label = if is_error {
-                    "failed to render tool error"
-                } else {
-                    "failed to render tool result"
-                };
-                ToolError::new(format!("{label}: {error}"))
-            })
-    }
-}
-
 #[track_caller]
 fn cli_agent_debug_log(event: &str, detail: impl AsRef<str>) {
     runtime::agent_debug_log(event, detail);
-}
-
-fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
-    if invocation.tool_name != "Agent" {
-        return format!("tool={}", invocation.tool_name);
-    }
-
-    let Ok(value) = serde_json::from_str::<Value>(&invocation.input) else {
-        return format!("tool={} input_parse_error", invocation.tool_name);
-    };
-    format!(
-        "tool={} description={:?} name={:?} background={} prompt_len={}",
-        invocation.tool_name,
-        value.get("description").and_then(Value::as_str),
-        value.get("name").and_then(Value::as_str),
-        value
-            .get("run_in_background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        value
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map_or(0, str::len)
-    )
-}
-
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        let result = self.execute_raw(tool_name, input);
-        self.render_result(tool_name, &result)?;
-        result
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn execute_many(&mut self, invocations: &[ToolInvocation]) -> Vec<Result<String, ToolError>> {
-        if invocations.len() < 2
-            || !invocations
-                .iter()
-                .all(|invocation| self.supports_parallel_execution(&invocation.tool_name))
-        {
-            return invocations
-                .iter()
-                .map(|invocation| self.execute(&invocation.tool_name, &invocation.input))
-                .collect();
-        }
-
-        let batch_started_at = Instant::now();
-        cli_agent_debug_log(
-            "tool.execute_many.parallel.begin",
-            format!(
-                "invocations={} session_id={:?} summary={}",
-                invocations.len(),
-                active_tool_session_id(),
-                invocations
-                    .iter()
-                    .map(describe_parallel_invocation)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ),
-        );
-        let session_id = active_tool_session_id();
-        let allowed_tools = self.allowed_tools.clone();
-        let tool_registry = self.tool_registry.clone();
-        let mcp_state = self.mcp_state.clone();
-        let emit_output = self.emit_output;
-
-        let handles: Vec<std::thread::JoinHandle<Result<String, ToolError>>> = invocations
-            .iter()
-            .map(|invocation| {
-                let invocation = invocation.clone();
-                let allowed_tools = allowed_tools.clone();
-                let tool_registry = tool_registry.clone();
-                let mcp_state = mcp_state.clone();
-                let session_id = session_id.clone();
-                std::thread::spawn(move || {
-                    let invocation_started_at = Instant::now();
-                    cli_agent_debug_log(
-                        "tool.execute_many.worker.begin",
-                        format!(
-                            "tool_name={} description={}",
-                            invocation.tool_name,
-                            describe_parallel_invocation(&invocation)
-                        ),
-                    );
-                    let worker = CliToolExecutor {
-                        renderer: TerminalRenderer::new(),
-                        emit_output: false,
-                        allowed_tools,
-                        tool_registry,
-                        mcp_state,
-                    };
-                    let result = with_active_tool_session(session_id.as_deref(), || {
-                        worker.execute_raw(&invocation.tool_name, &invocation.input)
-                    });
-                    cli_agent_debug_log(
-                        "tool.execute_many.worker.done",
-                        format!(
-                            "tool_name={} description={} ok={} elapsed_us={}",
-                            invocation.tool_name,
-                            describe_parallel_invocation(&invocation),
-                            result.is_ok(),
-                            invocation_started_at.elapsed().as_micros()
-                        ),
-                    );
-                    result
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let results = handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(result) => result,
-                Err(_) => Err(ToolError::new("tool execution thread panicked")),
-            })
-            .collect::<Vec<_>>();
-
-        cli_agent_debug_log(
-            "tool.execute_many.parallel.done",
-            format!(
-                "invocations={} ok_count={} err_count={} elapsed_us={}",
-                invocations.len(),
-                results.iter().filter(|result| result.is_ok()).count(),
-                results.iter().filter(|result| result.is_err()).count(),
-                batch_started_at.elapsed().as_micros()
-            ),
-        );
-
-        if emit_output {
-            for (index, (invocation, result)) in invocations.iter().zip(results.iter()).enumerate()
-            {
-                if let Err(error) = self.render_result(&invocation.tool_name, result) {
-                    return invocations
-                        .iter()
-                        .zip(results.into_iter())
-                        .enumerate()
-                        .map(|(result_index, (_invocation, result))| {
-                            if result_index == index {
-                                Err(error.clone())
-                            } else {
-                                result
-                            }
-                        })
-                        .collect();
-                }
-            }
-        }
-
-        results
-    }
-
-    fn supports_parallel_execution(&self, tool_name: &str) -> bool {
-        tool_name == "Agent"
-    }
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
