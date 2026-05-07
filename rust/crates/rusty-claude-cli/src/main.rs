@@ -125,7 +125,7 @@ use tools::{
 };
 use tool_display::{
     describe_tool_progress, first_visible_line, format_tool_call_start, format_tool_result,
-    summarize_tool_payload, truncate_for_summary,
+    truncate_for_summary,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";

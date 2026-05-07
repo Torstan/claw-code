@@ -427,7 +427,7 @@ fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value
     }
 }
 
-pub(crate) fn summarize_tool_payload(payload: &str) -> String {
+fn summarize_tool_payload(payload: &str) -> String {
     let compact = match serde_json::from_str::<serde_json::Value>(payload) {
         Ok(value) => value.to_string(),
         Err(_) => payload.trim().to_string(),
