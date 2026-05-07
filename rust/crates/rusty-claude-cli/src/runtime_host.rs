@@ -31,7 +31,7 @@ pub(crate) struct RuntimePluginState {
 }
 
 pub(crate) struct BuiltRuntime {
-    pub(crate) runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -71,6 +71,12 @@ impl BuiltRuntime {
             self.plugins_active = false;
         }
         Ok(())
+    }
+
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.api_client_mut().set_reasoning_effort(effort);
+        }
     }
 
     fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {

@@ -1054,9 +1054,7 @@ impl LiveCli {
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(effort);
-        }
+        self.runtime.set_reasoning_effort(effort);
     }
 
     fn startup_banner(&self) -> String {
