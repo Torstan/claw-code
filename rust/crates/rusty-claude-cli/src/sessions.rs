@@ -79,9 +79,7 @@ pub(crate) fn resolve_session_reference(
     Ok(SessionHandle { id, path })
 }
 
-fn resolve_managed_session_path(
-    session_id: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let directory = sessions_dir()?;
     for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
         let path = directory.join(format!("{session_id}.{extension}"));
