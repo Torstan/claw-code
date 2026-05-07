@@ -1,4 +1,22 @@
-use super::*;
+use super::{
+    active_tool_session_id, agent_debug_log, build_system_blocks_with_cache_controls,
+    canonical_tool_token, compress_summary_text, dedupe_superseded_commit_events,
+    detect_provider_kind, enqueue_session_notification, execute_tool_with_enforcer,
+    global_task_registry, is_background_task_tool_name, load_system_prompt,
+    log_prompt_cache_block_diagnostics, max_tokens_for_model, mvp_tool_specs, read_base_url,
+    render_tool_result_for_model, resolve_model_alias, resolve_startup_auth_source,
+    summarize_prompt_cache_controls, AgentInput, AgentJob, AgentOutput, AgentToolOutput,
+    AnthropicClient, ApiClient, ApiError, ApiRequest, ApiStreamEvent, AssistantEvent,
+    AsyncAgentLaunchOutput, AuthSource, BTreeMap, BTreeSet, CacheControl, Command, ConfigLoader,
+    ContentBlock, ContentBlockDelta, ConversationMessage, ConversationRuntime, InputContentBlock,
+    InputMessage, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass,
+    MessageRequest, MessageResponse, MessageRole, OAuthConfig, OutputContentBlock, Path,
+    PermissionEnforcer, PermissionMode, PermissionPolicy, PromptCache, PromptCacheEvent,
+    ProviderClient, ProviderFallbackConfig, ProviderKind, RuntimeError, Session, TaskStatus,
+    ToolChoice, ToolDefinition, ToolError, ToolExecutor, ToolResultContentBlock, ToolSpec,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+};
+use std::time::Instant;
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const FALLBACK_AGENT_SYSTEM_DATE: &str = "2026-03-31";
@@ -920,6 +938,7 @@ pub(crate) fn load_provider_fallback_config() -> ProviderFallbackConfig {
 }
 
 impl ApiClient for ProviderRuntimeClient {
+    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut tools = tool_definitions_for_request_tools(
             &self.allowed_tools,

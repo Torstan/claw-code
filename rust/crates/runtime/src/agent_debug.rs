@@ -50,6 +50,7 @@ fn agent_debug_dir() -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
+#[must_use]
 pub fn agent_debug_enabled() -> bool {
     agent_debug_dir().is_some()
 }

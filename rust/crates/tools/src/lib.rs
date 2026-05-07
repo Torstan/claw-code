@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,8 @@ use api::{
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
-use reqwest::blocking::Client;
 use runtime::{
-    active_tool_session_id, check_freshness, dedupe_superseded_commit_events, edit_file,
+    active_tool_session_id, check_freshness, dedupe_superseded_commit_events,
     enqueue_session_notification, execute_bash, glob_search, grep_search, load_system_prompt,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
@@ -23,13 +22,13 @@ use runtime::{
     worker_boot::WorkerReadySnapshot,
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass,
+    McpDegradedReport, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket, ToolError,
+    ToolExecutor, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 mod agent;
 mod config;

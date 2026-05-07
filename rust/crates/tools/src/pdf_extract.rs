@@ -307,7 +307,9 @@ pub fn maybe_extract_pdf_from_prompt(prompt: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        extract_text, extract_text_from_bytes, looks_like_pdf_path, maybe_extract_pdf_from_prompt,
+    };
 
     /// Build a minimal valid PDF with a single page containing uncompressed
     /// text.  This is the smallest PDF structure that exercises the BT/ET

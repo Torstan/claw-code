@@ -13,7 +13,20 @@ use commands::{
 };
 use plugins::{PluginError, PluginManager};
 
+type AgentsTextHandler = fn(Option<&str>, &Path) -> std::io::Result<String>;
+type AgentsJsonHandler = fn(Option<&str>, &Path) -> std::io::Result<serde_json::Value>;
+type McpTextHandler = fn(Option<&str>, &Path) -> Result<String, runtime::ConfigError>;
+type McpJsonHandler = fn(Option<&str>, &Path) -> Result<serde_json::Value, runtime::ConfigError>;
+type PluginsHandler =
+    fn(Option<&str>, Option<&str>, &mut PluginManager) -> Result<PluginsCommandResult, PluginError>;
+type PluginsReportRenderer = fn(&[plugins::PluginSummary]) -> String;
+type ResolvePathHandler = fn(&Path, &str) -> std::io::Result<PathBuf>;
+type SlashCommandHandler =
+    fn(&str, &runtime::Session, runtime::CompactionConfig, bool) -> Option<SlashCommandResult>;
+
 fn assert_public_type<T>() {}
+
+fn assert_public_function<T>(_: T) {}
 
 #[test]
 fn crate_root_exports_slash_command_api() {
@@ -25,31 +38,16 @@ fn crate_root_exports_slash_command_api() {
     assert_public_type::<SlashCommandResult>();
     assert_public_type::<SlashCommandSpec>();
 
-    let _agents_text: fn(Option<&str>, &Path) -> std::io::Result<String> =
-        handle_agents_slash_command;
-    let _agents_json: fn(Option<&str>, &Path) -> std::io::Result<serde_json::Value> =
-        handle_agents_slash_command_json;
-    let _mcp_text: fn(Option<&str>, &Path) -> Result<String, runtime::ConfigError> =
-        handle_mcp_slash_command;
-    let _mcp_json: fn(Option<&str>, &Path) -> Result<serde_json::Value, runtime::ConfigError> =
-        handle_mcp_slash_command_json;
-    let _plugins: fn(
-        Option<&str>,
-        Option<&str>,
-        &mut PluginManager,
-    ) -> Result<PluginsCommandResult, PluginError> = handle_plugins_slash_command;
-    let _plugins_report: fn(&[plugins::PluginSummary]) -> String = render_plugins_report;
-    let _skills_text: fn(Option<&str>, &Path) -> std::io::Result<String> =
-        handle_skills_slash_command;
-    let _skills_json: fn(Option<&str>, &Path) -> std::io::Result<serde_json::Value> =
-        handle_skills_slash_command_json;
-    let _resolve_path: fn(&Path, &str) -> std::io::Result<PathBuf> = resolve_skill_path;
-    let _handle: fn(
-        &str,
-        &runtime::Session,
-        runtime::CompactionConfig,
-        bool,
-    ) -> Option<SlashCommandResult> = handle_slash_command;
+    assert_public_function::<AgentsTextHandler>(handle_agents_slash_command);
+    assert_public_function::<AgentsJsonHandler>(handle_agents_slash_command_json);
+    assert_public_function::<McpTextHandler>(handle_mcp_slash_command);
+    assert_public_function::<McpJsonHandler>(handle_mcp_slash_command_json);
+    assert_public_function::<PluginsHandler>(handle_plugins_slash_command);
+    assert_public_function::<PluginsReportRenderer>(render_plugins_report);
+    assert_public_function::<AgentsTextHandler>(handle_skills_slash_command);
+    assert_public_function::<AgentsJsonHandler>(handle_skills_slash_command_json);
+    assert_public_function::<ResolvePathHandler>(resolve_skill_path);
+    assert_public_function::<SlashCommandHandler>(handle_slash_command);
 
     let specs = slash_command_specs();
     assert!(specs.iter().any(|spec| spec.name == "skills"));
@@ -79,6 +77,7 @@ fn crate_root_exports_slash_command_api() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn slash_command_specs_keep_public_order_and_aliases() {
     let names = slash_command_specs()
         .iter()

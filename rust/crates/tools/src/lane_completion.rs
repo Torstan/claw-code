@@ -91,8 +91,9 @@ pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use runtime::{DiffScope, LaneBlocker};
+    use super::{detect_lane_completion, evaluate_completed_lane};
+    use crate::AgentOutput;
+    use runtime::{DiffScope, LaneBlocker, LaneContext, PolicyAction, ReviewStatus};
 
     fn test_output() -> AgentOutput {
         AgentOutput {

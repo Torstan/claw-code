@@ -1,4 +1,28 @@
-use super::*;
+use super::{
+    agent_debug_log, check_freshness, execute_agent, execute_bash, execute_brief, execute_config,
+    execute_enter_plan_mode, execute_exit_plan_mode, execute_notebook_edit, execute_powershell,
+    execute_repl, execute_skill, execute_sleep, execute_structured_output, execute_todo_write,
+    execute_tool_search, execute_web_fetch, execute_web_search, glob_search, global_cron_registry,
+    global_lsp_registry, global_mcp_registry, global_task_registry, global_team_registry,
+    global_worker_registry, grep_search, iso8601_now, read_file, write_file, AgentInput,
+    AskUserQuestionInput, BashCommandInput, BashCommandOutput, BranchFreshness, BriefInput,
+    ConfigInput, CronCreateInput, CronDeleteInput, Duration, EditFileInput, EnforcementResult,
+    EnterPlanModeInput, ExitPlanModeInput, GlobSearchInputValue, GrepSearchInput, Instant,
+    LspInput, McpAuthInput, McpResourceInput, McpToolInput, NotebookEditInput, PermissionEnforcer,
+    PowerShellInput, ReadFileInput, RemoteTriggerInput, ReplInput, SkillInput, SleepInput,
+    StructuredOutputInput, TaskCreateInput, TaskIdInput, TaskOutputInput, TaskOutputPayload,
+    TaskPacket, TaskStatus, TaskUpdateInput, TeamCreateInput, TeamDeleteInput,
+    TestingPermissionInput, TodoWriteInput, ToolSearchInput, WebFetchInput, WebSearchInput,
+    WorkerCreateInput, WorkerIdInput, WorkerObserveCompletionInput, WorkerObserveInput,
+    WorkerReadySnapshot, WorkerSendPromptInput, WriteFileInput,
+};
+use reqwest::blocking::Client;
+use runtime::{
+    edit_file, ConfigLoader, LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::process::Command;
 
 pub fn enforce_permission_check(
     enforcer: &PermissionEnforcer,
@@ -66,7 +90,9 @@ pub(crate) fn execute_tool_with_enforcer(
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
-        "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "ToolSearch" => {
+            from_value::<ToolSearchInput>(input).and_then(|input| run_tool_search(&input))
+        }
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -983,7 +1009,7 @@ fn render_completed_agent_result_for_model(output: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
+fn run_tool_search(input: &ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
 

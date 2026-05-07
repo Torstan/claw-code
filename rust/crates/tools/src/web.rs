@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    SearchHit, WebFetchInput, WebFetchOutput, WebSearchInput, WebSearchOutput, WebSearchResultItem,
+};
+use reqwest::blocking::Client;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 pub(crate) fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();

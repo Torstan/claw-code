@@ -1,6 +1,9 @@
-use super::*;
+use super::{
+    mvp_tool_specs, GlobalToolRegistry, SearchableToolSpec, ToolSearchInput, ToolSearchOutput,
+    ToolSpec,
+};
 
-pub(crate) fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
+pub(crate) fn execute_tool_search(input: &ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 

@@ -1834,6 +1834,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn simplify_turn_forces_background_agents_into_synchronous_batch() {
         struct SimplifyApiClient {
             calls: usize,
@@ -3623,6 +3624,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn micro_compact_time_based_trigger_uses_last_assistant_timestamp() {
         struct TimeBasedMicrocompactApi;
 
@@ -3670,10 +3672,13 @@ mod tests {
             }
         }
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_millis() as u64;
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_millis(),
+        )
+        .expect("current timestamp in milliseconds should fit in u64");
         let stale_ms = now_ms.saturating_sub(2 * 60 * 60 * 1000);
 
         let mut session = Session::new();

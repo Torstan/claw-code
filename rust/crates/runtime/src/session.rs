@@ -1769,8 +1769,7 @@ mod workspace_sessions_dir_tests {
         let result = workspace_sessions_dir(&tmp);
         assert!(
             result.is_ok(),
-            "workspace_sessions_dir should succeed for a valid CWD, got: {:?}",
-            result
+            "workspace_sessions_dir should succeed for a valid CWD, got: {result:?}"
         );
         let dir = result.unwrap();
         // The returned path should be non-empty and end with a hash component

@@ -1,4 +1,4 @@
-use super::*;
+use super::{SkillInput, SkillOutput};
 
 pub(crate) fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let skill_path = resolve_skill_path(&input.skill)?;

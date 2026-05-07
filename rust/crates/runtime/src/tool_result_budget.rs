@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -102,15 +103,17 @@ fn build_persisted_output_message(path: &Path, output: &str) -> String {
     let mut message = String::new();
     message.push_str(PERSISTED_OUTPUT_TAG);
     message.push('\n');
-    message.push_str(&format!(
+    let _ = write!(
+        message,
         "Output too large ({}). Full output saved to: {}\n\n",
         format_file_size(output.len()),
         path.display()
-    ));
-    message.push_str(&format!(
+    );
+    let _ = writeln!(
+        message,
         "Preview (first {}):\n",
         format_file_size(PREVIEW_SIZE_BYTES)
-    ));
+    );
     message.push_str(preview);
     if preview.len() < output.len() {
         message.push_str("\n...\n");
@@ -125,7 +128,13 @@ fn format_file_size(bytes: usize) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
-    format!("{:.1} KB", bytes as f64 / 1024.0)
+    let whole = bytes / 1024;
+    let tenths = ((bytes % 1024) * 10 + 512) / 1024;
+    if tenths == 10 {
+        format!("{}.0 KB", whole + 1)
+    } else {
+        format!("{whole}.{tenths} KB")
+    }
 }
 
 fn sanitize_path_component(value: &str) -> String {

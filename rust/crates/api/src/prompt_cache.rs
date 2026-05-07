@@ -146,6 +146,7 @@ pub fn summarize_prompt_cache_controls(request: &MessageRequest) -> PromptCacheC
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn prompt_cache_block_diagnostics(request: &MessageRequest) -> PromptCacheBlockDiagnostics {
     let mut scanner = PromptCacheBlockScanner::default();
     let mut tool_name_by_id: BTreeMap<String, String> = BTreeMap::new();
@@ -481,10 +482,7 @@ pub fn log_prompt_cache_block_diagnostics(
         serde_json::to_string(&diagnostics.tool_results).unwrap_or_else(|_| "[]".to_string());
     agent_debug_log(
         &format!("{log_prefix}.provider.stream.tool_result_sizes"),
-        format!(
-            "session_id={} model={} tool_results={}",
-            session_id, model, tool_results_json
-        ),
+        format!("session_id={session_id} model={model} tool_results={tool_results_json}"),
     );
 }
 

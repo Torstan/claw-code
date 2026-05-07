@@ -1,6 +1,8 @@
-use super::*;
+use super::{PermissionMode, ToolSpec};
+use serde_json::json;
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {

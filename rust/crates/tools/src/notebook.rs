@@ -1,5 +1,7 @@
-use super::*;
+use super::{NotebookCellType, NotebookEditInput, NotebookEditMode, NotebookEditOutput};
+use serde_json::{json, Value};
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn execute_notebook_edit(
     input: NotebookEditInput,
 ) -> Result<NotebookEditOutput, String> {

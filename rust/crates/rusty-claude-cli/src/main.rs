@@ -12240,12 +12240,10 @@ UU conflicted.rs",
                     return None;
                 }
                 match message.content.last() {
-                    Some(api::InputContentBlock::Text { cache_control, .. })
-                    | Some(api::InputContentBlock::ToolResult { cache_control, .. })
-                        if cache_control.is_some() =>
-                    {
-                        Some(idx)
-                    }
+                    Some(
+                        api::InputContentBlock::Text { cache_control, .. }
+                        | api::InputContentBlock::ToolResult { cache_control, .. },
+                    ) if cache_control.is_some() => Some(idx),
                     _ => None,
                 }
             })
@@ -12383,6 +12381,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn mocked_queries_produce_cacheable_prompt_checkpoints_across_turns() {
         let _env_guard = env_lock();
         let _proxy_guards = clear_proxy_env();
@@ -13563,8 +13562,7 @@ UU conflicted.rs",
             ]);
             assert!(
                 result.is_ok(),
-                "--reasoning-effort {value} should be accepted, got: {:?}",
-                result
+                "--reasoning-effort {value} should be accepted, got: {result:?}"
             );
             if let Ok(CliAction::Prompt {
                 reasoning_effort, ..
