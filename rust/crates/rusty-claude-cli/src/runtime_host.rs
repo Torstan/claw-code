@@ -18,10 +18,9 @@ use runtime::{
 use tools::GlobalToolRegistry;
 
 use crate::mcp_runtime::{build_runtime_mcp_state, RuntimeMcpState};
+use crate::provider_client::AnthropicRuntimeClient;
 use crate::tool_executor::CliToolExecutor;
-use crate::{
-    AllowedToolSet, AnthropicRuntimeClient, InternalPromptProgressReporter, DEFAULT_DATE,
-};
+use crate::{AllowedToolSet, InternalPromptProgressReporter, DEFAULT_DATE};
 
 pub(crate) struct RuntimePluginState {
     pub(crate) feature_config: runtime::RuntimeFeatureConfig,

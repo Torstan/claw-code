@@ -10,9 +10,10 @@ use serde_json::Value;
 use tools::GlobalToolRegistry;
 
 use crate::mcp_runtime::RuntimeMcpState;
+use crate::provider_client::{debug_json_input_summary, normalize_tool_input_json};
 use crate::render::TerminalRenderer;
 use crate::tool_display::format_tool_result;
-use crate::{debug_json_input_summary, normalize_tool_input_json, AllowedToolSet};
+use crate::AllowedToolSet;
 
 #[derive(Debug, Deserialize)]
 struct ToolSearchRequest {
@@ -242,7 +243,8 @@ fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
         invocation.tool_name,
         value.get("description").and_then(Value::as_str),
         value.get("name").and_then(Value::as_str),
-        value.get("run_in_background")
+        value
+            .get("run_in_background")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         value
