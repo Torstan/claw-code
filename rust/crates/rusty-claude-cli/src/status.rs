@@ -499,7 +499,6 @@ fn detect_broad_cwd() -> Option<PathBuf> {
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
-
 pub(crate) fn enforce_broad_cwd_policy(
     allow_broad_cwd: bool,
     output_format: CliOutputFormat,
@@ -1399,7 +1398,6 @@ pub(crate) fn format_history_timestamp(timestamp_ms: u64) -> String {
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 {

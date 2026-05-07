@@ -929,8 +929,7 @@ fn run_resume_command(
     }
 }
 
-/// Detect if the current working directory is "broad" (home directory or
-/// filesystem root). Returns the cwd path if broad, None otherwise.#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -4061,9 +4060,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
         .collect()
 }
 
-/// Slash commands that are registered in the spec list but not yet implemented
-/// in this build. Used to filter both REPL completions and help output so the
-/// discovery surface only shows commands that actually work (ROADMAP #39).
 fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));

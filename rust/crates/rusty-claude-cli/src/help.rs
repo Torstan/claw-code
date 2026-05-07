@@ -59,6 +59,9 @@ pub(crate) fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
+/// Slash commands that are registered in the spec list but not yet implemented
+/// in this build. Used to filter both REPL completions and help output so the
+/// discovery surface only shows commands that actually work (ROADMAP #39).
 pub(crate) const STUB_COMMANDS: &[&str] = &[
     "login",
     "logout",
