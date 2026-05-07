@@ -1,8 +1,6 @@
 use serde_json::json;
 
-use runtime::{
-    permission_enforcer::PermissionEnforcer, PermissionMode, PermissionPolicy,
-};
+use runtime::{permission_enforcer::PermissionEnforcer, PermissionMode, PermissionPolicy};
 use tools::{
     enforce_permission_check, execute_tool, is_background_task_tool_name, mvp_tool_specs,
     render_tool_result_for_model, GlobalToolRegistry, RuntimeToolDefinition, ToolManifestEntry,
