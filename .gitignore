@@ -7,3 +7,4 @@ archive/
 .claude/sessions/
 rust/.clawd-todos.json
 rust/.claw/
+.worktrees/
