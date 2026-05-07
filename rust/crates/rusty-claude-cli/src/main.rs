@@ -74,6 +74,7 @@ use help::{
     slash_command_completion_candidates_with_sessions, STUB_COMMANDS,
 };
 use init::initialize_repo;
+use mcp_runtime::{build_runtime_mcp_state, run_mcp_serve, RuntimeMcpState};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
@@ -83,11 +84,11 @@ use runtime::{
     parse_oauth_callback_request_target, partial_compact_session, pricing_for_model,
     resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
     with_active_tool_session, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PartialCompactMode, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, ToolInvocation, TurnExecutionPolicy, UsageTracker,
+    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PartialCompactMode, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ToolInvocation, TurnExecutionPolicy, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -117,8 +118,8 @@ use status::{
     StatusContext, StatusUsage,
 };
 use tools::{
-    execute_tool, is_background_task_tool_name, mvp_tool_specs, render_tool_result_for_model,
-    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    is_background_task_tool_name, render_tool_result_for_model, GlobalToolRegistry,
+    ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -160,10 +161,6 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 ];
 
 type AllowedToolSet = BTreeSet<String>;
-type RuntimePluginStateBuildOutput = (
-    Option<Arc<Mutex<RuntimeMcpState>>>,
-    Vec<RuntimeToolDefinition>,
-);
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -339,35 +336,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    let tools = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| McpTool {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: Some(spec.input_schema),
-            annotations: None,
-            meta: None,
-        })
-        .collect();
-
-    let spec = McpServerSpec {
-        server_name: "claw".to_string(),
-        server_version: VERSION.to_string(),
-        tools,
-        tool_handler: Box::new(execute_tool),
-    };
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let mut server = McpServer::new(spec);
-        server.run().await
-    })?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)]
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
     let resolved_path = if session_path.exists() {
@@ -1031,13 +999,6 @@ struct RuntimePluginState {
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
-struct RuntimeMcpState {
-    runtime: tokio::runtime::Runtime,
-    manager: McpServerManager,
-    pending_servers: Vec<String>,
-    degraded_report: Option<runtime::McpDegradedReport>,
-}
-
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
@@ -1140,304 +1101,6 @@ struct ListMcpResourcesRequest {
 struct ReadMcpResourceRequest {
     server: String,
     uri: String,
-}
-
-impl RuntimeMcpState {
-    fn new(
-        runtime_config: &runtime::RuntimeConfig,
-    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
-        if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
-            return Ok(None);
-        }
-
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
-        let pending_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| failure.server_name.clone())
-            .chain(
-                discovery
-                    .unsupported_servers
-                    .iter()
-                    .map(|server| server.server_name.clone()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let available_tools = discovery
-            .tools
-            .iter()
-            .map(|tool| tool.qualified_name.clone())
-            .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
-            .server_names()
-            .into_iter()
-            .filter(|server_name| !failed_server_names.contains(server_name))
-            .collect::<Vec<_>>();
-        let failed_servers =
-            discovery
-                .failed_servers
-                .iter()
-                .map(|failure| runtime::McpFailedServer {
-                    server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some(failure.server_name.clone()),
-                        failure.error.clone(),
-                        std::collections::BTreeMap::new(),
-                        true,
-                    ),
-                })
-                .chain(discovery.unsupported_servers.iter().map(|server| {
-                    runtime::McpFailedServer {
-                        server_name: server.server_name.clone(),
-                        phase: runtime::McpLifecyclePhase::ServerRegistration,
-                        error: runtime::McpErrorSurface::new(
-                            runtime::McpLifecyclePhase::ServerRegistration,
-                            Some(server.server_name.clone()),
-                            server.reason.clone(),
-                            std::collections::BTreeMap::from([(
-                                "transport".to_string(),
-                                format!("{:?}", server.transport).to_ascii_lowercase(),
-                            )]),
-                            false,
-                        ),
-                    }
-                }))
-                .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
-            runtime::McpDegradedReport::new(
-                working_servers,
-                failed_servers,
-                available_tools.clone(),
-                available_tools,
-            )
-        });
-
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-            },
-            discovery,
-        )))
-    }
-
-    fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.block_on(self.manager.shutdown())?;
-        Ok(())
-    }
-
-    fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
-    }
-
-    fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
-        self.degraded_report.clone()
-    }
-
-    fn server_names(&self) -> Vec<String> {
-        self.manager.server_names()
-    }
-
-    fn call_tool(
-        &mut self,
-        qualified_tool_name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<String, ToolError> {
-        let response = self
-            .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
-                error.message, error.code
-            )));
-        }
-
-        let result = response.result.ok_or_else(|| {
-            ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned no result payload"
-            ))
-        })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.list_resources(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "resources": result.resources,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut resources = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
-                .runtime
-                .block_on(self.manager.list_resources(&server_name))
-            {
-                Ok(result) => resources.push(json!({
-                    "server": server_name,
-                    "resources": result.resources,
-                })),
-                Err(error) => failures.push(json!({
-                    "server": server_name,
-                    "error": error.to_string(),
-                })),
-            }
-        }
-
-        if resources.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "resources": resources,
-            "failures": failures,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.read_resource(server_name, uri))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "contents": result.contents,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-}
-
-fn build_runtime_mcp_state(
-    runtime_config: &runtime::RuntimeConfig,
-) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
-        return Ok((None, Vec::new()));
-    };
-
-    let mut runtime_tools = discovery
-        .tools
-        .iter()
-        .map(mcp_runtime_tool_definition)
-        .collect::<Vec<_>>();
-    if !mcp_state.server_names().is_empty() {
-        runtime_tools.extend(mcp_wrapper_tool_definitions());
-    }
-
-    Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
-}
-
-fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
-    RuntimeToolDefinition {
-        name: tool.qualified_name.clone(),
-        description: Some(
-            tool.tool
-                .description
-                .clone()
-                .unwrap_or_else(|| format!("Invoke MCP tool `{}`.", tool.qualified_name)),
-        ),
-        input_schema: tool
-            .tool
-            .input_schema
-            .clone()
-            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
-        required_permission: permission_mode_for_mcp_tool(&tool.tool),
-    }
-}
-
-fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
-    vec![
-        RuntimeToolDefinition {
-            name: "MCPTool".to_string(),
-            description: Some(
-                "Call a configured MCP tool by its qualified name and JSON arguments.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "qualifiedName": { "type": "string" },
-                    "arguments": {}
-                },
-                "required": ["qualifiedName"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        RuntimeToolDefinition {
-            name: "ListMcpResourcesTool".to_string(),
-            description: Some(
-                "List MCP resources from one configured server or from every connected server."
-                    .to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        RuntimeToolDefinition {
-            name: "ReadMcpResourceTool".to_string(),
-            description: Some("Read a specific MCP resource from a configured server.".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "uri": { "type": "string" }
-                },
-                "required": ["server", "uri"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-    ]
-}
-
-fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
-    let read_only = mcp_annotation_flag(tool, "readOnlyHint");
-    let destructive = mcp_annotation_flag(tool, "destructiveHint");
-    let open_world = mcp_annotation_flag(tool, "openWorldHint");
-
-    if read_only && !destructive && !open_world {
-        PermissionMode::ReadOnly
-    } else if destructive || open_world {
-        PermissionMode::DangerFullAccess
-    } else {
-        PermissionMode::WorkspaceWrite
-    }
-}
-
-fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
-    tool.annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(key))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 struct HookAbortMonitor {
