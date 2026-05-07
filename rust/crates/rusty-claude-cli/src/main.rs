@@ -2020,7 +2020,10 @@ mod tests {
         should_log_stream_event_for_tool_diagnostics, should_log_streamed_tool_input_delta,
         should_log_tool_stop_without_start, track_tool_block_index, validate_tool_input_json,
     };
-    use api::{ApiError, ContentBlockDeltaEvent, MessageResponse, OutputContentBlock, Usage};
+    use api::{
+        ApiError, ContentBlockDeltaEvent, MessageResponse, OutputContentBlock,
+        StreamEvent as ApiStreamEvent, Usage,
+    };
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
