@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -223,6 +224,11 @@ pub fn read_file(
 
 /// Replaces a file's contents and returns patch metadata.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    let absolute_path = normalize_path_allow_missing(path)?;
+    write_file_at_path(&absolute_path, content)
+}
+
+fn write_file_at_path(absolute_path: &Path, content: &str) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -234,12 +240,11 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         ));
     }
 
-    let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+    let original_file = fs::read_to_string(absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+    fs::write(absolute_path, content)?;
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -575,6 +580,87 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
 
     let original_lines = original.lines().collect::<Vec<_>>();
     let updated_lines = updated.lines().collect::<Vec<_>>();
+    if original_lines.len() == updated_lines.len() {
+        let changed_indices = original_lines
+            .iter()
+            .zip(&updated_lines)
+            .enumerate()
+            .filter_map(|(index, (old, new))| (old != new).then_some(index))
+            .collect::<Vec<_>>();
+        if !changed_indices.is_empty() {
+            return make_line_aligned_patch(&original_lines, &updated_lines, &changed_indices);
+        }
+    }
+
+    make_single_hunk_patch(&original_lines, &updated_lines)
+}
+
+fn make_line_aligned_patch(
+    original_lines: &[&str],
+    updated_lines: &[&str],
+    changed_indices: &[usize],
+) -> Vec<StructuredPatchHunk> {
+    const CONTEXT_LINES: usize = 2;
+
+    let mut hunks = Vec::new();
+    let mut hunk_start = changed_indices[0].saturating_sub(CONTEXT_LINES);
+    let mut hunk_end = (changed_indices[0] + CONTEXT_LINES + 1).min(original_lines.len());
+
+    for &index in &changed_indices[1..] {
+        let next_start = index.saturating_sub(CONTEXT_LINES);
+        let next_end = (index + CONTEXT_LINES + 1).min(original_lines.len());
+        if next_start <= hunk_end {
+            hunk_end = hunk_end.max(next_end);
+        } else {
+            hunks.push(make_line_aligned_hunk(
+                original_lines,
+                updated_lines,
+                hunk_start,
+                hunk_end,
+            ));
+            hunk_start = next_start;
+            hunk_end = next_end;
+        }
+    }
+
+    hunks.push(make_line_aligned_hunk(
+        original_lines,
+        updated_lines,
+        hunk_start,
+        hunk_end,
+    ));
+    hunks
+}
+
+fn make_line_aligned_hunk(
+    original_lines: &[&str],
+    updated_lines: &[&str],
+    start: usize,
+    end: usize,
+) -> StructuredPatchHunk {
+    let mut lines = Vec::new();
+    for index in start..end {
+        if original_lines[index] == updated_lines[index] {
+            lines.push(format!(" {}", original_lines[index]));
+        } else {
+            lines.push(format!("-{}", original_lines[index]));
+            lines.push(format!("+{}", updated_lines[index]));
+        }
+    }
+
+    StructuredPatchHunk {
+        old_start: start.saturating_add(1),
+        old_lines: end.saturating_sub(start),
+        new_start: start.saturating_add(1),
+        new_lines: end.saturating_sub(start),
+        lines,
+    }
+}
+
+fn make_single_hunk_patch(
+    original_lines: &[&str],
+    updated_lines: &[&str],
+) -> Vec<StructuredPatchHunk> {
     let mut prefix_len = 0usize;
     while prefix_len < original_lines.len()
         && prefix_len < updated_lines.len()
@@ -658,6 +744,79 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
+fn normalize_missing_path_with_existing_parent(path: &str) -> io::Result<(PathBuf, PathBuf)> {
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut current = candidate.as_path();
+    let mut missing_components = Vec::<OsString>::new();
+    let mut missing_contains_parent_dir = false;
+
+    loop {
+        if current.exists() {
+            let canonical_existing = current.canonicalize()?;
+            if missing_contains_parent_dir {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "path {} traverses through a missing parent directory",
+                        candidate.display()
+                    ),
+                ));
+            }
+
+            let mut resolved = canonical_existing.clone();
+            for component in missing_components.iter().rev() {
+                resolved.push(component);
+            }
+            return Ok((resolved, canonical_existing));
+        }
+
+        match current.components().next_back() {
+            Some(Component::Normal(component)) => {
+                missing_components.push(component.to_os_string());
+            }
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                missing_contains_parent_dir = true;
+            }
+            Some(Component::RootDir) | Some(Component::Prefix(_)) | None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no existing parent found for {}", candidate.display()),
+                ));
+            }
+        }
+
+        current = current.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no existing parent found for {}", candidate.display()),
+            )
+        })?;
+    }
+}
+
+fn glob_pattern_contains_parent_traversal(pattern: &str) -> bool {
+    Path::new(pattern)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn validate_glob_matches_in_workspace(
+    output: GlobSearchOutput,
+    workspace_root: &Path,
+) -> io::Result<GlobSearchOutput> {
+    for filename in &output.filenames {
+        let resolved = Path::new(filename).canonicalize()?;
+        validate_workspace_boundary(&resolved, workspace_root)?;
+    }
+    Ok(output)
+}
+
 /// Read a file with workspace boundary enforcement.
 #[allow(dead_code)]
 pub fn read_file_in_workspace(
@@ -681,12 +840,13 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
+    let (absolute_path, existing_parent) = normalize_missing_path_with_existing_parent(path)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&existing_parent, &canonical_root)?;
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    write_file_at_path(&absolute_path, content)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -721,14 +881,23 @@ pub fn glob_search_in_workspace(
         .transpose()?
         .unwrap_or_else(|| canonical_root.clone());
     validate_workspace_boundary(&base_path, &canonical_root)?;
+    if glob_pattern_contains_parent_traversal(pattern) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("glob pattern {pattern} escapes workspace boundary"),
+        ));
+    }
 
     if Path::new(pattern).is_absolute() {
         let resolved_pattern = normalize_path_allow_missing(pattern)?;
         validate_workspace_boundary(&resolved_pattern, &canonical_root)?;
-        return glob_search(pattern, None);
+        return validate_glob_matches_in_workspace(glob_search(pattern, None)?, &canonical_root);
     }
 
-    glob_search(pattern, Some(base_path.to_string_lossy().as_ref()))
+    validate_glob_matches_in_workspace(
+        glob_search(pattern, Some(base_path.to_string_lossy().as_ref()))?,
+        &canonical_root,
+    )
 }
 
 /// Run a grep search with workspace boundary enforcement.
@@ -796,7 +965,7 @@ mod tests {
     use super::{
         edit_file, expand_braces, glob_search, glob_search_in_workspace, grep_search,
         grep_search_in_workspace, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -861,6 +1030,41 @@ mod tests {
         assert!(
             changed_lines <= 4,
             "single-line edits should not serialize the entire file as removed and re-added"
+        );
+    }
+
+    #[test]
+    fn confirms_issue_14_replace_all_emits_separated_localized_hunks() {
+        let path = temp_path("issue-14-separated-patch.txt");
+        let mut lines = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+        lines[4] = "target".to_string();
+        lines[34] = "target".to_string();
+        let original = format!("{}\n", lines.join("\n"));
+        write_file(path.to_string_lossy().as_ref(), &original).expect("initial file should write");
+
+        let output = edit_file(path.to_string_lossy().as_ref(), "target", "TARGET", true)
+            .expect("replace_all edit should execute");
+        let serialized_lines = output
+            .structured_patch
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .collect::<Vec<_>>();
+
+        assert!(
+            output.structured_patch.len() >= 2,
+            "separated edits should be emitted as multiple localized hunks"
+        );
+        assert!(
+            serialized_lines.len() <= 16,
+            "separated edits should not serialize the unchanged middle of the file"
+        );
+        assert!(
+            !serialized_lines
+                .iter()
+                .any(|line| line.as_str() == "-line 20" || line.as_str() == "+line 20"),
+            "unchanged middle lines should not be represented as removals/additions"
         );
     }
 
@@ -934,6 +1138,61 @@ mod tests {
         )
         .expect_err("outside grep base should be rejected");
         assert_eq!(grep_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn workspace_scoped_search_rejects_relative_parent_traversal_patterns() {
+        let workspace = temp_path("workspace-search-relative-root");
+        let outside_name = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}-outside"))
+            .expect("workspace should have a file name");
+        let outside = workspace
+            .parent()
+            .expect("workspace should have a parent")
+            .join(&outside_name);
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::create_dir_all(&outside).expect("outside should create");
+        std::fs::write(outside.join("secret.txt"), "needle\n").expect("outside file should write");
+
+        let pattern = format!("../{outside_name}/**/*.txt");
+        let error = glob_search_in_workspace(&pattern, None, &workspace)
+            .expect_err("relative glob traversal should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn workspace_scoped_write_rejects_missing_parent_traversal() {
+        let workspace = temp_path("workspace-write-root");
+        let outside_name = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}-outside"))
+            .expect("workspace should have a file name");
+        let outside = workspace
+            .parent()
+            .expect("workspace should have a parent")
+            .join(&outside_name);
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let traversal = workspace.join("..").join(&outside_name).join("new.txt");
+        let error =
+            write_file_in_workspace(traversal.to_string_lossy().as_ref(), "nope", &workspace)
+                .expect_err("missing outside parent traversal should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !outside.join("new.txt").exists(),
+            "rejected workspace write should not create the outside file"
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(outside);
