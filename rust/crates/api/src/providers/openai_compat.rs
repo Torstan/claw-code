@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -948,53 +949,112 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
 
 /// Remove `role:"tool"` messages from `messages` that have no valid paired
 /// `role:"assistant"` message with a matching `tool_calls[].id` immediately
-/// preceding them. This is a last-resort safety net at the request-building
+/// preceding them, then remove assistant tool calls that no longer have kept
+/// tool results. This is a last-resort safety net at the request-building
 /// layer — the compaction boundary fix (6e301c8) prevents the most common
 /// producer path, but resume, session editing, or future compaction variants
 /// could still create orphaned tool messages.
 ///
-/// Algorithm: scan left-to-right. For each `role:"tool"` message, check the
-/// immediately preceding non-tool message. If it's `role:"assistant"` with a
-/// `tool_calls` array containing an entry whose `id` matches the tool
-/// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
-/// the tool message is dropped.
+/// Algorithm: scan left-to-right and keep only tool messages whose nearest
+/// preceding non-tool message is an assistant message with a matching
+/// `tool_calls[].id`. Then, in a second pass, keep only assistant tool calls
+/// that still have kept tool results; if none remain, keep the assistant only
+/// when it has non-empty content without tool calls.
 fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
-    // Collect indices of tool messages that are orphaned.
-    let mut drop_indices = std::collections::HashSet::new();
+    let mut kept_tool_indices = HashSet::new();
+    let mut matched_tool_call_ids_by_assistant: HashMap<usize, HashSet<String>> = HashMap::new();
+
     for (i, msg) in messages.iter().enumerate() {
         if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
             continue;
         }
-        let tool_call_id = msg
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let Some(tool_call_id) = msg.get("tool_call_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
         // Find the nearest preceding non-tool message.
         let preceding = messages[..i]
             .iter()
+            .enumerate()
             .rev()
-            .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
-        let paired = preceding
-            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
-            .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+            .find(|(_, m)| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
+        let Some((assistant_index, assistant)) = preceding else {
+            continue;
+        };
+        if assistant.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let paired = assistant
+            .get("tool_calls")
+            .and_then(|tc| tc.as_array())
             .is_some_and(|tool_calls| {
                 tool_calls
                     .iter()
                     .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
             });
-        if !paired {
-            drop_indices.insert(i);
+        if paired {
+            kept_tool_indices.insert(i);
+            matched_tool_call_ids_by_assistant
+                .entry(assistant_index)
+                .or_default()
+                .insert(tool_call_id.to_string());
         }
     }
-    if drop_indices.is_empty() {
-        return messages;
+
+    let mut sanitized = Vec::with_capacity(messages.len());
+    for (i, mut msg) in messages.into_iter().enumerate() {
+        match msg.get("role").and_then(|v| v.as_str()) {
+            Some("tool") => {
+                if kept_tool_indices.contains(&i) {
+                    sanitized.push(msg);
+                }
+            }
+            Some("assistant") if msg.get("tool_calls").and_then(|tc| tc.as_array()).is_some() => {
+                let retained_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|tool_calls| {
+                        tool_calls
+                            .iter()
+                            .filter(|tool_call| {
+                                tool_call
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|id| {
+                                        matched_tool_call_ids_by_assistant
+                                            .get(&i)
+                                            .is_some_and(|matched_ids| matched_ids.contains(id))
+                                    })
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                if retained_tool_calls.is_empty() {
+                    if assistant_has_non_empty_content(&msg) {
+                        if let Some(obj) = msg.as_object_mut() {
+                            obj.remove("tool_calls");
+                        }
+                        sanitized.push(msg);
+                    }
+                } else {
+                    msg["tool_calls"] = Value::Array(retained_tool_calls);
+                    sanitized.push(msg);
+                }
+            }
+            _ => sanitized.push(msg),
+        }
     }
-    messages
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !drop_indices.contains(i))
-        .map(|(_, m)| m)
-        .collect()
+    sanitized
+}
+
+fn assistant_has_non_empty_content(message: &Value) -> bool {
+    match message.get("content") {
+        Some(Value::String(content)) => !content.is_empty(),
+        Some(Value::Array(content)) => !content.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
 }
 
 fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
@@ -1220,12 +1280,27 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
 }
 
 fn is_local_openai_compatible_base_url(base_url: &str) -> bool {
-    let normalized = base_url.trim().to_ascii_lowercase();
-    normalized.starts_with("http://localhost:")
-        || normalized == "http://localhost"
-        || normalized.starts_with("http://localhost/")
-        || normalized.starts_with("http://127.")
-        || normalized.starts_with("http://[::1]")
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.octets()[0] == 127,
+        Ok(IpAddr::V6(ip)) => ip == Ipv6Addr::LOCALHOST,
+        Err(_) => false,
+    }
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -1582,25 +1657,64 @@ mod tests {
     }
 
     #[test]
+    fn confirms_issue_04_local_base_url_detection_parses_host_only() {
+        assert!(super::is_local_openai_compatible_base_url(
+            "http://localhost:11434/v1"
+        ));
+        assert!(super::is_local_openai_compatible_base_url(
+            "http://127.255.0.1:11434/v1"
+        ));
+        assert!(super::is_local_openai_compatible_base_url(
+            "http://[::1]:11434/v1"
+        ));
+
+        assert!(!super::is_local_openai_compatible_base_url(
+            "http://127.0.0.1@evil.example/v1"
+        ));
+        assert!(!super::is_local_openai_compatible_base_url(
+            "http://127.0.0.1.evil.example/v1"
+        ));
+    }
+
+    #[test]
     fn confirms_issue_05_tool_result_wire_payload_omits_is_error() {
         let request = MessageRequest {
             model: "openai/gpt-4o".to_string(),
             max_tokens: 64,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: vec![ToolResultContentBlock::Text {
-                        text: "tool failed".to_string(),
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "Cargo.toml"}),
                     }],
-                    is_error: true,
-                    cache_control: None,
-                }],
-            }],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "tool failed".to_string(),
+                        }],
+                        is_error: true,
+                        cache_control: None,
+                    }],
+                },
+            ],
             ..Default::default()
         };
 
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let tool_message = payload["messages"]
+            .as_array()
+            .expect("messages should be array")
+            .iter()
+            .find(|message| message["role"] == json!("tool"))
+            .expect("valid paired tool result should be serialized");
+        assert_eq!(tool_message["tool_call_id"], json!("call_1"));
+        assert!(tool_message.get("is_error").is_none());
+
         let serialized = serde_json::to_string(&payload).expect("payload should serialize");
 
         assert!(
@@ -1884,14 +1998,17 @@ mod tests {
         let request = MessageRequest {
             model: "gpt-4o".to_string(),
             max_tokens: 100,
-            messages: vec![InputMessage {
-                role: "assistant".to_string(),
-                content: vec![InputContentBlock::ToolUse {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "/tmp/test"}),
-                }],
-            }],
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/test"}),
+                    }],
+                },
+                InputMessage::user_tool_result("call_1", "file contents", false),
+            ],
             stream: false,
             ..Default::default()
         };
@@ -1912,7 +2029,7 @@ mod tests {
     /// dropped by the request-builder sanitizer. Regression for the second
     /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
     #[test]
-    fn sanitize_drops_orphaned_tool_messages() {
+    fn confirms_issue_05_sanitize_drops_orphaned_tool_messages_and_unmatched_tool_calls() {
         use super::sanitize_tool_message_pairing;
 
         // Valid pair: assistant with tool_calls → tool result
@@ -1938,7 +2055,10 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "call_WRONG", "content": "bad"}),
         ];
         let out = sanitize_tool_message_pairing(mismatched);
-        assert_eq!(out.len(), 1, "tool message with wrong id must be dropped");
+        assert!(
+            out.is_empty(),
+            "mismatched tool result and now-unanswered assistant tool call must both be dropped"
+        );
 
         // Two tool results both valid (same preceding assistant)
         let two_results = vec![
@@ -1951,6 +2071,23 @@ mod tests {
         ];
         let out = sanitize_tool_message_pairing(two_results);
         assert_eq!(out.len(), 3, "both valid tool results must be preserved");
+
+        // A partially answered assistant must keep only tool_calls that still
+        // have a matching kept tool result.
+        let partial_results = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "ra"}),
+        ];
+        let out = sanitize_tool_message_pairing(partial_results);
+        assert_eq!(out.len(), 2, "valid partial pair must be preserved");
+        let kept_tool_calls = out[0]["tool_calls"]
+            .as_array()
+            .expect("assistant should keep matched tool calls only");
+        assert_eq!(kept_tool_calls.len(), 1);
+        assert_eq!(kept_tool_calls[0]["id"], json!("call_a"));
     }
 
     #[test]
