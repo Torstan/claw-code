@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{validate_packet, TaskPacket, TaskPacketValidationError};
+use crate::{active_tool_session_id, validate_packet, TaskPacket, TaskPacketValidationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +83,14 @@ impl TaskRegistry {
         Self::default()
     }
 
+    fn current_scope() -> String {
+        active_tool_session_id().unwrap_or_else(|| "global".to_string())
+    }
+
+    fn scoped_key(task_id: &str) -> String {
+        format!("{}\u{1f}{task_id}", Self::current_scope())
+    }
+
     pub fn create(&self, prompt: &str, description: Option<&str>) -> Task {
         self.create_task(prompt.to_owned(), description.map(str::to_owned), None)
     }
@@ -154,20 +162,22 @@ impl TaskRegistry {
             output: String::new(),
             team_id: None,
         };
-        inner.tasks.insert(task_id, task.clone());
+        inner.tasks.insert(Self::scoped_key(&task_id), task.clone());
         task
     }
 
     pub fn get(&self, task_id: &str) -> Option<Task> {
+        let key = Self::scoped_key(task_id);
         let inner = self
             .state
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.tasks.get(task_id).cloned()
+        inner.tasks.get(&key).cloned()
     }
 
     pub fn list(&self, status_filter: Option<TaskStatus>) -> Vec<Task> {
+        let scope_prefix = format!("{}\u{1f}", Self::current_scope());
         let inner = self
             .state
             .inner
@@ -175,13 +185,16 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .tasks
-            .values()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&scope_prefix))
+            .map(|(_, task)| task)
             .filter(|t| status_filter.map_or(true, |s| t.status == s))
             .cloned()
             .collect()
     }
 
     pub fn stop(&self, task_id: &str) -> Result<Task, String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -189,7 +202,7 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get_mut(task_id)
+            .get_mut(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
 
         match task.status {
@@ -209,6 +222,7 @@ impl TaskRegistry {
     }
 
     pub fn update(&self, task_id: &str, message: &str) -> Result<Task, String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -216,7 +230,7 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get_mut(task_id)
+            .get_mut(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
 
         task.messages.push(TaskMessage {
@@ -229,6 +243,7 @@ impl TaskRegistry {
     }
 
     pub fn output(&self, task_id: &str) -> Result<String, String> {
+        let key = Self::scoped_key(task_id);
         let inner = self
             .state
             .inner
@@ -236,12 +251,13 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get(task_id)
+            .get(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         Ok(task.output.clone())
     }
 
     pub fn append_output(&self, task_id: &str, output: &str) -> Result<(), String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -249,7 +265,7 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get_mut(task_id)
+            .get_mut(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.output.push_str(output);
         task.updated_at = now_secs();
@@ -257,6 +273,7 @@ impl TaskRegistry {
     }
 
     pub fn set_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -264,7 +281,7 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get_mut(task_id)
+            .get_mut(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.status = status;
         task.updated_at = now_secs();
@@ -273,6 +290,7 @@ impl TaskRegistry {
     }
 
     pub fn assign_team(&self, task_id: &str, team_id: &str) -> Result<(), String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -280,7 +298,7 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let task = inner
             .tasks
-            .get_mut(task_id)
+            .get_mut(&key)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.team_id = Some(team_id.to_owned());
         task.updated_at = now_secs();
@@ -288,6 +306,7 @@ impl TaskRegistry {
     }
 
     pub fn wait_for_terminal(&self, task_id: &str, timeout: Duration) -> Result<Task, String> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
@@ -298,7 +317,7 @@ impl TaskRegistry {
         loop {
             let task = inner
                 .tasks
-                .get(task_id)
+                .get(&key)
                 .cloned()
                 .ok_or_else(|| format!("task not found: {task_id}"))?;
 
@@ -322,7 +341,7 @@ impl TaskRegistry {
             if wait_result.timed_out() {
                 let task = inner
                     .tasks
-                    .get(task_id)
+                    .get(&key)
                     .cloned()
                     .ok_or_else(|| format!("task not found: {task_id}"))?;
                 return Ok(task);
@@ -331,12 +350,13 @@ impl TaskRegistry {
     }
 
     pub fn remove(&self, task_id: &str) -> Option<Task> {
+        let key = Self::scoped_key(task_id);
         let mut inner = self
             .state
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let removed = inner.tasks.remove(task_id);
+        let removed = inner.tasks.remove(&key);
         if removed.is_some() {
             self.state.changed.notify_all();
         }

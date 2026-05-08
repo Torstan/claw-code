@@ -16,11 +16,17 @@ use super::{
     ToolChoice, ToolDefinition, ToolError, ToolExecutor, ToolResultContentBlock, ToolSpec,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
+use runtime::with_active_tool_session;
 use std::time::Instant;
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+const FALLBACK_AGENT_MODEL: &str = "claude-sonnet-4-6";
+const AGENT_MODEL_ENV_VAR: &str = "CLAWD_AGENT_MODEL";
 const FALLBACK_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+const BACKGROUND_NOTIFICATION_MAX_CHARS: usize = 8 * 1024;
+const BACKGROUND_NOTIFICATION_BODY_PREVIEW_CHARS: usize = 2 * 1024;
+const DEFAULT_AGENT_CONCURRENCY_LIMIT: usize = 4;
+const AGENT_CONCURRENCY_ENV_VAR: &str = "CLAWD_AGENT_MAX_CONCURRENCY";
 
 pub(crate) fn execute_agent(input: AgentInput) -> Result<AgentToolOutput, String> {
     agent_debug_log(
@@ -205,6 +211,46 @@ pub(crate) fn build_async_agent_launch_output(
     }
 }
 
+fn agent_concurrency_limit() -> usize {
+    std::env::var(AGENT_CONCURRENCY_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AGENT_CONCURRENCY_LIMIT)
+}
+
+fn background_agent_slots() -> &'static std::sync::Mutex<usize> {
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<usize>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Mutex::new(0))
+}
+
+pub(crate) struct BackgroundAgentSlot;
+
+impl BackgroundAgentSlot {
+    pub(crate) fn acquire() -> Result<Self, String> {
+        let limit = agent_concurrency_limit();
+        let mut active = background_agent_slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *active >= limit {
+            return Err(format!(
+                "background agent concurrency limit reached: active={active} limit={limit}"
+            ));
+        }
+        *active += 1;
+        Ok(Self)
+    }
+}
+
+impl Drop for BackgroundAgentSlot {
+    fn drop(&mut self) {
+        let mut active = background_agent_slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let started_at = Instant::now();
@@ -222,14 +268,17 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     // Register in the task registry so TaskGet/TaskOutput can find this agent.
     let registry = global_task_registry();
     let agent_id = job.manifest.agent_id.clone();
-    registry.create_with_id(
-        agent_id.clone(),
-        &job.prompt,
-        Some(&job.manifest.description),
-    );
-    registry
-        .set_status(&agent_id, TaskStatus::Running)
-        .map_err(|e| e.clone())?;
+    let parent_session_id = job.parent_session_id.clone();
+    with_active_tool_session(parent_session_id.as_deref(), || {
+        registry.create_with_id(
+            agent_id.clone(),
+            &job.prompt,
+            Some(&job.manifest.description),
+        );
+        registry
+            .set_status(&agent_id, TaskStatus::Running)
+            .map_err(|e| e.clone())
+    })?;
     agent_debug_log(
         "agent.background.register.done",
         format!(
@@ -251,6 +300,26 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 ),
             );
             let registry = global_task_registry();
+            let slot = match BackgroundAgentSlot::acquire() {
+                Ok(slot) => slot,
+                Err(error) => {
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(error.clone()),
+                    );
+                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                        registry.append_output(&job.manifest.agent_id, &error).ok();
+                        registry
+                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+                            .ok();
+                    });
+                    enqueue_background_agent_notification(&job, "failed", &error);
+                    return;
+                }
+            };
+            let _slot = slot;
             let started_at = Instant::now();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
@@ -268,8 +337,12 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         .ok()
                         .and_then(|m| m.result)
                         .unwrap_or_default();
-                    let _ = registry.append_output(&job.manifest.agent_id, &output);
-                    let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Completed);
+                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                        registry.append_output(&job.manifest.agent_id, &output).ok();
+                        registry
+                            .set_status(&job.manifest.agent_id, TaskStatus::Completed)
+                            .ok();
+                    });
                     enqueue_background_agent_notification(&job, "completed", &output);
                 }
                 Ok(Err(error)) => {
@@ -287,8 +360,12 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         None,
                         Some(error.clone()),
                     );
-                    let _ = registry.append_output(&job.manifest.agent_id, &error);
-                    let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Failed);
+                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                        registry.append_output(&job.manifest.agent_id, &error).ok();
+                        registry
+                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+                            .ok();
+                    });
                     enqueue_background_agent_notification(&job, "failed", &error);
                 }
                 Err(_) => {
@@ -307,8 +384,12 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         None,
                         Some(msg.clone()),
                     );
-                    let _ = registry.append_output(&job.manifest.agent_id, &msg);
-                    let _ = registry.set_status(&job.manifest.agent_id, TaskStatus::Failed);
+                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                        registry.append_output(&job.manifest.agent_id, &msg).ok();
+                        registry
+                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+                            .ok();
+                    });
                     enqueue_background_agent_notification(&job, "failed", &msg);
                 }
             }
@@ -342,10 +423,30 @@ pub(crate) fn enqueue_background_agent_notification(job: &AgentJob, status: &str
         job.manifest.agent_id, job.manifest.description, status, job.manifest.output_file
     );
     if !body.trim().is_empty() {
+        let compressed = compress_summary_text(body.trim());
+        let preview = compressed
+            .chars()
+            .take(BACKGROUND_NOTIFICATION_BODY_PREVIEW_CHARS)
+            .collect::<String>();
+        let truncated = compressed.chars().count() > BACKGROUND_NOTIFICATION_BODY_PREVIEW_CHARS;
         let _ = std::fmt::Write::write_fmt(
             &mut message,
-            format_args!("\n{detail_label}:\n{}", body.trim()),
+            format_args!(
+                "\n{detail_label}_preview:\n{}{}",
+                preview,
+                if truncated {
+                    "\n[full output is available in output_file]"
+                } else {
+                    ""
+                }
+            ),
         );
+    }
+    if message.chars().count() > BACKGROUND_NOTIFICATION_MAX_CHARS {
+        let marker = "\n[notification truncated; full output is available in output_file]";
+        let keep_chars = BACKGROUND_NOTIFICATION_MAX_CHARS.saturating_sub(marker.chars().count());
+        message = message.chars().take(keep_chars).collect::<String>();
+        message.push_str(marker);
     }
     enqueue_session_notification(session_id.to_string(), message);
 }
@@ -418,7 +519,7 @@ pub(crate) fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+        .unwrap_or_else(|| FALLBACK_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     agent_debug_log(
         "agent.runtime.build.begin",
@@ -449,7 +550,14 @@ pub(crate) fn build_agent_runtime(
 }
 
 pub(crate) fn new_agent_session(agent_id: &str) -> Session {
-    let mut session = Session::new();
+    let persistence_path = agent_store_dir()
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".clawd-agents")
+        })
+        .join(format!("{agent_id}.session.jsonl"));
+    let mut session = Session::new().with_persistence_path(persistence_path);
     session.session_id = agent_id.to_string();
     session
 }
@@ -494,8 +602,30 @@ pub(crate) fn resolve_agent_model(model: Option<&str>) -> String {
     model
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+        .map(ToOwned::to_owned)
+        .or_else(configured_agent_model)
+        .unwrap_or_else(|| FALLBACK_AGENT_MODEL.to_string())
+}
+
+fn configured_agent_model() -> Option<String> {
+    std::env::var(AGENT_MODEL_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let cwd = std::env::current_dir().ok()?;
+            ConfigLoader::default_for(cwd)
+                .load()
+                .ok()?
+                .model()
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            std::env::var("ANTHROPIC_MODEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 pub(crate) fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {

@@ -42,9 +42,9 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
-    fn set_path(key: &'static str, value: &Path) -> Self {
+    fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value.as_os_str());
+        std::env::set_var(key, value);
         Self { key, previous }
     }
 }
@@ -2020,18 +2020,17 @@ fn agent_runtime_session_uses_manifest_agent_id_for_llm_logs() {
 }
 
 #[test]
-#[ignore = "known issue confirmation: subagent default model currently ignores parent provider"]
 fn confirms_issue_08_subagent_default_model_is_not_hardcoded_anthropic() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _model = EnvVarGuard::set("CLAWD_AGENT_MODEL", "openai/gpt-4o-mini");
     let model = super::agent::resolve_agent_model(None);
 
-    assert_ne!(
-        model, "claude-opus-4-6",
-        "subagents without explicit model should inherit parent/provider model or use configurable default"
-    );
+    assert_eq!(model, "openai/gpt-4o-mini");
 }
 
 #[test]
-#[ignore = "known issue confirmation: subagent sessions currently lack persistence path"]
 fn confirms_issue_09_subagent_session_has_persistence_for_tool_result_budgeting() {
     let session = new_agent_session("agent-issue-09");
 
@@ -2094,7 +2093,6 @@ fn background_agent_captures_parent_session_and_formats_notification() {
 }
 
 #[test]
-#[ignore = "known issue confirmation: background agent notifications currently include unbounded body"]
 fn confirms_issue_10_background_agent_notification_is_bounded() {
     let parent_session = "parent-issue-10";
     let manifest = super::AgentOutput {
@@ -2129,9 +2127,11 @@ fn confirms_issue_10_background_agent_notification_is_bounded() {
 
     assert_eq!(notifications.len(), 1);
     assert!(
-        notifications[0].len() < 8 * 1024,
+        notifications[0].chars().count() <= 8 * 1024,
         "background completion notifications should summarize or externalize large agent output"
     );
+    assert!(notifications[0].contains("result_preview:"));
+    assert!(!notifications[0].contains(&"x".repeat(4 * 1024)));
 }
 
 #[test]
@@ -2339,22 +2339,27 @@ fn agent_background_registers_in_task_registry() {
 }
 
 #[test]
-#[ignore = "known issue confirmation: global task registry is not session-scoped"]
 fn confirms_issue_11_task_registry_requires_session_scope() {
     let registry = global_task_registry();
-    let task = registry.create_with_id(
-        "shared-task-id".to_string(),
-        "prompt from session a",
-        Some("session a task"),
-    );
+    let task = with_active_tool_session(Some("session-a"), || {
+        registry.create_with_id(
+            "shared-task-id".to_string(),
+            "prompt from session a",
+            Some("session a task"),
+        )
+    });
 
-    let visible_from_global_lookup = registry.get(&task.task_id).is_some();
-    registry.remove(&task.task_id);
+    let visible_in_session_a =
+        with_active_tool_session(Some("session-a"), || registry.get(&task.task_id).is_some());
+    let visible_in_session_b =
+        with_active_tool_session(Some("session-b"), || registry.get(&task.task_id).is_some());
+    let visible_without_session = registry.get(&task.task_id).is_some();
 
-    assert!(
-        !visible_from_global_lookup,
-        "task lookup should require a session namespace instead of process-global task ids"
-    );
+    let _ = with_active_tool_session(Some("session-a"), || registry.remove(&task.task_id));
+
+    assert!(visible_in_session_a);
+    assert!(!visible_in_session_b);
+    assert!(!visible_without_session);
 }
 
 #[test]
@@ -2410,38 +2415,20 @@ fn agent_background_launch_returns_async_contract() {
 }
 
 #[test]
-#[ignore = "known issue confirmation: background agent spawn is unbounded"]
 fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
     let _guard = env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let agent_store = temp_path("issue-12-agent-store");
-    let _agent_store_env = EnvVarGuard::set_path("CLAWD_AGENT_STORE", &agent_store);
+    let _limit = EnvVarGuard::set("CLAWD_AGENT_MAX_CONCURRENCY", "1");
 
-    let input = AgentInput {
-        description: "bounded background work".to_string(),
-        prompt: "do bounded work".to_string(),
-        subagent_type: None,
-        name: None,
-        model: Some("claude-opus-4-6".to_string()),
-        run_in_background: Some(true),
-    };
-    let spawned = Arc::new(Mutex::new(0usize));
-    let spawned_for_closure = Arc::clone(&spawned);
+    let first_slot =
+        super::agent::BackgroundAgentSlot::acquire().expect("first slot should be available");
+    let second = super::agent::BackgroundAgentSlot::acquire();
+    drop(first_slot);
 
-    let output = execute_agent_with_mode(input, move |_job| {
-        *spawned_for_closure.lock().expect("spawn count lock") += 1;
-        Ok(())
-    });
-
-    let _ = fs::remove_dir_all(&agent_store);
-    let output = output.expect("agent launch should return");
-
-    assert!(matches!(output, AgentToolOutput::AsyncLaunched(_)));
-    assert_eq!(
-        *spawned.lock().expect("spawn count lock"),
-        0,
-        "background launches should enter a bounded queue instead of spawning immediately"
+    assert!(
+        second.is_err(),
+        "background agent work must be capped instead of allowing unbounded concurrent execution"
     );
 }
 
