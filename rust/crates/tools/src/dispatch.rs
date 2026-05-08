@@ -933,9 +933,10 @@ fn branch_divergence_output(
 }
 
 fn active_workspace_root() -> Result<std::path::PathBuf, String> {
-    active_tool_workspace_root()
-        .map(Ok)
-        .unwrap_or_else(|| std::env::current_dir().map_err(|error| error.to_string()))
+    active_tool_workspace_root().map_or_else(
+        || std::env::current_dir().map_err(|error| error.to_string()),
+        Ok,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]

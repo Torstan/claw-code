@@ -133,9 +133,10 @@ pub(crate) fn execute_notebook_edit(
 }
 
 fn active_workspace_root() -> Result<std::path::PathBuf, String> {
-    active_tool_workspace_root()
-        .map(Ok)
-        .unwrap_or_else(|| std::env::current_dir().map_err(|error| error.to_string()))
+    active_tool_workspace_root().map_or_else(
+        || std::env::current_dir().map_err(|error| error.to_string()),
+        Ok,
+    )
 }
 
 fn require_notebook_source(

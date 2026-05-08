@@ -2765,10 +2765,7 @@ fn background_agent_spawn_error_marks_registry_failed() {
 
     let launch_error = with_active_tool_session(Some(session_id), || {
         super::agent::spawn_agent_job_with_thread_spawner(job, |_builder, _body| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "thread creation failed",
-            ))
+            Err(std::io::Error::other("thread creation failed"))
         })
         .expect_err("thread spawn failure should surface")
     });

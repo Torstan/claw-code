@@ -395,7 +395,7 @@ where
         }
     });
     spawn_thread(std::thread::Builder::new().name(thread_name), body)
-        .map(|_| {
+        .map(|()| {
             agent_debug_log(
                 "agent.background.thread.spawned",
                 format!("agent_id={spawned_agent_id}"),
