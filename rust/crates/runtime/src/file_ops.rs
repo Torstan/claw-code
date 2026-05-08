@@ -180,9 +180,16 @@ pub fn read_file(
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
+    read_file_at_path(&absolute_path, offset, limit)
+}
 
+fn read_file_at_path(
+    absolute_path: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> io::Result<ReadFileOutput> {
     // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
+    let metadata = fs::metadata(absolute_path)?;
     if metadata.len() > MAX_READ_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -195,14 +202,14 @@ pub fn read_file(
     }
 
     // Detect binary files
-    if is_binary_file(&absolute_path)? {
+    if is_binary_file(absolute_path)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file appears to be binary",
         ));
     }
 
-    let content = fs::read_to_string(&absolute_path)?;
+    let content = fs::read_to_string(absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
@@ -268,7 +275,16 @@ pub fn edit_file(
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let original_file = fs::read_to_string(&absolute_path)?;
+    edit_file_at_path(&absolute_path, old_string, new_string, replace_all)
+}
+
+fn edit_file_at_path(
+    absolute_path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    let original_file = fs::read_to_string(absolute_path)?;
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -296,7 +312,7 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+    fs::write(absolute_path, &updated)?;
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -907,21 +923,31 @@ fn make_single_hunk_patch(
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
+fn path_candidate_from(path: &str, base: &Path) -> PathBuf {
+    if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
-    };
+        base.join(path)
+    }
+}
+
+fn normalize_path(path: &str) -> io::Result<PathBuf> {
+    let base = std::env::current_dir()?;
+    normalize_path_from(path, &base)
+}
+
+fn normalize_path_from(path: &str, base: &Path) -> io::Result<PathBuf> {
+    let candidate = path_candidate_from(path, base);
     candidate.canonicalize()
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let base = std::env::current_dir()?;
+    normalize_path_allow_missing_from(path, &base)
+}
+
+fn normalize_path_allow_missing_from(path: &str, base: &Path) -> io::Result<PathBuf> {
+    let candidate = path_candidate_from(path, base);
 
     if let Ok(canonical) = candidate.canonicalize() {
         return Ok(canonical);
@@ -939,12 +965,11 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
-fn normalize_missing_path_with_existing_parent(path: &str) -> io::Result<(PathBuf, PathBuf)> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+fn normalize_missing_path_with_existing_parent_from(
+    path: &str,
+    base: &Path,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let candidate = path_candidate_from(path, base);
 
     let mut current = candidate.as_path();
     let mut missing_components = Vec::<OsString>::new();
@@ -1020,12 +1045,12 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let absolute_path = normalize_path_from(path, &canonical_root)?;
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    read_file_at_path(&absolute_path, offset, limit)
 }
 
 /// Write a file with workspace boundary enforcement.
@@ -1035,10 +1060,11 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
-    let (absolute_path, existing_parent) = normalize_missing_path_with_existing_parent(path)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let (absolute_path, existing_parent) =
+        normalize_missing_path_with_existing_parent_from(path, &canonical_root)?;
     validate_workspace_boundary(&existing_parent, &canonical_root)?;
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     write_file_at_path(&absolute_path, content)
@@ -1053,12 +1079,12 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let absolute_path = normalize_path_from(path, &canonical_root)?;
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    edit_file_at_path(&absolute_path, old_string, new_string, replace_all)
 }
 
 /// Run a glob search with workspace boundary enforcement.
@@ -1072,7 +1098,7 @@ pub fn glob_search_in_workspace(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let base_path = path
-        .map(normalize_path)
+        .map(|path| normalize_path_from(path, &canonical_root))
         .transpose()?
         .unwrap_or_else(|| canonical_root.clone());
     validate_workspace_boundary(&base_path, &canonical_root)?;
@@ -1084,7 +1110,7 @@ pub fn glob_search_in_workspace(
     }
 
     if Path::new(pattern).is_absolute() {
-        let resolved_pattern = normalize_path_allow_missing(pattern)?;
+        let resolved_pattern = normalize_path_allow_missing_from(pattern, &canonical_root)?;
         validate_workspace_boundary(&resolved_pattern, &canonical_root)?;
         return validate_glob_matches_in_workspace(glob_search(pattern, None)?, &canonical_root);
     }
@@ -1107,7 +1133,7 @@ pub fn grep_search_in_workspace(
     let base_path = input
         .path
         .as_deref()
-        .map(normalize_path)
+        .map(|path| normalize_path_from(path, &canonical_root))
         .transpose()?
         .unwrap_or_else(|| canonical_root.clone());
     validate_workspace_boundary(&base_path, &canonical_root)?;
@@ -1158,9 +1184,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, glob_search_in_workspace, grep_search,
-        grep_search_in_workspace, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, edit_file_in_workspace, expand_braces, glob_search, glob_search_in_workspace,
+        grep_search, grep_search_in_workspace, is_symlink_escape, read_file,
+        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1169,6 +1196,31 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct CwdGuard {
+        previous: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("cwd should be readable");
+            std::env::set_current_dir(path).expect("cwd should change");
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).expect("cwd should restore");
+        }
     }
 
     #[test]
@@ -1511,6 +1563,55 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("escapes workspace"));
+    }
+
+    #[test]
+    fn workspace_scoped_file_ops_resolve_relative_paths_from_workspace_root() {
+        let _lock = env_lock();
+        let workspace = temp_path("workspace-relative-root");
+        let process_cwd = temp_path("workspace-relative-cwd");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&process_cwd).expect("cwd dir should be created");
+        std::fs::write(workspace.join("target.txt"), "alpha\n").expect("workspace file");
+        std::fs::write(process_cwd.join("target.txt"), "wrong\n").expect("cwd file");
+        let _cwd = CwdGuard::set(&process_cwd);
+
+        let read_output = read_file_in_workspace("target.txt", None, None, &workspace)
+            .expect("relative read should resolve from workspace root");
+        assert_eq!(read_output.file.content, "alpha");
+
+        let write_output = write_file_in_workspace("created.txt", "created\n", &workspace)
+            .expect("relative write should resolve from workspace root");
+        assert_eq!(
+            write_output.file_path,
+            workspace.join("created.txt").display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("created.txt")).expect("workspace created file"),
+            "created\n"
+        );
+        assert!(
+            !process_cwd.join("created.txt").exists(),
+            "relative workspace writes must not target process cwd"
+        );
+
+        let edit_output = edit_file_in_workspace("target.txt", "alpha", "beta", false, &workspace)
+            .expect("relative edit should resolve from workspace root");
+        assert_eq!(
+            edit_output.file_path,
+            workspace.join("target.txt").display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("target.txt")).expect("workspace edited file"),
+            "beta\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(process_cwd.join("target.txt")).expect("cwd file unchanged"),
+            "wrong\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(process_cwd);
     }
 
     #[test]

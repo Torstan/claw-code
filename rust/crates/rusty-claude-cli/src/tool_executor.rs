@@ -1,9 +1,11 @@
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use runtime::{
-    active_tool_session_id, with_active_tool_session, ToolError, ToolExecutor, ToolInvocation,
+    active_tool_session_id, active_tool_workspace_root, with_active_tool_context, ToolError,
+    ToolExecutor, ToolInvocation,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -292,24 +294,25 @@ fn execute_parallel_invocation(
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     session_id: Option<&str>,
+    workspace_root: Option<&Path>,
 ) -> Result<String, ToolError> {
-    #[cfg(test)]
-    if let Some(executor) = test_parallel_invocation_executor()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-    {
-        return executor(invocation);
-    }
+    with_active_tool_context(session_id, workspace_root, || {
+        #[cfg(test)]
+        if let Some(executor) = test_parallel_invocation_executor()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return executor(invocation);
+        }
 
-    let worker = CliToolExecutor {
-        renderer: TerminalRenderer::new(),
-        emit_output: false,
-        allowed_tools,
-        tool_registry,
-        mcp_state,
-    };
-    with_active_tool_session(session_id, || {
+        let worker = CliToolExecutor {
+            renderer: TerminalRenderer::new(),
+            emit_output: false,
+            allowed_tools,
+            tool_registry,
+            mcp_state,
+        };
         worker.execute_raw(&invocation.tool_name, &invocation.input)
     })
 }
@@ -320,6 +323,7 @@ fn execute_parallel_chunk(
     tool_registry: &GlobalToolRegistry,
     mcp_state: Option<&Arc<Mutex<RuntimeMcpState>>>,
     session_id: Option<&str>,
+    workspace_root: Option<&Path>,
 ) -> Vec<Result<String, ToolError>> {
     #[cfg(test)]
     if let Some(observer) = test_parallel_chunk_observer()
@@ -338,6 +342,7 @@ fn execute_parallel_chunk(
             let tool_registry = tool_registry.clone();
             let mcp_state = mcp_state.cloned();
             let session_id = session_id.map(str::to_string);
+            let workspace_root = workspace_root.map(Path::to_path_buf);
             std::thread::spawn(move || {
                 let invocation_started_at = Instant::now();
                 cli_agent_debug_log(
@@ -354,6 +359,7 @@ fn execute_parallel_chunk(
                     tool_registry,
                     mcp_state,
                     session_id.as_deref(),
+                    workspace_root.as_deref(),
                 );
                 cli_agent_debug_log(
                     "tool.execute_many.worker.done",
@@ -414,6 +420,7 @@ impl ToolExecutor for CliToolExecutor {
             ),
         );
         let session_id = active_tool_session_id();
+        let workspace_root = active_tool_workspace_root();
         let allowed_tools = self.allowed_tools.clone();
         let tool_registry = self.tool_registry.clone();
         let mcp_state = self.mcp_state.clone();
@@ -428,6 +435,7 @@ impl ToolExecutor for CliToolExecutor {
                 &tool_registry,
                 mcp_state.as_ref(),
                 session_id.as_deref(),
+                workspace_root.as_deref(),
             ));
         }
 
@@ -647,5 +655,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["result:first", "result:second", "result:third"]
         );
+    }
+
+    #[test]
+    fn parallel_agent_execution_preserves_active_workspace_root() {
+        let _lock = env_lock();
+        let workspace = debug_temp_dir("parallel-workspace-root");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let expected_workspace = workspace.clone();
+        let _executor_guard = TestParallelInvocationExecutorGuard::set(move |_invocation| {
+            assert_eq!(
+                active_tool_workspace_root().as_deref(),
+                Some(expected_workspace.as_path())
+            );
+            Ok(String::from("ok"))
+        });
+        let invocations = [
+            ToolInvocation {
+                tool_name: "Agent".to_string(),
+                input: r#"{"description":"first","prompt":"first prompt"}"#.to_string(),
+            },
+            ToolInvocation {
+                tool_name: "Agent".to_string(),
+                input: r#"{"description":"second","prompt":"second prompt"}"#.to_string(),
+            },
+        ];
+        let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+
+        let results =
+            runtime::with_active_tool_context(Some("parent-session"), Some(&workspace), || {
+                executor.execute_many(&invocations)
+            });
+
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
