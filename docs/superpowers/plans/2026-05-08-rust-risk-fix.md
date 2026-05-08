@@ -1102,7 +1102,11 @@ with_active_tool_session(parent_session_id.as_deref(), || {
 
 Also wrap `append_output` and `set_status` calls inside the background thread with `with_active_tool_session(job.parent_session_id.as_deref(), || { ... })`.
 
-To make `with_active_tool_session` available in `agent/mod.rs`, add it to the runtime import list in `rust/crates/tools/src/lib.rs` next to `active_tool_session_id`, and add it to the `use super::{ ... }` list at the top of `rust/crates/tools/src/agent/mod.rs`.
+To make `with_active_tool_session` available in `agent/mod.rs` without touching `rust/crates/tools/src/lib.rs`, add a direct import near the top of `rust/crates/tools/src/agent/mod.rs`:
+
+```rust
+use runtime::with_active_tool_session;
+```
 
 Replace the issue 11 proxy test with a direct session isolation test and remove the ignore:
 
