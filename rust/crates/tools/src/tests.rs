@@ -25,9 +25,10 @@ use super::{
 use api::{AuthSource, CacheControl, OutputContentBlock, ProviderClient};
 use runtime::ProviderFallbackConfig;
 use runtime::{
-    drain_session_notifications, permission_enforcer::PermissionEnforcer, with_active_tool_session,
-    ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime, LaneEventName,
-    PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+    drain_session_notifications, permission_enforcer::PermissionEnforcer, with_active_tool_context,
+    with_active_tool_session, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
+    LaneEventName, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+    ToolExecutor,
 };
 use serde_json::json;
 
@@ -355,6 +356,57 @@ fn confirms_issue_02_file_tool_dispatch_rejects_outside_absolute_paths() {
         accepted.is_empty(),
         "file tool dispatch accepted outside paths instead of enforcing workspace boundary: {accepted:?}"
     );
+}
+
+#[test]
+fn file_tool_dispatch_uses_active_session_workspace_root_not_process_cwd() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let session_workspace = temp_path("session-workspace-root");
+    let process_cwd = temp_path("process-cwd-root");
+    fs::create_dir_all(&session_workspace).expect("create session workspace");
+    fs::create_dir_all(&process_cwd).expect("create process cwd");
+    let session_file = session_workspace.join("readable.txt");
+    let cwd_file = process_cwd.join("cwd-only.txt");
+    fs::write(&session_file, "session-root-content\n").expect("write session file");
+    fs::write(&cwd_file, "cwd-content\n").expect("write cwd file");
+
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&process_cwd).expect("set process cwd");
+    let session_result = with_active_tool_context(
+        Some("session-workspace-test"),
+        Some(&session_workspace),
+        || {
+            execute_tool(
+                "read_file",
+                &json!({
+                    "path": session_file.display().to_string()
+                }),
+            )
+        },
+    )
+    .expect("session workspace file should be readable");
+    let cwd_result = with_active_tool_context(
+        Some("session-workspace-test"),
+        Some(&session_workspace),
+        || {
+            execute_tool(
+                "read_file",
+                &json!({
+                    "path": cwd_file.display().to_string()
+                }),
+            )
+        },
+    );
+    std::env::set_current_dir(original_dir).expect("restore cwd");
+
+    assert!(session_result.contains("session-root-content"));
+    assert!(cwd_result
+        .expect_err("process cwd file should be outside active session workspace")
+        .contains("escapes workspace boundary"));
+    let _ = fs::remove_dir_all(session_workspace);
+    let _ = fs::remove_dir_all(process_cwd);
 }
 
 #[test]
@@ -2085,7 +2137,9 @@ fn background_agent_captures_parent_session_and_formats_notification() {
     let captured = Arc::new(Mutex::new(None::<AgentJob>));
     let captured_for_spawn = Arc::clone(&captured);
 
-    let _ = with_active_tool_session(Some("parent-session"), || {
+    let parent_workspace = dir.join("workspace");
+    fs::create_dir_all(&parent_workspace).expect("parent workspace should exist");
+    let _ = with_active_tool_context(Some("parent-session"), Some(&parent_workspace), || {
         execute_agent_with_spawn(
             AgentInput {
                 description: "Background audit".to_string(),
@@ -2113,6 +2167,10 @@ fn background_agent_captures_parent_session_and_formats_notification() {
     assert_eq!(
         captured_job.parent_session_id.as_deref(),
         Some("parent-session")
+    );
+    assert_eq!(
+        captured_job.parent_workspace_root.as_deref(),
+        Some(parent_workspace.as_path())
     );
 
     enqueue_background_agent_notification(&captured_job, "completed", "review done");
@@ -2154,6 +2212,7 @@ fn confirms_issue_10_background_agent_notification_is_bounded() {
         system_prompt: Vec::new(),
         allowed_tools: BTreeSet::new(),
         parent_session_id: Some(parent_session.to_string()),
+        parent_workspace_root: None,
     };
     let large_body = "x".repeat(128 * 1024);
 
@@ -2450,6 +2509,100 @@ fn agent_background_launch_returns_async_contract() {
 }
 
 #[test]
+fn background_agent_spawn_error_marks_registry_failed() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = temp_path("agent-bg-spawn-error");
+    fs::create_dir_all(&dir).expect("agent store should be created");
+    let agent_id = "agent-bg-spawn-error".to_string();
+    let session_id = "bg-spawn-error-parent-session";
+    let output_file = dir.join("agent-bg-spawn-error.md");
+    let manifest_file = dir.join("agent-bg-spawn-error.json");
+    fs::write(&output_file, "initial output\n").expect("agent output should be seeded");
+    let manifest = super::AgentOutput {
+        agent_id: agent_id.clone(),
+        name: "bg-spawn-error".to_string(),
+        description: "Background spawn error regression".to_string(),
+        subagent_type: Some("general".to_string()),
+        model: Some("claude-opus-4-6".to_string()),
+        status: "running".to_string(),
+        output_file: output_file.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        created_at: super::iso8601_now(),
+        started_at: Some(super::iso8601_now()),
+        completed_at: None,
+        lane_events: vec![runtime::LaneEvent::started(super::iso8601_now())],
+        current_blocker: None,
+        derived_state: "working".to_string(),
+        error: None,
+        result: None,
+    };
+    super::agent::write_agent_manifest(&manifest).expect("manifest should be seeded");
+    let job = AgentJob {
+        manifest,
+        prompt: "Do background work".to_string(),
+        system_prompt: Vec::new(),
+        allowed_tools: BTreeSet::new(),
+        parent_session_id: Some(session_id.to_string()),
+        parent_workspace_root: None,
+    };
+
+    let launch_error = with_active_tool_session(Some(session_id), || {
+        super::agent::spawn_agent_job_with_thread_spawner(job, |_builder, _body| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "thread creation failed",
+            ))
+        })
+        .expect_err("thread spawn failure should surface")
+    });
+
+    assert!(launch_error.contains("thread creation failed"));
+    let registry = global_task_registry();
+    let task = with_active_tool_session(Some(session_id), || {
+        registry
+            .get(&agent_id)
+            .expect("failed background agent should remain registered")
+    });
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(task.output.contains("thread creation failed"));
+
+    let task_output = with_active_tool_session(Some(session_id), || {
+        run_task_output(TaskOutputInput {
+            task_id: agent_id.clone(),
+            block: false,
+            timeout_ms: 30_000,
+        })
+    })
+    .expect("task output should succeed");
+    let task_output_json: serde_json::Value =
+        serde_json::from_str(&task_output).expect("task output json");
+    assert_eq!(task_output_json["retrieval_status"], "success");
+    assert_eq!(task_output_json["task"]["status"], "failed");
+    assert!(task_output_json["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("thread creation failed"));
+
+    let failed_manifest = super::agent::read_agent_manifest(&manifest_file.display().to_string())
+        .expect("failed manifest should be readable");
+    assert_eq!(failed_manifest.status, "failed");
+    assert!(failed_manifest
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("thread creation failed"));
+    let notifications = drain_session_notifications(session_id);
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains("status: failed"));
+    assert!(notifications[0].contains("thread creation failed"));
+
+    let _ = with_active_tool_session(Some(session_id), || registry.remove(&agent_id));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
     let _guard = env_lock()
         .lock()
@@ -2489,6 +2642,7 @@ fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
         system_prompt: Vec::new(),
         allowed_tools: BTreeSet::new(),
         parent_session_id: Some(session_id.to_string()),
+        parent_workspace_root: None,
     };
 
     let launch_error = with_active_tool_session(Some(session_id), || {
@@ -2864,7 +3018,14 @@ fn agent_rejects_blank_required_fields() {
 
 #[test]
 fn notebook_edit_replaces_inserts_and_deletes_cells() {
-    let path = temp_path("notebook.ipynb");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = temp_path("notebook-workspace");
+    fs::create_dir_all(&root).expect("create notebook workspace");
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&root).expect("set notebook workspace cwd");
+    let path = root.join("notebook.ipynb");
     std::fs::write(
             &path,
             r#"{
@@ -2939,12 +3100,20 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
     assert!(cells[0].get("outputs").is_none());
     assert_eq!(cells[1]["cell_type"], "code");
     assert_eq!(cells[1]["source"][0], "print(3)\n");
-    let _ = std::fs::remove_file(path);
+    std::env::set_current_dir(original_dir).expect("restore cwd");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn notebook_edit_rejects_invalid_inputs() {
-    let text_path = temp_path("notebook.txt");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = temp_path("notebook-invalid-workspace");
+    fs::create_dir_all(&root).expect("create notebook workspace");
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&root).expect("set notebook workspace cwd");
+    let text_path = root.join("notebook.txt");
     fs::write(&text_path, "not a notebook").expect("write text file");
     let wrong_extension = execute_tool(
         "NotebookEdit",
@@ -2957,7 +3126,7 @@ fn notebook_edit_rejects_invalid_inputs() {
     assert!(wrong_extension.contains("Jupyter notebook"));
     let _ = fs::remove_file(&text_path);
 
-    let empty_notebook = temp_path("empty.ipynb");
+    let empty_notebook = root.join("empty.ipynb");
     fs::write(
             &empty_notebook,
             r#"{"cells":[],"metadata":{"kernelspec":{"language":"python"}},"nbformat":4,"nbformat_minor":5}"#,
@@ -2983,7 +3152,45 @@ fn notebook_edit_rejects_invalid_inputs() {
     )
     .expect_err("delete on empty notebook should fail");
     assert!(missing_cell.contains("Notebook has no cells to edit"));
-    let _ = fs::remove_file(empty_notebook);
+    std::env::set_current_dir(original_dir).expect("restore cwd");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn notebook_edit_rejects_paths_outside_active_workspace() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let workspace = temp_path("notebook-workspace-boundary");
+    let outside = temp_path("notebook-outside");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    fs::create_dir_all(&outside).expect("create outside dir");
+    let outside_notebook = outside.join("outside.ipynb");
+    fs::write(
+        &outside_notebook,
+        r#"{"cells":[{"cell_type":"code","id":"cell-a","metadata":{},"source":["print(1)\n"],"outputs":[],"execution_count":null}],"metadata":{"kernelspec":{"language":"python"}},"nbformat":4,"nbformat_minor":5}"#,
+    )
+    .expect("write outside notebook");
+
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&workspace).expect("set workspace cwd");
+    let error = execute_tool(
+        "NotebookEdit",
+        &json!({
+            "notebook_path": outside_notebook.display().to_string(),
+            "cell_id": "cell-a",
+            "new_source": "print(2)\n",
+            "edit_mode": "replace"
+        }),
+    )
+    .expect_err("outside notebook edit should be rejected");
+    std::env::set_current_dir(original_dir).expect("restore cwd");
+
+    assert!(error.contains("escapes workspace boundary"));
+    let outside_contents = fs::read_to_string(&outside_notebook).expect("read outside notebook");
+    assert!(outside_contents.contains("print(1)"));
+    let _ = fs::remove_dir_all(workspace);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[test]

@@ -306,6 +306,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
+    session = bind_session_workspace_root_if_missing(session)?;
     let RuntimePluginState {
         feature_config,
         tool_registry,
@@ -340,6 +341,15 @@ pub(crate) fn build_runtime_with_plugin_state(
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+fn bind_session_workspace_root_if_missing(
+    session: Session,
+) -> Result<Session, Box<dyn std::error::Error>> {
+    if session.workspace_root().is_some() {
+        return Ok(session);
+    }
+    Ok(session.with_workspace_root(env::current_dir()?))
 }
 
 struct CliHookProgressReporter;
@@ -435,4 +445,60 @@ pub(crate) fn permission_policy(
             policy.with_tool_requirement(name, required_permission)
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_session_workspace_root_if_missing;
+    use runtime::Session;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("claw-runtime-host-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn binds_missing_session_workspace_root_to_current_dir() {
+        let _guard = env_lock();
+        let workspace = temp_path("missing-workspace-root");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace cwd");
+
+        let session = bind_session_workspace_root_if_missing(Session::new())
+            .expect("session workspace root should bind");
+
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+        assert_eq!(session.workspace_root(), Some(workspace.as_path()));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn preserves_existing_session_workspace_root() {
+        let _guard = env_lock();
+        let workspace = temp_path("current-workspace-root");
+        let existing = temp_path("existing-workspace-root");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&existing).expect("create existing workspace");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace cwd");
+
+        let session = bind_session_workspace_root_if_missing(
+            Session::new().with_workspace_root(existing.clone()),
+        )
+        .expect("session workspace root should bind");
+
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+        assert_eq!(session.workspace_root(), Some(existing.as_path()));
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(existing);
+    }
 }

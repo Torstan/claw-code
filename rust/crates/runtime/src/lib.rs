@@ -43,8 +43,8 @@ mod session_notifications;
 mod snip_compact;
 pub use session_control::SessionStore;
 pub use session_notifications::{
-    active_tool_session_id, drain_session_notifications, enqueue_session_notification,
-    with_active_tool_session,
+    active_tool_session_id, active_tool_workspace_root, drain_session_notifications,
+    enqueue_session_notification, with_active_tool_context, with_active_tool_session,
 };
 mod sse;
 pub mod stale_base;

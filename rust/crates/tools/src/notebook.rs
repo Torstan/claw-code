@@ -1,18 +1,22 @@
 use super::{NotebookCellType, NotebookEditInput, NotebookEditMode, NotebookEditOutput};
+use runtime::{active_tool_workspace_root, read_file_in_workspace, write_file_in_workspace};
 use serde_json::{json, Value};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_notebook_edit(
     input: NotebookEditInput,
 ) -> Result<NotebookEditOutput, String> {
-    let path = std::path::PathBuf::from(&input.notebook_path);
+    let path = std::path::Path::new(&input.notebook_path);
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
         return Err(String::from(
             "File must be a Jupyter notebook (.ipynb file).",
         ));
     }
 
-    let original_file = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let workspace_root = active_workspace_root()?;
+    let read_output = read_file_in_workspace(&input.notebook_path, None, None, &workspace_root)
+        .map_err(|error| error.to_string())?;
+    let original_file = read_output.file.content;
     let mut notebook: serde_json::Value =
         serde_json::from_str(&original_file).map_err(|error| error.to_string())?;
     let language = notebook
@@ -111,7 +115,9 @@ pub(crate) fn execute_notebook_edit(
 
     let updated_file =
         serde_json::to_string_pretty(&notebook).map_err(|error| error.to_string())?;
-    std::fs::write(&path, &updated_file).map_err(|error| error.to_string())?;
+    let write_output =
+        write_file_in_workspace(&input.notebook_path, &updated_file, &workspace_root)
+            .map_err(|error| error.to_string())?;
 
     Ok(NotebookEditOutput {
         new_source,
@@ -120,10 +126,16 @@ pub(crate) fn execute_notebook_edit(
         language,
         edit_mode: format_notebook_edit_mode(edit_mode),
         error: None,
-        notebook_path: path.display().to_string(),
+        notebook_path: write_output.file_path,
         original_file,
         updated_file,
     })
+}
+
+fn active_workspace_root() -> Result<std::path::PathBuf, String> {
+    active_tool_workspace_root()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().map_err(|error| error.to_string()))
 }
 
 fn require_notebook_source(

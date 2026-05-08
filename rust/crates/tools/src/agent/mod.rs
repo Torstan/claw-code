@@ -1,10 +1,10 @@
 use super::{
-    active_tool_session_id, agent_debug_log, build_system_blocks_with_cache_controls,
-    canonical_tool_token, compress_summary_text, dedupe_superseded_commit_events,
-    detect_provider_kind, enqueue_session_notification, execute_tool_with_enforcer,
-    global_task_registry, is_background_task_tool_name, load_system_prompt,
-    log_prompt_cache_block_diagnostics, max_tokens_for_model, mvp_tool_specs, read_base_url,
-    render_tool_result_for_model, resolve_model_alias, resolve_startup_auth_source,
+    active_tool_session_id, active_tool_workspace_root, agent_debug_log,
+    build_system_blocks_with_cache_controls, canonical_tool_token, compress_summary_text,
+    dedupe_superseded_commit_events, detect_provider_kind, enqueue_session_notification,
+    execute_tool_with_enforcer, global_task_registry, is_background_task_tool_name,
+    load_system_prompt, log_prompt_cache_block_diagnostics, max_tokens_for_model, mvp_tool_specs,
+    read_base_url, render_tool_result_for_model, resolve_model_alias, resolve_startup_auth_source,
     summarize_prompt_cache_controls, AgentInput, AgentJob, AgentOutput, AgentToolOutput,
     AnthropicClient, ApiClient, ApiError, ApiRequest, ApiStreamEvent, AssistantEvent,
     AsyncAgentLaunchOutput, AuthSource, BTreeMap, BTreeSet, CacheControl, Command, ConfigLoader,
@@ -171,6 +171,7 @@ where
         system_prompt,
         allowed_tools,
         parent_session_id: active_tool_session_id(),
+        parent_workspace_root: active_tool_workspace_root(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -224,6 +225,8 @@ fn background_agent_slots() -> &'static std::sync::Mutex<usize> {
     SLOTS.get_or_init(|| std::sync::Mutex::new(0))
 }
 
+pub(crate) type BackgroundThreadBody = Box<dyn FnOnce() + Send + 'static>;
+
 pub(crate) struct BackgroundAgentSlot;
 
 impl BackgroundAgentSlot {
@@ -253,6 +256,17 @@ impl Drop for BackgroundAgentSlot {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+    spawn_agent_job_with_thread_spawner(job, |builder, body| builder.spawn(body).map(drop))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn spawn_agent_job_with_thread_spawner<F>(
+    job: AgentJob,
+    spawn_thread: F,
+) -> Result<(), String>
+where
+    F: FnOnce(std::thread::Builder, BackgroundThreadBody) -> std::io::Result<()>,
+{
     let started_at = Instant::now();
     let spawned_agent_id = job.manifest.agent_id.clone();
     agent_debug_log(
@@ -300,92 +314,87 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         }
     };
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let _slot = slot;
-            agent_debug_log(
-                "agent.background.thread.begin",
-                format!(
-                    "agent_id={} description={:?}",
-                    job.manifest.agent_id, job.manifest.description
-                ),
-            );
-            let registry = global_task_registry();
-            let started_at = Instant::now();
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {
-                    agent_debug_log(
-                        "agent.background.thread.completed",
-                        format!(
-                            "agent_id={} elapsed_ms={}",
-                            job.manifest.agent_id,
-                            started_at.elapsed().as_millis()
-                        ),
-                    );
-                    let output = read_agent_manifest(&job.manifest.manifest_file)
-                        .ok()
-                        .and_then(|m| m.result)
-                        .unwrap_or_default();
-                    with_active_tool_session(job.parent_session_id.as_deref(), || {
-                        registry.append_output(&job.manifest.agent_id, &output).ok();
-                        registry
-                            .set_status(&job.manifest.agent_id, TaskStatus::Completed)
-                            .ok();
-                    });
-                    enqueue_background_agent_notification(&job, "completed", &output);
-                }
-                Ok(Err(error)) => {
-                    agent_debug_log(
-                        "agent.background.thread.failed",
-                        format!(
-                            "agent_id={} elapsed_ms={} error={error}",
-                            job.manifest.agent_id,
-                            started_at.elapsed().as_millis()
-                        ),
-                    );
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
-                    with_active_tool_session(job.parent_session_id.as_deref(), || {
-                        registry.append_output(&job.manifest.agent_id, &error).ok();
-                        registry
-                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
-                            .ok();
-                    });
-                    enqueue_background_agent_notification(&job, "failed", &error);
-                }
-                Err(_) => {
-                    let msg = String::from("sub-agent thread panicked");
-                    agent_debug_log(
-                        "agent.background.thread.panicked",
-                        format!(
-                            "agent_id={} elapsed_ms={}",
-                            job.manifest.agent_id,
-                            started_at.elapsed().as_millis()
-                        ),
-                    );
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(msg.clone()),
-                    );
-                    with_active_tool_session(job.parent_session_id.as_deref(), || {
-                        registry.append_output(&job.manifest.agent_id, &msg).ok();
-                        registry
-                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
-                            .ok();
-                    });
-                    enqueue_background_agent_notification(&job, "failed", &msg);
-                }
+    let spawn_failed_job = job.clone();
+    let body: BackgroundThreadBody = Box::new(move || {
+        let _slot = slot;
+        agent_debug_log(
+            "agent.background.thread.begin",
+            format!(
+                "agent_id={} description={:?}",
+                job.manifest.agent_id, job.manifest.description
+            ),
+        );
+        let registry = global_task_registry();
+        let started_at = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
+        match result {
+            Ok(Ok(())) => {
+                agent_debug_log(
+                    "agent.background.thread.completed",
+                    format!(
+                        "agent_id={} elapsed_ms={}",
+                        job.manifest.agent_id,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                let output = read_agent_manifest(&job.manifest.manifest_file)
+                    .ok()
+                    .and_then(|m| m.result)
+                    .unwrap_or_default();
+                with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    registry.append_output(&job.manifest.agent_id, &output).ok();
+                    registry
+                        .set_status(&job.manifest.agent_id, TaskStatus::Completed)
+                        .ok();
+                });
+                enqueue_background_agent_notification(&job, "completed", &output);
             }
-        })
+            Ok(Err(error)) => {
+                agent_debug_log(
+                    "agent.background.thread.failed",
+                    format!(
+                        "agent_id={} elapsed_ms={} error={error}",
+                        job.manifest.agent_id,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                let _ = persist_agent_terminal_state(
+                    &job.manifest,
+                    "failed",
+                    None,
+                    Some(error.clone()),
+                );
+                with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    registry.append_output(&job.manifest.agent_id, &error).ok();
+                    registry
+                        .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+                        .ok();
+                });
+                enqueue_background_agent_notification(&job, "failed", &error);
+            }
+            Err(_) => {
+                let msg = String::from("sub-agent thread panicked");
+                agent_debug_log(
+                    "agent.background.thread.panicked",
+                    format!(
+                        "agent_id={} elapsed_ms={}",
+                        job.manifest.agent_id,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                let _ =
+                    persist_agent_terminal_state(&job.manifest, "failed", None, Some(msg.clone()));
+                with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    registry.append_output(&job.manifest.agent_id, &msg).ok();
+                    registry
+                        .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+                        .ok();
+                });
+                enqueue_background_agent_notification(&job, "failed", &msg);
+            }
+        }
+    });
+    spawn_thread(std::thread::Builder::new().name(thread_name), body)
         .map(|_| {
             agent_debug_log(
                 "agent.background.thread.spawned",
@@ -397,7 +406,9 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 "agent.background.thread.spawn_error",
                 format!("agent_id={spawned_agent_id} error={error}"),
             );
-            error.to_string()
+            let error = error.to_string();
+            mark_registered_background_agent_failed(&spawn_failed_job, &error);
+            error
         })
 }
 
@@ -543,7 +554,10 @@ pub(crate) fn build_agent_runtime(
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    let session = new_agent_session(&job.manifest.agent_id);
+    let mut session = new_agent_session(&job.manifest.agent_id);
+    if let Some(workspace_root) = &job.parent_workspace_root {
+        session = session.with_workspace_root(workspace_root.clone());
+    }
     Ok(ConversationRuntime::new(
         session,
         api_client,

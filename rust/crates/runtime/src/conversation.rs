@@ -15,7 +15,7 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::session_memory_compact::refresh_session_memory;
-use crate::session_notifications::{drain_session_notifications, with_active_tool_session};
+use crate::session_notifications::{drain_session_notifications, with_active_tool_context};
 use crate::snip_compact::{snip_compact_session, SnipCompactionConfig};
 use crate::tool_result_budget::{is_persisted_tool_result_output, stabilize_tool_result_output};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -785,9 +785,11 @@ where
                 input: prepared.effective_input.clone(),
             })
             .collect::<Vec<_>>();
-        let results = with_active_tool_session(Some(self.session.session_id.as_str()), || {
-            self.tool_executor.execute_many(&invocations)
-        });
+        let results = with_active_tool_context(
+            Some(self.session.session_id.as_str()),
+            self.session.workspace_root(),
+            || self.tool_executor.execute_many(&invocations),
+        );
 
         for (prepared, result) in batch.into_iter().zip(results) {
             let result_message = self.finalize_prepared_tool_result(prepared, result);
@@ -804,10 +806,14 @@ where
         tool_results: &mut Vec<ConversationMessage>,
     ) -> Result<(), RuntimeError> {
         self.record_tool_started(iteration, &prepared.tool_name);
-        let result = with_active_tool_session(Some(self.session.session_id.as_str()), || {
-            self.tool_executor
-                .execute(&prepared.tool_name, &prepared.effective_input)
-        });
+        let result = with_active_tool_context(
+            Some(self.session.session_id.as_str()),
+            self.session.workspace_root(),
+            || {
+                self.tool_executor
+                    .execute(&prepared.tool_name, &prepared.effective_input)
+            },
+        );
         let result_message = self.finalize_prepared_tool_result(prepared, result);
         self.push_tool_result_message(iteration, result_message, tool_results)
     }

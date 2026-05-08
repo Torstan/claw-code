@@ -1,14 +1,14 @@
 use super::{
-    agent_debug_log, check_freshness, edit_file_in_workspace, execute_agent, execute_bash,
-    execute_brief, execute_config, execute_enter_plan_mode, execute_exit_plan_mode,
-    execute_notebook_edit, execute_powershell, execute_repl, execute_skill, execute_sleep,
-    execute_structured_output, execute_todo_write, execute_tool_search, execute_web_fetch,
-    execute_web_search, glob_search_in_workspace, global_cron_registry, global_lsp_registry,
-    global_mcp_registry, global_task_registry, global_team_registry, global_worker_registry,
-    grep_search_in_workspace, iso8601_now, read_file_in_workspace, write_file_in_workspace,
-    AgentInput, AskUserQuestionInput, BashCommandInput, BashCommandOutput, BranchFreshness,
-    BriefInput, ConfigInput, CronCreateInput, CronDeleteInput, Duration, EditFileInput,
-    EnforcementResult, EnterPlanModeInput, ExitPlanModeInput, GlobSearchInputValue,
+    active_tool_workspace_root, agent_debug_log, check_freshness, edit_file_in_workspace,
+    execute_agent, execute_bash, execute_brief, execute_config, execute_enter_plan_mode,
+    execute_exit_plan_mode, execute_notebook_edit, execute_powershell, execute_repl, execute_skill,
+    execute_sleep, execute_structured_output, execute_todo_write, execute_tool_search,
+    execute_web_fetch, execute_web_search, glob_search_in_workspace, global_cron_registry,
+    global_lsp_registry, global_mcp_registry, global_task_registry, global_team_registry,
+    global_worker_registry, grep_search_in_workspace, iso8601_now, read_file_in_workspace,
+    write_file_in_workspace, AgentInput, AskUserQuestionInput, BashCommandInput, BashCommandOutput,
+    BranchFreshness, BriefInput, ConfigInput, CronCreateInput, CronDeleteInput, Duration,
+    EditFileInput, EnforcementResult, EnterPlanModeInput, ExitPlanModeInput, GlobSearchInputValue,
     GrepSearchInput, Instant, LspInput, McpAuthInput, McpResourceInput, McpToolInput,
     NotebookEditInput, PermissionEnforcer, PowerShellInput, ReadFileInput, RemoteTriggerInput,
     ReplInput, SkillInput, SleepInput, StructuredOutputInput, TaskCreateInput, TaskIdInput,
@@ -933,7 +933,9 @@ fn branch_divergence_output(
 }
 
 fn active_workspace_root() -> Result<std::path::PathBuf, String> {
-    std::env::current_dir().map_err(|error| error.to_string())
+    active_tool_workspace_root()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().map_err(|error| error.to_string()))
 }
 
 #[allow(clippy::needless_pass_by_value)]

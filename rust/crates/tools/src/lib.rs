@@ -13,9 +13,9 @@ use api::{
 };
 use plugins::PluginTool;
 use runtime::{
-    active_tool_session_id, check_freshness, dedupe_superseded_commit_events,
-    edit_file_in_workspace, enqueue_session_notification, execute_bash, glob_search_in_workspace,
-    grep_search_in_workspace, load_system_prompt,
+    active_tool_session_id, active_tool_workspace_root, check_freshness,
+    dedupe_superseded_commit_events, edit_file_in_workspace, enqueue_session_notification,
+    execute_bash, glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace,
     summary_compression::compress_summary_text,
@@ -518,6 +518,7 @@ struct AgentJob {
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
     parent_session_id: Option<String>,
+    parent_workspace_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
