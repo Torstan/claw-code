@@ -943,14 +943,14 @@ fn normalize_path_from(path: &str, base: &Path) -> io::Result<PathBuf> {
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     let base = std::env::current_dir()?;
-    normalize_path_allow_missing_from(path, &base)
+    Ok(normalize_path_allow_missing_from(path, &base))
 }
 
-fn normalize_path_allow_missing_from(path: &str, base: &Path) -> io::Result<PathBuf> {
+fn normalize_path_allow_missing_from(path: &str, base: &Path) -> PathBuf {
     let candidate = path_candidate_from(path, base);
 
     if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
+        return canonical;
     }
 
     if let Some(parent) = candidate.parent() {
@@ -958,11 +958,11 @@ fn normalize_path_allow_missing_from(path: &str, base: &Path) -> io::Result<Path
             .canonicalize()
             .unwrap_or_else(|_| parent.to_path_buf());
         if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+            return canonical_parent.join(name);
         }
     }
 
-    Ok(candidate)
+    candidate
 }
 
 fn normalize_missing_path_with_existing_parent_from(
@@ -1110,7 +1110,7 @@ pub fn glob_search_in_workspace(
     }
 
     if Path::new(pattern).is_absolute() {
-        let resolved_pattern = normalize_path_allow_missing_from(pattern, &canonical_root)?;
+        let resolved_pattern = normalize_path_allow_missing_from(pattern, &canonical_root);
         validate_workspace_boundary(&resolved_pattern, &canonical_root)?;
         return validate_glob_matches_in_workspace(glob_search(pattern, None)?, &canonical_root);
     }
