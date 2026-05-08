@@ -19,10 +19,6 @@ It does **not** copy the repository into the image. Instead, the recommended flo
 
 From the repository root:
 
-The first build needs Docker Hub access for the `rust:bookworm` base image. If
-Docker Hub is blocked or slow in your environment, pre-pull or load that image
-from an accessible registry mirror before running the build command.
-
 ### Docker
 
 ```bash
