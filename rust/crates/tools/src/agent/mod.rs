@@ -16,7 +16,7 @@ use super::{
     ToolChoice, ToolDefinition, ToolError, ToolExecutor, ToolResultContentBlock, ToolSpec,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
-use runtime::with_active_tool_session;
+use runtime::{with_active_tool_session, SessionStore};
 use std::time::Instant;
 
 const FALLBACK_AGENT_MODEL: &str = "claude-sonnet-4-6";
@@ -622,6 +622,7 @@ pub(crate) fn resolve_agent_model(model: Option<&str>) -> String {
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned)
         .or_else(configured_agent_model)
+        .or_else(active_parent_session_model)
         .unwrap_or_else(|| FALLBACK_AGENT_MODEL.to_string())
 }
 
@@ -644,6 +645,19 @@ fn configured_agent_model() -> Option<String> {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+}
+
+fn active_parent_session_model() -> Option<String> {
+    let session_id = active_tool_session_id()?;
+    let workspace_root = active_tool_workspace_root().or_else(|| std::env::current_dir().ok())?;
+    SessionStore::from_cwd(workspace_root)
+        .ok()?
+        .load_session(&session_id)
+        .ok()?
+        .session
+        .model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
 }
 
 pub(crate) fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {

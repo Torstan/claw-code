@@ -27,8 +27,8 @@ use runtime::ProviderFallbackConfig;
 use runtime::{
     drain_session_notifications, permission_enforcer::PermissionEnforcer, with_active_tool_context,
     with_active_tool_session, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
-    LaneEventName, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
-    ToolExecutor,
+    LaneEventName, PermissionMode, PermissionPolicy, RuntimeError, Session, SessionStore,
+    TaskPacket, ToolExecutor,
 };
 use serde_json::json;
 
@@ -46,6 +46,12 @@ impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
         Self { key, previous }
     }
 }
@@ -2115,6 +2121,73 @@ fn confirms_issue_08_subagent_default_model_is_not_hardcoded_anthropic() {
     let model = super::agent::resolve_agent_model(None);
 
     assert_eq!(model, "openai/gpt-4o-mini");
+}
+
+#[test]
+fn subagent_inherits_active_parent_session_model_when_no_agent_default_is_set() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _agent_model = EnvVarGuard::remove("CLAWD_AGENT_MODEL");
+    let _anthropic_model = EnvVarGuard::remove("ANTHROPIC_MODEL");
+    let workspace = temp_path("parent-model-workspace");
+    let agent_store = temp_path("parent-model-agent-store");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let _agent_store_env = EnvVarGuard::set(
+        "CLAWD_AGENT_STORE",
+        agent_store
+            .to_str()
+            .expect("agent store path should be utf8"),
+    );
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&workspace).expect("set cwd");
+
+    let parent_session_id = "parent-model-session";
+    let session_store = SessionStore::from_cwd(&workspace).expect("session store should build");
+    let parent_handle = session_store.create_handle(parent_session_id);
+    let mut parent_session = Session::new().with_workspace_root(workspace.clone());
+    parent_session.session_id = parent_session_id.to_string();
+    parent_session.model = Some("openai/gpt-5.1".to_string());
+    parent_session
+        .save_to_path(&parent_handle.path)
+        .expect("parent session should save");
+    let captured = Arc::new(Mutex::new(None::<AgentJob>));
+    let captured_for_spawn = Arc::clone(&captured);
+
+    let manifest = with_active_tool_context(Some(parent_session_id), Some(&workspace), || {
+        execute_agent_with_spawn(
+            AgentInput {
+                description: "Audit the active model".to_string(),
+                prompt: "Confirm inherited model.".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            move |job| {
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(())
+            },
+        )
+    })
+    .expect("agent should spawn");
+
+    std::env::set_current_dir(original_dir).expect("restore cwd");
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&agent_store);
+
+    assert_eq!(manifest.model.as_deref(), Some("openai/gpt-5.1"));
+    let captured_job = captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("spawn job should be captured");
+    assert_eq!(
+        captured_job.manifest.model.as_deref(),
+        Some("openai/gpt-5.1")
+    );
 }
 
 #[test]
