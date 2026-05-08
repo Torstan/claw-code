@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -269,10 +270,19 @@ pub fn edit_file(
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    let match_count = original_file.matches(old_string).count();
+    if match_count == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "old_string not found in file",
+        ));
+    }
+    if !replace_all && match_count != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string matched {match_count} times; expected exactly one match when replace_all is false"
+            ),
         ));
     }
 
@@ -398,13 +408,9 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         }
 
         let lines: Vec<&str> = file_contents.lines().collect();
-        let mut matched_lines = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                total_matches += 1;
-                matched_lines.push(index);
-            }
-        }
+        let (matched_lines, match_count) =
+            matched_line_indices(&regex, &file_contents, input.multiline.unwrap_or(false));
+        total_matches += match_count;
 
         if matched_lines.is_empty() {
             continue;
@@ -494,6 +500,53 @@ fn matches_optional_filters(
     true
 }
 
+fn matched_line_indices(
+    regex: &regex::Regex,
+    contents: &str,
+    multiline: bool,
+) -> (Vec<usize>, usize) {
+    if !multiline {
+        let lines = contents.lines().collect::<Vec<_>>();
+        let matched = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| regex.is_match(line).then_some(index))
+            .collect::<Vec<_>>();
+        return (matched.clone(), matched.len());
+    }
+
+    let line_starts = line_start_offsets(contents);
+    let mut lines = BTreeSet::new();
+    let mut matches = 0usize;
+    for found in regex.find_iter(contents) {
+        matches += 1;
+        let start_line = line_index_for_offset(&line_starts, found.start());
+        let end_offset = found.end().saturating_sub(1);
+        let end_line = line_index_for_offset(&line_starts, end_offset);
+        for line in start_line..=end_line {
+            lines.insert(line);
+        }
+    }
+    (lines.into_iter().collect(), matches)
+}
+
+fn line_start_offsets(contents: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (index, ch) in contents.char_indices() {
+        if ch == '\n' && index + 1 < contents.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    match line_starts.binary_search(&offset) {
+        Ok(index) => index,
+        Err(index) => index.saturating_sub(1),
+    }
+}
+
 fn apply_limit<T>(
     items: Vec<T>,
     limit: Option<usize>,
@@ -516,19 +569,59 @@ fn apply_limit<T>(
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
+    if original == updated {
+        return Vec::new();
     }
 
+    let original_lines = original.lines().collect::<Vec<_>>();
+    let updated_lines = updated.lines().collect::<Vec<_>>();
+    let mut prefix_len = 0usize;
+    while prefix_len < original_lines.len()
+        && prefix_len < updated_lines.len()
+        && original_lines[prefix_len] == updated_lines[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0usize;
+    while suffix_len < original_lines.len().saturating_sub(prefix_len)
+        && suffix_len < updated_lines.len().saturating_sub(prefix_len)
+        && original_lines[original_lines.len() - 1 - suffix_len]
+            == updated_lines[updated_lines.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let old_change_end = original_lines.len().saturating_sub(suffix_len);
+    let new_change_end = updated_lines.len().saturating_sub(suffix_len);
+    let context_before_start = prefix_len.saturating_sub(2);
+    let context_after_end = (old_change_end + 2).min(original_lines.len());
+    let context_after_len = context_after_end.saturating_sub(old_change_end);
+
+    let mut lines = Vec::new();
+    for line in &original_lines[context_before_start..prefix_len] {
+        lines.push(format!(" {line}"));
+    }
+    for line in &original_lines[prefix_len..old_change_end] {
+        lines.push(format!("-{line}"));
+    }
+    for line in &updated_lines[prefix_len..new_change_end] {
+        lines.push(format!("+{line}"));
+    }
+    for line in &original_lines[old_change_end..context_after_end] {
+        lines.push(format!(" {line}"));
+    }
+
+    let old_lines = context_after_end.saturating_sub(context_before_start);
+    let new_lines = prefix_len.saturating_sub(context_before_start)
+        + new_change_end.saturating_sub(prefix_len)
+        + context_after_len;
+
     vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
+        old_start: context_before_start.saturating_add(1),
+        old_lines,
+        new_start: context_before_start.saturating_add(1),
+        new_lines,
         lines,
     }]
 }
@@ -613,6 +706,53 @@ pub fn edit_file_in_workspace(
     edit_file(path, old_string, new_string, replace_all)
 }
 
+/// Run a glob search with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn glob_search_in_workspace(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+) -> io::Result<GlobSearchOutput> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let base_path = path
+        .map(normalize_path)
+        .transpose()?
+        .unwrap_or_else(|| canonical_root.clone());
+    validate_workspace_boundary(&base_path, &canonical_root)?;
+
+    if Path::new(pattern).is_absolute() {
+        let resolved_pattern = normalize_path_allow_missing(pattern)?;
+        validate_workspace_boundary(&resolved_pattern, &canonical_root)?;
+        return glob_search(pattern, None);
+    }
+
+    glob_search(pattern, Some(base_path.to_string_lossy().as_ref()))
+}
+
+/// Run a grep search with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn grep_search_in_workspace(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+) -> io::Result<GrepSearchOutput> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let base_path = input
+        .path
+        .as_deref()
+        .map(normalize_path)
+        .transpose()?
+        .unwrap_or_else(|| canonical_root.clone());
+    validate_workspace_boundary(&base_path, &canonical_root)?;
+
+    let mut scoped = input.clone();
+    scoped.path = Some(base_path.to_string_lossy().into_owned());
+    grep_search(&scoped)
+}
+
 /// Check whether a path is a symlink that resolves outside the workspace.
 #[allow(dead_code)]
 pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool> {
@@ -654,8 +794,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, expand_braces, glob_search, glob_search_in_workspace, grep_search,
+        grep_search_in_workspace, is_symlink_escape, read_file, read_file_in_workspace, write_file,
+        GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -689,7 +830,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: edit_file currently edits first duplicate match"]
     fn confirms_issue_13_edit_file_requires_unique_match_when_not_replace_all() {
         let path = temp_path("issue-13-duplicate-edit.txt");
         write_file(path.to_string_lossy().as_ref(), "alpha\nbeta\nalpha\n")
@@ -704,7 +844,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: structured patch currently emits full-file replacement"]
     fn confirms_issue_14_structured_patch_is_localized() {
         let path = temp_path("issue-14-patch.txt");
         write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree\nfour\n")
@@ -726,7 +865,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: multiline grep content mode currently scans line-by-line"]
     fn confirms_issue_15_multiline_grep_matches_across_lines_in_content_mode() {
         let dir = temp_path("issue-15-grep");
         std::fs::create_dir_all(&dir).expect("directory should create");
@@ -756,6 +894,49 @@ mod tests {
             result.content.unwrap_or_default().contains("first"),
             "multiline content mode should return a match spanning newline characters"
         );
+    }
+
+    #[test]
+    fn workspace_scoped_search_rejects_outside_absolute_paths() {
+        let workspace = temp_path("workspace-search-root");
+        let outside = temp_path("workspace-search-outside");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::create_dir_all(&outside).expect("outside should create");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "needle\n").expect("outside file should write");
+
+        let glob_error = glob_search_in_workspace(
+            "**/*.txt",
+            Some(outside.to_string_lossy().as_ref()),
+            &workspace,
+        )
+        .expect_err("outside glob base should be rejected");
+        assert_eq!(glob_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let grep_error = grep_search_in_workspace(
+            &GrepSearchInput {
+                pattern: "needle".to_string(),
+                path: Some(outside.to_string_lossy().into_owned()),
+                glob: Some("**/*.txt".to_string()),
+                output_mode: Some("content".to_string()),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: Some(true),
+                case_insensitive: Some(false),
+                file_type: None,
+                head_limit: Some(10),
+                offset: Some(0),
+                multiline: Some(false),
+            },
+            &workspace,
+        )
+        .expect_err("outside grep base should be rejected");
+        assert_eq!(grep_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]
