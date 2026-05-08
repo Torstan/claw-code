@@ -265,6 +265,55 @@ fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
     )
 }
 
+#[cfg(test)]
+type TestParallelChunkObserver = Arc<dyn Fn(&[ToolInvocation]) + Send + Sync + 'static>;
+
+#[cfg(test)]
+fn test_parallel_chunk_observer() -> &'static Mutex<Option<TestParallelChunkObserver>> {
+    static OBSERVER: std::sync::OnceLock<Mutex<Option<TestParallelChunkObserver>>> =
+        std::sync::OnceLock::new();
+    OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+type TestParallelInvocationExecutor =
+    Arc<dyn Fn(&ToolInvocation) -> Result<String, ToolError> + Send + Sync + 'static>;
+
+#[cfg(test)]
+fn test_parallel_invocation_executor() -> &'static Mutex<Option<TestParallelInvocationExecutor>> {
+    static EXECUTOR: std::sync::OnceLock<Mutex<Option<TestParallelInvocationExecutor>>> =
+        std::sync::OnceLock::new();
+    EXECUTOR.get_or_init(|| Mutex::new(None))
+}
+
+fn execute_parallel_invocation(
+    invocation: &ToolInvocation,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    session_id: Option<&str>,
+) -> Result<String, ToolError> {
+    #[cfg(test)]
+    if let Some(executor) = test_parallel_invocation_executor()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return executor(invocation);
+    }
+
+    let worker = CliToolExecutor {
+        renderer: TerminalRenderer::new(),
+        emit_output: false,
+        allowed_tools,
+        tool_registry,
+        mcp_state,
+    };
+    with_active_tool_session(session_id, || {
+        worker.execute_raw(&invocation.tool_name, &invocation.input)
+    })
+}
+
 fn execute_parallel_chunk(
     invocations: &[ToolInvocation],
     allowed_tools: Option<AllowedToolSet>,
@@ -272,6 +321,15 @@ fn execute_parallel_chunk(
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     session_id: Option<String>,
 ) -> Vec<Result<String, ToolError>> {
+    #[cfg(test)]
+    if let Some(observer) = test_parallel_chunk_observer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        observer(invocations);
+    }
+
     let handles = invocations
         .iter()
         .map(|invocation| {
@@ -290,16 +348,13 @@ fn execute_parallel_chunk(
                         describe_parallel_invocation(&invocation)
                     ),
                 );
-                let worker = CliToolExecutor {
-                    renderer: TerminalRenderer::new(),
-                    emit_output: false,
+                let result = execute_parallel_invocation(
+                    &invocation,
                     allowed_tools,
                     tool_registry,
                     mcp_state,
-                };
-                let result = with_active_tool_session(session_id.as_deref(), || {
-                    worker.execute_raw(&invocation.tool_name, &invocation.input)
-                });
+                    session_id.as_deref(),
+                );
                 cli_agent_debug_log(
                     "tool.execute_many.worker.done",
                     format!(
@@ -425,7 +480,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("env lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     struct EnvVarGuard {
@@ -447,6 +502,46 @@ mod tests {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
             }
+        }
+    }
+
+    struct TestParallelChunkObserverGuard;
+
+    impl TestParallelChunkObserverGuard {
+        fn set(observer: impl Fn(&[ToolInvocation]) + Send + Sync + 'static) -> Self {
+            *test_parallel_chunk_observer()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(observer));
+            Self
+        }
+    }
+
+    impl Drop for TestParallelChunkObserverGuard {
+        fn drop(&mut self) {
+            *test_parallel_chunk_observer()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct TestParallelInvocationExecutorGuard;
+
+    impl TestParallelInvocationExecutorGuard {
+        fn set(
+            executor: impl Fn(&ToolInvocation) -> Result<String, ToolError> + Send + Sync + 'static,
+        ) -> Self {
+            *test_parallel_invocation_executor()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(executor));
+            Self
+        }
+    }
+
+    impl Drop for TestParallelInvocationExecutorGuard {
+        fn drop(&mut self) {
+            *test_parallel_invocation_executor()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
@@ -492,45 +587,65 @@ mod tests {
     fn parallel_agent_limit_chunks_agent_invocations_and_preserves_result_order() {
         let _lock = env_lock();
         let _limit_env = EnvVarGuard::set(PARALLEL_AGENT_LIMIT_ENV_VAR, "2");
+        let observed_chunks = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let _observer_guard = TestParallelChunkObserverGuard::set({
+            let observed_chunks = Arc::clone(&observed_chunks);
+            move |chunk| {
+                observed_chunks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(
+                        chunk
+                            .iter()
+                            .map(|invocation| invocation.input.clone())
+                            .collect(),
+                    );
+            }
+        });
+        let _executor_guard = TestParallelInvocationExecutorGuard::set(|invocation| {
+            let value = serde_json::from_str::<Value>(&invocation.input)
+                .expect("test invocations should be valid JSON");
+            let description = value
+                .get("description")
+                .and_then(Value::as_str)
+                .expect("test invocation should include a description");
+            Ok(format!("result:{description}"))
+        });
 
         let invocations = [
             ToolInvocation {
                 tool_name: "Agent".to_string(),
-                input: "{".to_string(),
+                input: r#"{"description":"first","prompt":"first prompt"}"#.to_string(),
             },
             ToolInvocation {
                 tool_name: "Agent".to_string(),
-                input: r#"{"prompt":"second"}"#.to_string(),
+                input: r#"{"description":"second","prompt":"second prompt"}"#.to_string(),
             },
             ToolInvocation {
                 tool_name: "Agent".to_string(),
-                input: r#"{"description":"third"}"#.to_string(),
+                input: r#"{"description":"third","prompt":"third prompt"}"#.to_string(),
             },
         ];
         let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
 
         let results = executor.execute_many(&invocations);
-        let messages = results
-            .into_iter()
-            .map(|result| {
-                result
-                    .expect_err("all inputs should fail before agent spawn")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
 
         assert_eq!(parallel_agent_limit(), 2);
-        assert!(
-            messages[0].contains("EOF while parsing"),
-            "first result should stay first: {messages:?}"
+        assert_eq!(
+            *observed_chunks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                vec![invocations[0].input.clone(), invocations[1].input.clone()],
+                vec![invocations[2].input.clone()]
+            ]
         );
-        assert!(
-            messages[1].contains("missing field `description`"),
-            "second result should stay second: {messages:?}"
-        );
-        assert!(
-            messages[2].contains("missing field `prompt`"),
-            "third result should stay third across chunk boundary: {messages:?}"
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|result| result.expect("test executor should succeed"))
+                .collect::<Vec<_>>(),
+            vec!["result:first", "result:second", "result:third"]
         );
     }
 }
