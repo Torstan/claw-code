@@ -15,6 +15,9 @@ use crate::render::TerminalRenderer;
 use crate::tool_display::format_tool_result;
 use crate::AllowedToolSet;
 
+const DEFAULT_PARALLEL_AGENT_LIMIT: usize = 4;
+const PARALLEL_AGENT_LIMIT_ENV_VAR: &str = "CLAWD_AGENT_MAX_CONCURRENCY";
+
 #[derive(Debug, Deserialize)]
 struct ToolSearchRequest {
     query: String,
@@ -230,6 +233,14 @@ fn cli_agent_debug_log(event: &str, detail: impl AsRef<str>) {
     runtime::agent_debug_log(event, detail);
 }
 
+fn parallel_agent_limit() -> usize {
+    std::env::var(PARALLEL_AGENT_LIMIT_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_AGENT_LIMIT)
+}
+
 fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
     if invocation.tool_name != "Agent" {
         return format!("tool={}", invocation.tool_name);
@@ -252,6 +263,65 @@ fn describe_parallel_invocation(invocation: &ToolInvocation) -> String {
             .and_then(Value::as_str)
             .map_or(0, str::len)
     )
+}
+
+fn execute_parallel_chunk(
+    invocations: &[ToolInvocation],
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    session_id: Option<String>,
+) -> Vec<Result<String, ToolError>> {
+    let handles = invocations
+        .iter()
+        .map(|invocation| {
+            let invocation = invocation.clone();
+            let allowed_tools = allowed_tools.clone();
+            let tool_registry = tool_registry.clone();
+            let mcp_state = mcp_state.clone();
+            let session_id = session_id.clone();
+            std::thread::spawn(move || {
+                let invocation_started_at = Instant::now();
+                cli_agent_debug_log(
+                    "tool.execute_many.worker.begin",
+                    format!(
+                        "tool_name={} description={}",
+                        invocation.tool_name,
+                        describe_parallel_invocation(&invocation)
+                    ),
+                );
+                let worker = CliToolExecutor {
+                    renderer: TerminalRenderer::new(),
+                    emit_output: false,
+                    allowed_tools,
+                    tool_registry,
+                    mcp_state,
+                };
+                let result = with_active_tool_session(session_id.as_deref(), || {
+                    worker.execute_raw(&invocation.tool_name, &invocation.input)
+                });
+                cli_agent_debug_log(
+                    "tool.execute_many.worker.done",
+                    format!(
+                        "tool_name={} description={} ok={} elapsed_us={}",
+                        invocation.tool_name,
+                        describe_parallel_invocation(&invocation),
+                        result.is_ok(),
+                        invocation_started_at.elapsed().as_micros()
+                    ),
+                );
+                result
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .map(|handle| match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(ToolError::new("tool execution thread panicked")),
+        })
+        .collect()
 }
 
 impl ToolExecutor for CliToolExecutor {
@@ -294,56 +364,17 @@ impl ToolExecutor for CliToolExecutor {
         let mcp_state = self.mcp_state.clone();
         let emit_output = self.emit_output;
 
-        let handles: Vec<std::thread::JoinHandle<Result<String, ToolError>>> = invocations
-            .iter()
-            .map(|invocation| {
-                let invocation = invocation.clone();
-                let allowed_tools = allowed_tools.clone();
-                let tool_registry = tool_registry.clone();
-                let mcp_state = mcp_state.clone();
-                let session_id = session_id.clone();
-                std::thread::spawn(move || {
-                    let invocation_started_at = Instant::now();
-                    cli_agent_debug_log(
-                        "tool.execute_many.worker.begin",
-                        format!(
-                            "tool_name={} description={}",
-                            invocation.tool_name,
-                            describe_parallel_invocation(&invocation)
-                        ),
-                    );
-                    let worker = CliToolExecutor {
-                        renderer: TerminalRenderer::new(),
-                        emit_output: false,
-                        allowed_tools,
-                        tool_registry,
-                        mcp_state,
-                    };
-                    let result = with_active_tool_session(session_id.as_deref(), || {
-                        worker.execute_raw(&invocation.tool_name, &invocation.input)
-                    });
-                    cli_agent_debug_log(
-                        "tool.execute_many.worker.done",
-                        format!(
-                            "tool_name={} description={} ok={} elapsed_us={}",
-                            invocation.tool_name,
-                            describe_parallel_invocation(&invocation),
-                            result.is_ok(),
-                            invocation_started_at.elapsed().as_micros()
-                        ),
-                    );
-                    result
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let results = handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(result) => result,
-                Err(_) => Err(ToolError::new("tool execution thread panicked")),
-            })
-            .collect::<Vec<_>>();
+        let parallel_limit = parallel_agent_limit();
+        let mut results = Vec::with_capacity(invocations.len());
+        for chunk in invocations.chunks(parallel_limit) {
+            results.extend(execute_parallel_chunk(
+                chunk,
+                allowed_tools.clone(),
+                tool_registry.clone(),
+                mcp_state.clone(),
+                session_id.clone(),
+            ));
+        }
 
         cli_agent_debug_log(
             "tool.execute_many.parallel.done",
@@ -448,5 +479,18 @@ mod tests {
             !leaked_secret,
             "debug logs must redact secret-shaped values before writing to disk"
         );
+        assert!(log.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn parallel_agent_limit_uses_env_override() {
+        let _lock = env_lock();
+        let previous = std::env::var_os(PARALLEL_AGENT_LIMIT_ENV_VAR);
+        std::env::set_var(PARALLEL_AGENT_LIMIT_ENV_VAR, "2");
+        assert_eq!(parallel_agent_limit(), 2);
+        match previous {
+            Some(value) => std::env::set_var(PARALLEL_AGENT_LIMIT_ENV_VAR, value),
+            None => std::env::remove_var(PARALLEL_AGENT_LIMIT_ENV_VAR),
+        }
     }
 }

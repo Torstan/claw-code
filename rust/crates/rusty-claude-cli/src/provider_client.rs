@@ -24,8 +24,18 @@ use crate::repl::InternalPromptProgressReporter;
 use crate::tool_display::{format_tool_call_start, truncate_for_summary};
 use crate::AllowedToolSet;
 
-fn max_tokens_for_model(_model: &str) -> u32 {
-    64_000
+fn max_tokens_for_model(model: &str) -> u32 {
+    let canonical = api::resolve_model_alias(model);
+    if matches!(
+        canonical.as_str(),
+        "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251213"
+    ) {
+        return api::max_tokens_for_model(&canonical);
+    }
+    if canonical.starts_with("grok-") {
+        return api::max_tokens_for_model(&canonical);
+    }
+    16_384
 }
 
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1153,7 +1163,6 @@ fn apply_tool_cache_controls(tools: &mut Option<Vec<ToolDefinition>>) {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "known issue confirmation: CLI provider currently hardcodes max_tokens to 64000"]
     fn confirms_issue_07_cli_uses_model_specific_max_tokens() {
         let gpt_max = super::max_tokens_for_model("openai/gpt-4o-mini");
         let unknown_local_max = super::max_tokens_for_model("local-small-model");
