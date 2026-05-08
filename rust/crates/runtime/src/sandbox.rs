@@ -361,6 +361,24 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known issue confirmation: filesystem sandbox reports active without mount isolation"]
+    fn confirms_issue_03_filesystem_sandbox_requires_enforced_mount_boundary() {
+        let request = SandboxConfig::default().resolve_request(
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(FilesystemIsolationMode::WorkspaceOnly),
+            None,
+        );
+        let status = super::resolve_sandbox_status_for_request(&request, Path::new("/workspace"));
+
+        assert!(
+            !status.filesystem_active,
+            "filesystem_active must not be true unless filesystem isolation is actually enforced"
+        );
+    }
+
+    #[test]
     fn builds_linux_launcher_with_network_flag_when_requested() {
         let config = SandboxConfig::default();
         let status = super::resolve_sandbox_status_for_request(

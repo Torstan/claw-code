@@ -527,6 +527,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known issue confirmation: prompt mode currently bypasses approval"]
+    fn confirms_issue_01_prompt_mode_requires_prompter_for_dangerous_tools() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+
+        let outcome = policy.authorize(
+            "bash",
+            r#"{"command":"rm -rf /tmp/example"}"#,
+            Some(&mut prompter),
+        );
+
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(
+            prompter.seen.len(),
+            1,
+            "Prompt mode must ask before allowing danger-full-access tools"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: prompt mode currently allows without prompter"]
+    fn confirms_issue_01_prompt_mode_denies_without_prompter() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"rm -rf /tmp/example"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("requires approval")
+        ));
+    }
+
+    #[test]
     fn prompts_for_workspace_write_to_danger_full_access_escalation() {
         let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);

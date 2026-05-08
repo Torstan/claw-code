@@ -689,6 +689,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known issue confirmation: edit_file currently edits first duplicate match"]
+    fn confirms_issue_13_edit_file_requires_unique_match_when_not_replace_all() {
+        let path = temp_path("issue-13-duplicate-edit.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha\nbeta\nalpha\n")
+            .expect("initial file should write");
+
+        let result = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", false);
+
+        assert!(
+            result.is_err(),
+            "non-replace-all edit should reject ambiguous duplicate old_string matches"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: structured patch currently emits full-file replacement"]
+    fn confirms_issue_14_structured_patch_is_localized() {
+        let path = temp_path("issue-14-patch.txt");
+        write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree\nfour\n")
+            .expect("initial file should write");
+
+        let output = edit_file(path.to_string_lossy().as_ref(), "two", "TWO", false)
+            .expect("edit should execute");
+        let changed_lines = output
+            .structured_patch
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .filter(|line| line.starts_with('+') || line.starts_with('-'))
+            .count();
+
+        assert!(
+            changed_lines <= 4,
+            "single-line edits should not serialize the entire file as removed and re-added"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: multiline grep content mode currently scans line-by-line"]
+    fn confirms_issue_15_multiline_grep_matches_across_lines_in_content_mode() {
+        let dir = temp_path("issue-15-grep");
+        std::fs::create_dir_all(&dir).expect("directory should create");
+        let file = dir.join("sample.txt");
+        write_file(file.to_string_lossy().as_ref(), "first\nsecond\nthird\n")
+            .expect("file should write");
+
+        let result = grep_search(&GrepSearchInput {
+            pattern: "first\\nsecond".to_string(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: Some("**/*.txt".to_string()),
+            output_mode: Some("content".to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(true),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: Some(10),
+            offset: Some(0),
+            multiline: Some(true),
+        })
+        .expect("grep should run");
+
+        assert!(
+            result.content.unwrap_or_default().contains("first"),
+            "multiline content mode should return a match spanning newline characters"
+        );
+    }
+
+    #[test]
     fn rejects_binary_files() {
         let path = temp_path("binary-test.bin");
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
