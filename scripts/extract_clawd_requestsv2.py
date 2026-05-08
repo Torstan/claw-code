@@ -11,6 +11,9 @@ from typing import Any
 
 
 DEFAULT_LOG_PATH = "/tmp/clawd-debug/clawd-agent-debug.log"
+ANTHROPIC_BREAKPOINT_LOOKBACK_BLOCKS = 20
+CACHE_CREATION_COST_MULTIPLIER = 1.25
+CACHE_READ_COST_MULTIPLIER = 0.1
 
 ENTRY_RE = re.compile(
     r"(\[clawd-agent-debug ts=.*?)(?=\[clawd-agent-debug ts=|\Z)",
@@ -293,6 +296,13 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         help="Write JSON output to this file. Defaults to stdout.",
+    )
+    parser.add_argument(
+        "--summary-output",
+        help=(
+            "Write a compact JSON summary with cache marker coverage and "
+            "20-block lookback risks to this file."
+        ),
     )
     return parser.parse_args()
 
@@ -662,6 +672,20 @@ def parse_usage(response_text: str) -> dict[str, int | None]:
     }
 
 
+def _int_field(record: dict[str, object], key: str) -> int:
+    """Safely extract an integer field from a record dict."""
+    return int(record.get(key) or 0)
+
+
+def _weighted_input(input_tokens: int, cache_creation: int, cache_read: int) -> float:
+    """Core cost-weighted input formula shared across metrics."""
+    return (
+        input_tokens
+        + cache_creation * CACHE_CREATION_COST_MULTIPLIER
+        + cache_read * CACHE_READ_COST_MULTIPLIER
+    )
+
+
 def build_core_metrics(usage: dict[str, int | None]) -> dict[str, float | int | None] | None:
     input_tokens = usage["input_tokens"]
     output_tokens = usage["output_tokens"]
@@ -680,12 +704,213 @@ def build_core_metrics(usage: dict[str, int | None]) -> dict[str, float | int | 
         "cache_hit_rate": (
             cache_read_input_tokens / cache_total if cache_total else None
         ),
-        "input_tokens": (
-            input_tokens
-            + cache_creation_input_tokens * 1.25
-            + cache_read_input_tokens * 0.1
+        "input_tokens": _weighted_input(
+            input_tokens, cache_creation_input_tokens, cache_read_input_tokens
         ),
         "output_tokens": output_tokens,
+    }
+
+
+def core_input_for_record(record: dict[str, object]) -> float:
+    return _weighted_input(
+        _int_field(record, "input_tokens"),
+        _int_field(record, "cache_creation_input_tokens"),
+        _int_field(record, "cache_read_input_tokens"),
+    )
+
+
+def is_zero_cache_record(record: dict[str, object]) -> bool:
+    return (
+        _int_field(record, "cache_creation_input_tokens") == 0
+        and _int_field(record, "cache_read_input_tokens") == 0
+    )
+
+
+def summarize_records(records: list[dict[str, object]]) -> dict[str, object]:
+    def aggregate(selected: list[dict[str, object]]) -> dict[str, object]:
+        cache_creation = sum(
+            _int_field(record, "cache_creation_input_tokens")
+            for record in selected
+        )
+        cache_read = sum(
+            _int_field(record, "cache_read_input_tokens") for record in selected
+        )
+        cache_total = cache_creation + cache_read
+        output_tokens = sum(
+            _int_field(record, "output_tokens") for record in selected
+        )
+        core_input = sum(core_input_for_record(record) for record in selected)
+        input_tokens = sum(_int_field(record, "input_tokens") for record in selected)
+        zero_cache = [record for record in selected if is_zero_cache_record(record)]
+        zero_cache_input = sum(_int_field(record, "input_tokens") for record in zero_cache)
+        zero_cache_core_input = sum(core_input_for_record(record) for record in zero_cache)
+        raw_inclusive_cache_denominator = input_tokens + cache_creation + cache_read
+        return {
+            "record_count": len(selected),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
+            "core_input_tokens": core_input,
+            "core_total_tokens": core_input + output_tokens,
+            "core_cache_hit": cache_read / cache_total if cache_total else None,
+            "raw_inclusive_cache_coverage": (
+                cache_read / raw_inclusive_cache_denominator
+                if raw_inclusive_cache_denominator
+                else None
+            ),
+            "zero_cache_record_count": len(zero_cache),
+            "zero_cache_input_tokens": zero_cache_input,
+            "zero_cache_core_input_tokens": zero_cache_core_input,
+            "zero_cache_core_input_share": (
+                zero_cache_core_input / core_input if core_input else None
+            ),
+        }
+
+    def record_ref(record: dict[str, object]) -> dict[str, object]:
+        return {
+            "request_index": record.get("request_index"),
+            "session_id": record.get("session_id"),
+            "iteration": record.get("iteration"),
+            "agent_role": record.get("agent_role"),
+            "agent_name": record.get("agent_name"),
+            "agent_round": record.get("agent_round"),
+            "input_tokens": record.get("input_tokens"),
+            "cache_creation_input_tokens": record.get(
+                "cache_creation_input_tokens"
+            ),
+            "cache_read_input_tokens": record.get("cache_read_input_tokens"),
+            "core_input_tokens": core_input_for_record(record),
+        }
+
+    marker_distribution: dict[
+        tuple[object, object, object, object, object, object], int
+    ] = {}
+    lookback_risks: list[dict[str, object]] = []
+    cache_read_zero_records: list[dict[str, object]] = []
+    zero_cache_records: list[dict[str, object]] = []
+
+    for record in records:
+        prompt_cache_raw = record.get("PromptCache")
+        prompt_cache = prompt_cache_raw if isinstance(prompt_cache_raw, dict) else {}
+        marker_key = (
+            record.get("agent_role"),
+            prompt_cache.get("automatic_cache_control_count", 0),
+            prompt_cache.get("system_cache_control_count"),
+            prompt_cache.get("tool_cache_control_count"),
+            prompt_cache.get("message_cache_control_count"),
+            prompt_cache.get("cache_control_count"),
+        )
+        marker_distribution[marker_key] = marker_distribution.get(marker_key, 0) + 1
+
+        cache_read_zero = _int_field(record, "cache_read_input_tokens") == 0
+        is_zero_cache = is_zero_cache_record(record)
+        if cache_read_zero or is_zero_cache:
+            ref = record_ref(record)
+            if cache_read_zero:
+                cache_read_zero_records.append(ref)
+            if is_zero_cache:
+                zero_cache_records.append(ref)
+
+        block_diagnostics = prompt_cache.get("block_diagnostics")
+        if not isinstance(block_diagnostics, dict):
+            continue
+        cache_breakpoints = block_diagnostics.get("cache_breakpoints")
+        if not isinstance(cache_breakpoints, list):
+            continue
+        for bp in cache_breakpoints:
+            if not isinstance(bp, dict):
+                continue
+            distance = bp.get("distance_from_previous_breakpoint")
+            exceeds_from_distance = (
+                isinstance(distance, int)
+                and distance > ANTHROPIC_BREAKPOINT_LOOKBACK_BLOCKS
+            )
+            exceeds_from_log = (
+                bp.get("exceeds_anthropic_20_block_lookback") is True
+            )
+            if not exceeds_from_distance and not exceeds_from_log:
+                continue
+            risk = record_ref(record)
+            risk.update(
+                {
+                    "breakpoint_section": bp.get("section"),
+                    "breakpoint_block_type": bp.get("block_type"),
+                    "breakpoint_cache_control_source": bp.get(
+                        "cache_control_source"
+                    ),
+                    "breakpoint_block_index": bp.get("block_index"),
+                    "distance_from_previous_breakpoint": distance,
+                    "estimated_prefix_tokens": bp.get(
+                        "estimated_prefix_tokens"
+                    ),
+                    "below_opus_4_6_min_cache_tokens": bp.get(
+                        "below_opus_4_6_min_cache_tokens"
+                    ),
+                    "exceeds_anthropic_20_block_lookback": exceeds_from_distance
+                    or exceeds_from_log,
+                    "exceeds_anthropic_20_block_lookback_from_log": (
+                        bp.get("exceeds_anthropic_20_block_lookback")
+                    ),
+                    "lookback_threshold_blocks": (
+                        ANTHROPIC_BREAKPOINT_LOOKBACK_BLOCKS
+                    ),
+                }
+            )
+            lookback_risks.append(risk)
+
+    marker_distribution_items = [
+        {
+            "agent_role": key[0],
+            "automatic_cache_control_count": key[1],
+            "system_cache_control_count": key[2],
+            "tool_cache_control_count": key[3],
+            "message_cache_control_count": key[4],
+            "cache_control_count": key[5],
+            "record_count": count,
+        }
+        for key, count in sorted(
+            marker_distribution.items(), key=lambda item: repr(item[0])
+        )
+    ]
+
+    return {
+        "record_count": len(records),
+        "aggregates": {
+            "all": aggregate(records),
+            "main": aggregate(
+                [record for record in records if record.get("agent_role") == "main"]
+            ),
+            "subagent": aggregate(
+                [
+                    record
+                    for record in records
+                    if record.get("agent_role") == "subagent"
+                ]
+            ),
+        },
+        "aggregates_by_agent_name": {
+            str(agent_name): aggregate(
+                [record for record in records if record.get("agent_name") == agent_name]
+            )
+            for agent_name in sorted(
+                {
+                    record.get("agent_name")
+                    for record in records
+                    if record.get("agent_name") is not None
+                },
+                key=str,
+            )
+        },
+        "marker_distribution": marker_distribution_items,
+        "lookback_risks": lookback_risks,
+        "cache_read_zero_records": cache_read_zero_records,
+        "zero_cache_records": zero_cache_records,
+        "counts": {
+            "lookback_risk_breakpoints": len(lookback_risks),
+            "cache_read_zero_records": len(cache_read_zero_records),
+            "zero_cache_records": len(zero_cache_records),
+        },
     }
 
 
@@ -999,6 +1224,7 @@ def parse_prompt_cache_summary(entry: str) -> dict[str, object] | None:
         else [],
     }
     for key in (
+        "automatic_cache_control_count",
         "system_cache_control_count",
         "tool_cache_control_count",
         "message_cache_control_count",
@@ -1221,6 +1447,7 @@ def extract_records(text: str) -> list[dict[str, object]]:
                     prompt_cache["cache_control_count"] = summary["cache_control_count"]
                     prompt_cache["cache_control_types"] = summary["cache_control_types"]
                     for key in (
+                        "automatic_cache_control_count",
                         "system_cache_control_count",
                         "tool_cache_control_count",
                         "message_cache_control_count",
@@ -1318,10 +1545,18 @@ def write_output(records: list[dict[str, object]], output_path: str | None) -> N
     print(payload)
 
 
+def write_summary(records: list[dict[str, object]], output_path: str | None) -> None:
+    if not output_path:
+        return
+    payload = json.dumps(summarize_records(records), ensure_ascii=False, indent=2)
+    Path(output_path).write_text(payload + "\n", encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     records = extract_records(read_log(args.log_path))
     write_output(records, args.output)
+    write_summary(records, args.summary_output)
     return 0
 
 
