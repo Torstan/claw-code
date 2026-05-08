@@ -37,12 +37,6 @@ impl PermissionEnforcer {
     /// Check whether a tool can be executed under the current permission policy.
     /// Auto-denies when prompting is required but no prompter is provided.
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying (the enforcer has no prompter).
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let outcome = self.policy.authorize(tool_name, input, None);
 
         match outcome {
@@ -321,6 +315,30 @@ mod tests {
 
         let result = enforcer.check_file_write("/workspace/file.rs", "/workspace");
         assert!(matches!(result, EnforcementResult::Denied { .. }));
+    }
+
+    #[test]
+    fn confirms_issue_01_prompt_mode_check_denies_without_prompter() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        for tool_name in ["bash", "unknown_tool"] {
+            match enforcer.check(tool_name, r#"{"command":"rm -rf /tmp/example"}"#) {
+                EnforcementResult::Denied {
+                    tool,
+                    active_mode,
+                    required_mode,
+                    reason,
+                } => {
+                    assert_eq!(tool, tool_name);
+                    assert_eq!(active_mode, "prompt");
+                    assert_eq!(required_mode, "danger-full-access");
+                    assert!(reason.contains("requires approval"));
+                }
+                other => panic!("expected denied result for {tool_name}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
