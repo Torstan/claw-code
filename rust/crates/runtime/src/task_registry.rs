@@ -365,12 +365,17 @@ impl TaskRegistry {
 
     #[must_use]
     pub fn len(&self) -> usize {
+        let scope_prefix = format!("{}\u{1f}", Self::current_scope());
         let inner = self
             .state
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.tasks.len()
+        inner
+            .tasks
+            .keys()
+            .filter(|key| key.starts_with(&scope_prefix))
+            .count()
     }
 
     #[must_use]
@@ -649,6 +654,45 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
         assert!(all_tasks.is_empty());
+    }
+
+    #[test]
+    fn len_and_is_empty_are_scoped_to_active_tool_session() {
+        let registry = TaskRegistry::new();
+
+        let task_a = crate::with_active_tool_session(Some("session-a"), || {
+            registry.create_with_id(
+                "shared-task-id".to_string(),
+                "prompt from session a",
+                Some("session a task"),
+            )
+        });
+        let task_b = crate::with_active_tool_session(Some("session-b"), || {
+            registry.create_with_id(
+                "other-task-id".to_string(),
+                "prompt from session b",
+                Some("session b task"),
+            )
+        });
+
+        assert_eq!(
+            crate::with_active_tool_session(Some("session-a"), || registry.len()),
+            1
+        );
+        assert!(!crate::with_active_tool_session(Some("session-a"), || {
+            registry.is_empty()
+        }));
+        assert_eq!(
+            crate::with_active_tool_session(Some("session-b"), || registry.len()),
+            1
+        );
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+
+        let _ =
+            crate::with_active_tool_session(Some("session-a"), || registry.remove(&task_a.task_id));
+        let _ =
+            crate::with_active_tool_session(Some("session-b"), || registry.remove(&task_b.task_id));
     }
 
     #[test]

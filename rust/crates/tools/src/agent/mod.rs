@@ -288,10 +288,22 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         ),
     );
 
+    let slot = match BackgroundAgentSlot::acquire() {
+        Ok(slot) => slot,
+        Err(error) => {
+            agent_debug_log(
+                "agent.background.capacity_exhausted",
+                format!("agent_id={} error={error}", job.manifest.agent_id),
+            );
+            mark_registered_background_agent_failed(&job, &error);
+            return Err(error);
+        }
+    };
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let _slot = slot;
             agent_debug_log(
                 "agent.background.thread.begin",
                 format!(
@@ -300,26 +312,6 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 ),
             );
             let registry = global_task_registry();
-            let slot = match BackgroundAgentSlot::acquire() {
-                Ok(slot) => slot,
-                Err(error) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
-                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
-                        registry.append_output(&job.manifest.agent_id, &error).ok();
-                        registry
-                            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
-                            .ok();
-                    });
-                    enqueue_background_agent_notification(&job, "failed", &error);
-                    return;
-                }
-            };
-            let _slot = slot;
             let started_at = Instant::now();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
@@ -407,6 +399,18 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             );
             error.to_string()
         })
+}
+
+fn mark_registered_background_agent_failed(job: &AgentJob, error: &str) {
+    let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.to_string()));
+    let registry = global_task_registry();
+    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+        registry.append_output(&job.manifest.agent_id, error).ok();
+        registry
+            .set_status(&job.manifest.agent_id, TaskStatus::Failed)
+            .ok();
+    });
+    enqueue_background_agent_notification(job, "failed", error);
 }
 
 pub(crate) fn enqueue_background_agent_notification(job: &AgentJob, status: &str, body: &str) {

@@ -2437,16 +2437,74 @@ fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _limit = EnvVarGuard::set("CLAWD_AGENT_MAX_CONCURRENCY", "1");
-
-    let first_slot =
+    let dir = temp_path("agent-issue-12-cap");
+    fs::create_dir_all(&dir).expect("agent store should be created");
+    let held_slot =
         super::agent::BackgroundAgentSlot::acquire().expect("first slot should be available");
-    let second = super::agent::BackgroundAgentSlot::acquire();
-    drop(first_slot);
+    let agent_id = "agent-issue-12-cap".to_string();
+    let session_id = "issue-12-parent-session";
+    let output_file = dir.join("agent-issue-12-cap.md");
+    let manifest_file = dir.join("agent-issue-12-cap.json");
+    fs::write(&output_file, "initial output\n").expect("agent output should be seeded");
+    let manifest = super::AgentOutput {
+        agent_id: agent_id.clone(),
+        name: "issue-12-cap".to_string(),
+        description: "Background cap regression".to_string(),
+        subagent_type: Some("general".to_string()),
+        model: Some("claude-opus-4-6".to_string()),
+        status: "running".to_string(),
+        output_file: output_file.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        created_at: super::iso8601_now(),
+        started_at: Some(super::iso8601_now()),
+        completed_at: None,
+        lane_events: vec![runtime::LaneEvent::started(super::iso8601_now())],
+        current_blocker: None,
+        derived_state: "working".to_string(),
+        error: None,
+        result: None,
+    };
+    super::agent::write_agent_manifest(&manifest).expect("manifest should be seeded");
+    let job = AgentJob {
+        manifest,
+        prompt: "Do background work".to_string(),
+        system_prompt: Vec::new(),
+        allowed_tools: BTreeSet::new(),
+        parent_session_id: Some(session_id.to_string()),
+    };
 
-    assert!(
-        second.is_err(),
-        "background agent work must be capped instead of allowing unbounded concurrent execution"
-    );
+    let launch_error = with_active_tool_session(Some(session_id), || {
+        super::agent::spawn_agent_job(job)
+            .expect_err("exhausted cap should reject before starting a background thread")
+    });
+
+    assert!(launch_error.contains("background agent concurrency limit reached"));
+    let registry = global_task_registry();
+    let task = with_active_tool_session(Some(session_id), || {
+        registry
+            .get(&agent_id)
+            .expect("rejected background agent should be registered")
+    });
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(task
+        .output
+        .contains("background agent concurrency limit reached"));
+    let failed_manifest = super::agent::read_agent_manifest(&manifest_file.display().to_string())
+        .expect("failed manifest should be readable");
+    assert_eq!(failed_manifest.status, "failed");
+    assert!(failed_manifest
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("background agent concurrency limit reached"));
+    let notifications = drain_session_notifications(session_id);
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains("status: failed"));
+    assert!(notifications[0].contains("background agent concurrency limit reached"));
+
+    let _ = with_active_tool_session(Some(session_id), || registry.remove(&agent_id));
+    drop(held_slot);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
