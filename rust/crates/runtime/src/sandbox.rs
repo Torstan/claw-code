@@ -163,8 +163,9 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let container = detect_container_environment();
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
     let network_supported = namespace_supported;
-    let filesystem_active =
+    let filesystem_requested =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    let filesystem_active = false;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
@@ -181,6 +182,12 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     {
         fallback_reasons
             .push("filesystem allow-list requested without configured mounts".to_string());
+    }
+    if filesystem_requested {
+        fallback_reasons.push(
+            "filesystem isolation unavailable (no enforced mount boundary is configured)"
+                .to_string(),
+        );
     }
 
     let active = request.enabled
@@ -361,7 +368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: filesystem sandbox reports active without mount isolation"]
     fn confirms_issue_03_filesystem_sandbox_requires_enforced_mount_boundary() {
         let request = SandboxConfig::default().resolve_request(
             Some(true),

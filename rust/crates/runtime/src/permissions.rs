@@ -152,6 +152,17 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    fn mode_satisfies_requirement(current: PermissionMode, required: PermissionMode) -> bool {
+        match current {
+            PermissionMode::Allow => true,
+            PermissionMode::Prompt => matches!(
+                required,
+                PermissionMode::ReadOnly | PermissionMode::WorkspaceWrite | PermissionMode::Prompt
+            ),
+            _ => current >= required && required != PermissionMode::Prompt,
+        }
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         self.tool_requirements
@@ -233,7 +244,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || Self::mode_satisfies_requirement(current_mode, required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -258,7 +269,7 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || Self::mode_satisfies_requirement(current_mode, required_mode)
         {
             return PermissionOutcome::Allow;
         }
@@ -527,7 +538,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: prompt mode currently bypasses approval"]
     fn confirms_issue_01_prompt_mode_requires_prompter_for_dangerous_tools() {
         let policy = PermissionPolicy::new(PermissionMode::Prompt)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
@@ -551,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: prompt mode currently allows without prompter"]
     fn confirms_issue_01_prompt_mode_denies_without_prompter() {
         let policy = PermissionPolicy::new(PermissionMode::Prompt)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);

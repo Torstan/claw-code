@@ -5,9 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
+
 const AGENT_DEBUG_ENV_VAR: &str = "CLAWD_AGENT_DEBUG";
 const AGENT_DEBUG_FILE_NAME: &str = "clawd-agent-debug.log";
 const DEBUG_LOG_LOCAL_OFFSET_SECONDS: i64 = 8 * 3_600;
+const DEBUG_DETAIL_MAX_CHARS: usize = 16 * 1024;
+const DEBUG_DETAIL_TRUNCATION_MARKER: &str = "[truncated debug detail]";
+const REDACTED_SECRET: &str = "[REDACTED_SECRET]";
 
 #[derive(Debug, Default)]
 struct AgentDebugWriter {
@@ -55,6 +60,54 @@ pub fn agent_debug_enabled() -> bool {
     agent_debug_dir().is_some()
 }
 
+fn secret_token_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\bsk-[a-z0-9][a-z0-9_-]{6,}\b").expect("secret token regex should compile")
+    })
+}
+
+fn authorization_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s"']+"#)
+            .expect("authorization regex should compile")
+    })
+}
+
+fn key_value_secret_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?i)\b((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,"'}\]]+"#)
+            .expect("key-value secret regex should compile")
+    })
+}
+
+fn redact_secret_shaped_values(detail: &str) -> String {
+    let redacted = secret_token_regex().replace_all(detail, REDACTED_SECRET);
+    let redacted = authorization_regex().replace_all(&redacted, "${1}[REDACTED_SECRET]");
+    key_value_secret_regex()
+        .replace_all(&redacted, "${1}[REDACTED_SECRET]")
+        .into_owned()
+}
+
+fn bound_debug_detail(detail: &str) -> String {
+    let redacted = redact_secret_shaped_values(detail);
+    if redacted.chars().count() <= DEBUG_DETAIL_MAX_CHARS {
+        return redacted;
+    }
+
+    let mut bounded = redacted
+        .chars()
+        .take(DEBUG_DETAIL_MAX_CHARS)
+        .collect::<String>();
+    let original_chars = redacted.chars().count();
+    bounded.push_str(&format!(
+        "\n{DEBUG_DETAIL_TRUNCATION_MARKER} original_chars={original_chars}"
+    ));
+    bounded
+}
+
 #[track_caller]
 pub fn agent_debug_log(event: &str, detail: impl AsRef<str>) {
     let Some(dir) = agent_debug_dir() else {
@@ -86,7 +139,8 @@ pub fn agent_debug_log(event: &str, detail: impl AsRef<str>) {
         "[clawd-agent-debug ts={formatted_timestamp} pid={} thread={thread_name} tid={thread_id} caller={caller_site}] {event}",
         std::process::id()
     );
-    let detail = detail.as_ref();
+    let detail = bound_debug_detail(detail.as_ref());
+    let detail = detail.as_str();
     if detail.is_empty() {
         let _ = writeln!(file, "{prefix}");
     } else {
@@ -175,6 +229,39 @@ mod tests {
 
         std::env::remove_var(AGENT_DEBUG_ENV_VAR);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_debug_log_redacts_secret_shaped_values() {
+        let _guard = crate::test_env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "clawd-agent-debug-redaction-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("debug dir should be created");
+        let previous = std::env::var_os(AGENT_DEBUG_ENV_VAR);
+        std::env::set_var(AGENT_DEBUG_ENV_VAR, &dir);
+
+        agent_debug_log(
+            "test.secret",
+            "api_key=sk-ant-secret-value\nAuthorization: Bearer sk-openai-secret-value",
+        );
+
+        match previous {
+            Some(value) => std::env::set_var(AGENT_DEBUG_ENV_VAR, value),
+            None => std::env::remove_var(AGENT_DEBUG_ENV_VAR),
+        }
+
+        let contents =
+            std::fs::read_to_string(dir.join(AGENT_DEBUG_FILE_NAME)).expect("debug log file");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!contents.contains("sk-ant-secret-value"));
+        assert!(!contents.contains("sk-openai-secret-value"));
+        assert!(contents.contains("[REDACTED_SECRET]"));
     }
 
     #[test]
