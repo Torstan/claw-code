@@ -1,25 +1,24 @@
 use super::{
-    agent_debug_log, check_freshness, execute_agent, execute_bash, execute_brief, execute_config,
-    execute_enter_plan_mode, execute_exit_plan_mode, execute_notebook_edit, execute_powershell,
-    execute_repl, execute_skill, execute_sleep, execute_structured_output, execute_todo_write,
-    execute_tool_search, execute_web_fetch, execute_web_search, glob_search, global_cron_registry,
-    global_lsp_registry, global_mcp_registry, global_task_registry, global_team_registry,
-    global_worker_registry, grep_search, iso8601_now, read_file, write_file, AgentInput,
-    AskUserQuestionInput, BashCommandInput, BashCommandOutput, BranchFreshness, BriefInput,
-    ConfigInput, CronCreateInput, CronDeleteInput, Duration, EditFileInput, EnforcementResult,
-    EnterPlanModeInput, ExitPlanModeInput, GlobSearchInputValue, GrepSearchInput, Instant,
-    LspInput, McpAuthInput, McpResourceInput, McpToolInput, NotebookEditInput, PermissionEnforcer,
-    PowerShellInput, ReadFileInput, RemoteTriggerInput, ReplInput, SkillInput, SleepInput,
-    StructuredOutputInput, TaskCreateInput, TaskIdInput, TaskOutputInput, TaskOutputPayload,
-    TaskPacket, TaskStatus, TaskUpdateInput, TeamCreateInput, TeamDeleteInput,
-    TestingPermissionInput, TodoWriteInput, ToolSearchInput, WebFetchInput, WebSearchInput,
-    WorkerCreateInput, WorkerIdInput, WorkerObserveCompletionInput, WorkerObserveInput,
-    WorkerReadySnapshot, WorkerSendPromptInput, WriteFileInput,
+    agent_debug_log, check_freshness, edit_file_in_workspace, execute_agent, execute_bash,
+    execute_brief, execute_config, execute_enter_plan_mode, execute_exit_plan_mode,
+    execute_notebook_edit, execute_powershell, execute_repl, execute_skill, execute_sleep,
+    execute_structured_output, execute_todo_write, execute_tool_search, execute_web_fetch,
+    execute_web_search, glob_search_in_workspace, global_cron_registry, global_lsp_registry,
+    global_mcp_registry, global_task_registry, global_team_registry, global_worker_registry,
+    grep_search_in_workspace, iso8601_now, read_file_in_workspace, write_file_in_workspace,
+    AgentInput, AskUserQuestionInput, BashCommandInput, BashCommandOutput, BranchFreshness,
+    BriefInput, ConfigInput, CronCreateInput, CronDeleteInput, Duration, EditFileInput,
+    EnforcementResult, EnterPlanModeInput, ExitPlanModeInput, GlobSearchInputValue,
+    GrepSearchInput, Instant, LspInput, McpAuthInput, McpResourceInput, McpToolInput,
+    NotebookEditInput, PermissionEnforcer, PowerShellInput, ReadFileInput, RemoteTriggerInput,
+    ReplInput, SkillInput, SleepInput, StructuredOutputInput, TaskCreateInput, TaskIdInput,
+    TaskOutputInput, TaskOutputPayload, TaskPacket, TaskStatus, TaskUpdateInput, TeamCreateInput,
+    TeamDeleteInput, TestingPermissionInput, TodoWriteInput, ToolSearchInput, WebFetchInput,
+    WebSearchInput, WorkerCreateInput, WorkerIdInput, WorkerObserveCompletionInput,
+    WorkerObserveInput, WorkerReadySnapshot, WorkerSendPromptInput, WriteFileInput,
 };
 use reqwest::blocking::Client;
-use runtime::{
-    edit_file, ConfigLoader, LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass,
-};
+use runtime::{ConfigLoader, LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
@@ -891,24 +890,37 @@ fn branch_divergence_output(
     }
 }
 
+fn active_workspace_root() -> Result<std::path::PathBuf, String> {
+    std::env::current_dir().map_err(|error| error.to_string())
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let workspace = active_workspace_root()?;
+    to_pretty_json(
+        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let workspace = active_workspace_root()?;
+    to_pretty_json(
+        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+    let workspace = active_workspace_root()?;
     to_pretty_json(
-        edit_file(
+        edit_file_in_workspace(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
+            &workspace,
         )
         .map_err(io_to_string)?,
     )
@@ -916,12 +928,17 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+    let workspace = active_workspace_root()?;
+    to_pretty_json(
+        glob_search_in_workspace(&input.pattern, input.path.as_deref(), &workspace)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+    let workspace = active_workspace_root()?;
+    to_pretty_json(grep_search_in_workspace(&input, &workspace).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]

@@ -279,7 +279,6 @@ fn rejects_unknown_tool_names() {
 }
 
 #[test]
-#[ignore = "known issue confirmation: tool dispatch currently bypasses workspace boundary helpers"]
 fn confirms_issue_02_file_tool_dispatch_rejects_outside_absolute_paths() {
     let outside_dir = temp_path("issue-02-outside-dir");
     fs::create_dir_all(&outside_dir).expect("outside dir should create");

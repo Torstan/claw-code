@@ -14,18 +14,19 @@ use api::{
 use plugins::PluginTool;
 use runtime::{
     active_tool_session_id, check_freshness, dedupe_superseded_commit_events,
-    enqueue_session_notification, execute_bash, glob_search, grep_search, load_system_prompt,
+    edit_file_in_workspace, enqueue_session_notification, execute_bash, glob_search_in_workspace,
+    grep_search_in_workspace, load_system_prompt,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    read_file_in_workspace,
     summary_compression::compress_summary_text,
     task_registry::TaskStatus,
     worker_boot::WorkerReadySnapshot,
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass,
-    McpDegradedReport, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket, ToolError,
-    ToolExecutor, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
+    ToolError, ToolExecutor, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
