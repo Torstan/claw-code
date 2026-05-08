@@ -155,10 +155,9 @@ impl PermissionPolicy {
     fn mode_satisfies_requirement(current: PermissionMode, required: PermissionMode) -> bool {
         match current {
             PermissionMode::Allow => true,
-            PermissionMode::Prompt => matches!(
-                required,
-                PermissionMode::ReadOnly | PermissionMode::WorkspaceWrite | PermissionMode::Prompt
-            ),
+            PermissionMode::Prompt => {
+                matches!(required, PermissionMode::ReadOnly | PermissionMode::Prompt)
+            }
             _ => current >= required && required != PermissionMode::Prompt,
         }
     }
@@ -567,6 +566,17 @@ mod tests {
 
         assert!(matches!(
             policy.authorize("bash", r#"{"command":"rm -rf /tmp/example"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("requires approval")
+        ));
+    }
+
+    #[test]
+    fn prompt_mode_denies_workspace_write_without_prompter() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+
+        assert!(matches!(
+            policy.authorize("write_file", r#"{"path":"src/main.rs"}"#, None),
             PermissionOutcome::Deny { reason } if reason.contains("requires approval")
         ));
     }

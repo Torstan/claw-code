@@ -63,7 +63,8 @@ pub fn agent_debug_enabled() -> bool {
 fn secret_token_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\bsk-[a-z0-9][a-z0-9_-]{6,}\b").expect("secret token regex should compile")
+        Regex::new(r"(?i)\b(?:sk|xai)-[a-z0-9][a-z0-9_-]{6,}\b")
+            .expect("secret token regex should compile")
     })
 }
 
@@ -78,8 +79,10 @@ fn authorization_regex() -> &'static Regex {
 fn key_value_secret_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,"'}\]]+"#)
-            .expect("key-value secret regex should compile")
+        Regex::new(
+            r#"(?i)(["']?\b(?:(?:[a-z0-9]+[_-])*api[_-]?key|token|secret|password)\b["']?\s*[:=]\s*["']?)[^\s,"'}\]]+"#,
+        )
+        .expect("key-value secret regex should compile")
     })
 }
 
@@ -248,7 +251,12 @@ mod tests {
 
         agent_debug_log(
             "test.secret",
-            "api_key=sk-ant-secret-value\nAuthorization: Bearer sk-openai-secret-value",
+            concat!(
+                "api_key=sk-ant-secret-value\n",
+                "Authorization: Bearer sk-openai-secret-value\n",
+                "XAI_API_KEY=xai-secret-value-123456\n",
+                r#"{"api_key":"json-secret-value-123456"}"#
+            ),
         );
 
         match previous {
@@ -262,6 +270,8 @@ mod tests {
 
         assert!(!contents.contains("sk-ant-secret-value"));
         assert!(!contents.contains("sk-openai-secret-value"));
+        assert!(!contents.contains("xai-secret-value-123456"));
+        assert!(!contents.contains("json-secret-value-123456"));
         assert!(contents.contains("[REDACTED_SECRET]"));
     }
 

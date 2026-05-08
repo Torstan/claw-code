@@ -342,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn prompt_mode_check_denies_workspace_write_without_prompter() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        match enforcer.check("write_file", r#"{"path":"src/main.rs"}"#) {
+            EnforcementResult::Denied {
+                tool,
+                active_mode,
+                required_mode,
+                reason,
+            } => {
+                assert_eq!(tool, "write_file");
+                assert_eq!(active_mode, "prompt");
+                assert_eq!(required_mode, "workspace-write");
+                assert!(reason.contains("requires approval"));
+            }
+            other => panic!("expected denied result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn workspace_boundary_check() {
         assert!(is_within_workspace("/workspace/src/main.rs", "/workspace"));
         assert!(is_within_workspace("/workspace", "/workspace"));
