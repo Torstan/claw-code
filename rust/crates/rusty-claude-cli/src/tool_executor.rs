@@ -434,9 +434,9 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value.as_os_str());
+            std::env::set_var(key, value);
             Self { key, previous }
         }
     }
@@ -484,12 +484,53 @@ mod tests {
     #[test]
     fn parallel_agent_limit_uses_env_override() {
         let _lock = env_lock();
-        let previous = std::env::var_os(PARALLEL_AGENT_LIMIT_ENV_VAR);
-        std::env::set_var(PARALLEL_AGENT_LIMIT_ENV_VAR, "2");
+        let _limit_env = EnvVarGuard::set(PARALLEL_AGENT_LIMIT_ENV_VAR, "2");
         assert_eq!(parallel_agent_limit(), 2);
-        match previous {
-            Some(value) => std::env::set_var(PARALLEL_AGENT_LIMIT_ENV_VAR, value),
-            None => std::env::remove_var(PARALLEL_AGENT_LIMIT_ENV_VAR),
-        }
+    }
+
+    #[test]
+    fn parallel_agent_limit_chunks_agent_invocations_and_preserves_result_order() {
+        let _lock = env_lock();
+        let _limit_env = EnvVarGuard::set(PARALLEL_AGENT_LIMIT_ENV_VAR, "2");
+
+        let invocations = [
+            ToolInvocation {
+                tool_name: "Agent".to_string(),
+                input: "{".to_string(),
+            },
+            ToolInvocation {
+                tool_name: "Agent".to_string(),
+                input: r#"{"prompt":"second"}"#.to_string(),
+            },
+            ToolInvocation {
+                tool_name: "Agent".to_string(),
+                input: r#"{"description":"third"}"#.to_string(),
+            },
+        ];
+        let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+
+        let results = executor.execute_many(&invocations);
+        let messages = results
+            .into_iter()
+            .map(|result| {
+                result
+                    .expect_err("all inputs should fail before agent spawn")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(parallel_agent_limit(), 2);
+        assert!(
+            messages[0].contains("EOF while parsing"),
+            "first result should stay first: {messages:?}"
+        );
+        assert!(
+            messages[1].contains("missing field `description`"),
+            "second result should stay second: {messages:?}"
+        );
+        assert!(
+            messages[2].contains("missing field `prompt`"),
+            "third result should stay third across chunk boundary: {messages:?}"
+        );
     }
 }

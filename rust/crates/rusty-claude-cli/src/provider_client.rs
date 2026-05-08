@@ -119,7 +119,7 @@ impl AnthropicRuntimeClient {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
+            model: resolved_model,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -1162,6 +1162,128 @@ fn apply_tool_cache_controls(tools: &mut Option<Vec<ToolDefinition>>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use runtime::{ApiRequest, ConversationMessage};
+    use serde_json::Value;
+    use tools::GlobalToolRegistry;
+
+    use super::*;
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    struct CapturingSseServer {
+        base_url: String,
+        captured_body: Arc<Mutex<Option<String>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl CapturingSseServer {
+        fn spawn(response_body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+            let captured_body = Arc::new(Mutex::new(None));
+            let captured_body_for_thread = Arc::clone(&captured_body);
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("server should accept request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let bytes = stream
+                        .read(&mut buffer)
+                        .expect("server should read request");
+                    if bytes == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes]);
+                    if request_body_complete(&request) {
+                        break;
+                    }
+                }
+                let body = http_request_body(&request).to_string();
+                *captured_body_for_thread.lock().expect("captured body lock") = Some(body);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("server should write response");
+            });
+
+            Self {
+                base_url,
+                captured_body,
+                handle: Some(handle),
+            }
+        }
+
+        fn captured_json(&mut self) -> Value {
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("server thread should finish");
+            }
+            let body = self
+                .captured_body
+                .lock()
+                .expect("captured body lock")
+                .clone()
+                .expect("server should capture request body");
+            serde_json::from_str(&body).expect("captured body should be JSON")
+        }
+    }
+
+    fn request_body_complete(request: &[u8]) -> bool {
+        let Some(header_end) = find_header_end(request) else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .or_else(|| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
+    fn find_header_end(request: &[u8]) -> Option<usize> {
+        request.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn http_request_body(request: &[u8]) -> &str {
+        let body_start = find_header_end(request).expect("headers should terminate") + 4;
+        std::str::from_utf8(&request[body_start..]).expect("request body should be UTF-8")
+    }
+
     #[test]
     fn confirms_issue_07_cli_uses_model_specific_max_tokens() {
         let gpt_max = super::max_tokens_for_model("openai/gpt-4o-mini");
@@ -1175,5 +1297,40 @@ mod tests {
             unknown_local_max <= 16_384,
             "unknown local models should use a conservative output budget"
         );
+    }
+
+    #[test]
+    fn confirms_issue_07_api_alias_request_model_and_max_tokens_align() {
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl_cli\",\"model\":\"grok-3\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_cli\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut server = CapturingSseServer::spawn(sse);
+        let _base_url = ScopedEnvVar::set("XAI_BASE_URL", &server.base_url);
+
+        let mut client = AnthropicRuntimeClient::new(
+            "test-session",
+            "grok".to_string(),
+            false,
+            false,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+        )
+        .expect("local xAI-compatible client should construct");
+
+        let events = client
+            .stream(ApiRequest {
+                system_prompt: Vec::new(),
+                messages: vec![ConversationMessage::user_text("hello")],
+                suppress_background_task_tools: false,
+            })
+            .expect("mock stream should complete");
+        assert!(!events.is_empty());
+
+        let request = server.captured_json();
+        assert_eq!(request["model"], "grok-3");
+        assert_eq!(request["max_tokens"], api::max_tokens_for_model("grok-3"));
     }
 }
