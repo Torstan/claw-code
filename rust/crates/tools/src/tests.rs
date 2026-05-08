@@ -959,6 +959,24 @@ fn global_tool_registry_denies_blocked_tool_before_dispatch() {
 }
 
 #[test]
+fn global_tool_registry_denies_prompt_mode_without_prompter_before_dispatch() {
+    let policy = PermissionPolicy::new(PermissionMode::Prompt)
+        .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+    let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+    let error = registry
+        .execute(
+            "bash",
+            &json!({
+                "command": "printf prompt-dispatch-denied"
+            }),
+        )
+        .expect_err("prompt mode without a prompter should deny before dispatch");
+
+    assert!(error.contains("requires approval to escalate from prompt to danger-full-access"));
+}
+
+#[test]
 fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
     // given
     let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
