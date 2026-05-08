@@ -36,6 +36,28 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value.as_os_str());
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 fn temp_path(name: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -265,7 +287,7 @@ fn confirms_issue_02_file_tool_dispatch_rejects_outside_absolute_paths() {
     fs::write(&outside_file, "alpha\nneedle\n").expect("outside file should write");
     let outside_write = outside_dir.join("created-by-tool.txt");
 
-    let outcomes = vec![
+    let outcomes = [
         (
             "read_file",
             execute_tool(
@@ -2327,6 +2349,7 @@ fn confirms_issue_11_task_registry_requires_session_scope() {
     );
 
     let visible_from_global_lookup = registry.get(&task.task_id).is_some();
+    registry.remove(&task.task_id);
 
     assert!(
         !visible_from_global_lookup,
@@ -2393,8 +2416,7 @@ fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let agent_store = temp_path("issue-12-agent-store");
-    let original_agent_store = std::env::var_os("CLAWD_AGENT_STORE");
-    std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
+    let _agent_store_env = EnvVarGuard::set_path("CLAWD_AGENT_STORE", &agent_store);
 
     let input = AgentInput {
         description: "bounded background work".to_string(),
@@ -2412,10 +2434,6 @@ fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
         Ok(())
     });
 
-    match original_agent_store {
-        Some(value) => std::env::set_var("CLAWD_AGENT_STORE", value),
-        None => std::env::remove_var("CLAWD_AGENT_STORE"),
-    }
     let _ = fs::remove_dir_all(&agent_store);
     let output = output.expect("agent launch should return");
 
