@@ -459,7 +459,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: tool debug logs currently include full input/output"]
     fn confirms_issue_16_tool_debug_log_redacts_secret_shaped_values() {
         let _lock = env_lock();
         let debug_dir = debug_temp_dir("issue-16");
