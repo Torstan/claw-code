@@ -257,6 +257,86 @@ fn rejects_unknown_tool_names() {
 }
 
 #[test]
+#[ignore = "known issue confirmation: tool dispatch currently bypasses workspace boundary helpers"]
+fn confirms_issue_02_file_tool_dispatch_rejects_outside_absolute_paths() {
+    let outside_dir = temp_path("issue-02-outside-dir");
+    fs::create_dir_all(&outside_dir).expect("outside dir should create");
+    let outside_file = outside_dir.join("secret.txt");
+    fs::write(&outside_file, "alpha\nneedle\n").expect("outside file should write");
+    let outside_write = outside_dir.join("created-by-tool.txt");
+
+    let outcomes = vec![
+        (
+            "read_file",
+            execute_tool(
+                "read_file",
+                &json!({
+                    "path": outside_file.display().to_string()
+                }),
+            )
+            .is_err(),
+        ),
+        (
+            "write_file",
+            execute_tool(
+                "write_file",
+                &json!({
+                    "path": outside_write.display().to_string(),
+                    "content": "created outside workspace"
+                }),
+            )
+            .is_err(),
+        ),
+        (
+            "edit_file",
+            execute_tool(
+                "edit_file",
+                &json!({
+                    "path": outside_file.display().to_string(),
+                    "old_string": "alpha",
+                    "new_string": "omega"
+                }),
+            )
+            .is_err(),
+        ),
+        (
+            "glob_search",
+            execute_tool(
+                "glob_search",
+                &json!({
+                    "pattern": "**/*.txt",
+                    "path": outside_dir.display().to_string()
+                }),
+            )
+            .is_err(),
+        ),
+        (
+            "grep_search",
+            execute_tool(
+                "grep_search",
+                &json!({
+                    "pattern": "needle",
+                    "path": outside_dir.display().to_string(),
+                    "glob": "**/*.txt",
+                    "output_mode": "content"
+                }),
+            )
+            .is_err(),
+        ),
+    ];
+    let accepted = outcomes
+        .iter()
+        .filter_map(|(tool, rejected)| (!rejected).then_some(*tool))
+        .collect::<Vec<_>>();
+    let _ = fs::remove_dir_all(&outside_dir);
+
+    assert!(
+        accepted.is_empty(),
+        "file tool dispatch accepted outside paths instead of enforcing workspace boundary: {accepted:?}"
+    );
+}
+
+#[test]
 fn worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust() {
     let created = execute_tool(
         "WorkerCreate",
@@ -1918,6 +1998,28 @@ fn agent_runtime_session_uses_manifest_agent_id_for_llm_logs() {
 }
 
 #[test]
+#[ignore = "known issue confirmation: subagent default model currently ignores parent provider"]
+fn confirms_issue_08_subagent_default_model_is_not_hardcoded_anthropic() {
+    let model = super::agent::resolve_agent_model(None);
+
+    assert_ne!(
+        model, "claude-opus-4-6",
+        "subagents without explicit model should inherit parent/provider model or use configurable default"
+    );
+}
+
+#[test]
+#[ignore = "known issue confirmation: subagent sessions currently lack persistence path"]
+fn confirms_issue_09_subagent_session_has_persistence_for_tool_result_budgeting() {
+    let session = new_agent_session("agent-issue-09");
+
+    assert!(
+        session.persistence_path().is_some(),
+        "subagent sessions need persistence paths so large tool results can be externalized"
+    );
+}
+
+#[test]
 fn background_agent_captures_parent_session_and_formats_notification() {
     let _guard = env_lock()
         .lock()
@@ -1967,6 +2069,47 @@ fn background_agent_captures_parent_session_and_formats_notification() {
 
     std::env::remove_var("CLAWD_AGENT_STORE");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "known issue confirmation: background agent notifications currently include unbounded body"]
+fn confirms_issue_10_background_agent_notification_is_bounded() {
+    let parent_session = "parent-issue-10";
+    let manifest = super::AgentOutput {
+        agent_id: "agent-issue-10".to_string(),
+        name: "issue-10".to_string(),
+        description: "large result".to_string(),
+        subagent_type: Some("general".to_string()),
+        model: Some("claude-opus-4-6".to_string()),
+        status: "running".to_string(),
+        output_file: "/tmp/agent-issue-10.md".to_string(),
+        manifest_file: "/tmp/agent-issue-10.json".to_string(),
+        created_at: super::iso8601_now(),
+        started_at: Some(super::iso8601_now()),
+        completed_at: None,
+        lane_events: Vec::new(),
+        current_blocker: None,
+        derived_state: "working".to_string(),
+        error: None,
+        result: None,
+    };
+    let job = AgentJob {
+        manifest,
+        prompt: "summarize".to_string(),
+        system_prompt: Vec::new(),
+        allowed_tools: BTreeSet::new(),
+        parent_session_id: Some(parent_session.to_string()),
+    };
+    let large_body = "x".repeat(128 * 1024);
+
+    enqueue_background_agent_notification(&job, "completed", &large_body);
+    let notifications = drain_session_notifications(parent_session);
+
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        notifications[0].len() < 8 * 1024,
+        "background completion notifications should summarize or externalize large agent output"
+    );
 }
 
 #[test]
@@ -2174,6 +2317,24 @@ fn agent_background_registers_in_task_registry() {
 }
 
 #[test]
+#[ignore = "known issue confirmation: global task registry is not session-scoped"]
+fn confirms_issue_11_task_registry_requires_session_scope() {
+    let registry = global_task_registry();
+    let task = registry.create_with_id(
+        "shared-task-id".to_string(),
+        "prompt from session a",
+        Some("session a task"),
+    );
+
+    let visible_from_global_lookup = registry.get(&task.task_id).is_some();
+
+    assert!(
+        !visible_from_global_lookup,
+        "task lookup should require a session namespace instead of process-global task ids"
+    );
+}
+
+#[test]
 fn agent_background_launch_returns_async_contract() {
     let _guard = env_lock()
         .lock()
@@ -2223,6 +2384,47 @@ fn agent_background_launch_returns_async_contract() {
     registry.remove(&launch.agent_id);
     std::env::remove_var("CLAWD_AGENT_STORE");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "known issue confirmation: background agent spawn is unbounded"]
+fn confirms_issue_12_background_agent_execution_requires_concurrency_limit() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let agent_store = temp_path("issue-12-agent-store");
+    let original_agent_store = std::env::var_os("CLAWD_AGENT_STORE");
+    std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
+
+    let input = AgentInput {
+        description: "bounded background work".to_string(),
+        prompt: "do bounded work".to_string(),
+        subagent_type: None,
+        name: None,
+        model: Some("claude-opus-4-6".to_string()),
+        run_in_background: Some(true),
+    };
+    let spawned = Arc::new(Mutex::new(0usize));
+    let spawned_for_closure = Arc::clone(&spawned);
+
+    let output = execute_agent_with_mode(input, move |_job| {
+        *spawned_for_closure.lock().expect("spawn count lock") += 1;
+        Ok(())
+    });
+
+    match original_agent_store {
+        Some(value) => std::env::set_var("CLAWD_AGENT_STORE", value),
+        None => std::env::remove_var("CLAWD_AGENT_STORE"),
+    }
+    let _ = fs::remove_dir_all(&agent_store);
+    let output = output.expect("agent launch should return");
+
+    assert!(matches!(output, AgentToolOutput::AsyncLaunched(_)));
+    assert_eq!(
+        *spawned.lock().expect("spawn count lock"),
+        0,
+        "background launches should enter a bounded queue instead of spawning immediately"
+    );
 }
 
 #[test]

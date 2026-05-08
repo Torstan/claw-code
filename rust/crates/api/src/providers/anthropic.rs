@@ -1773,6 +1773,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known issue confirmation: default retry budget is too long for fast fallback"]
+    fn confirms_issue_17_default_retry_budget_exceeds_fast_fallback_window() {
+        let client = AnthropicClient::from_auth(AuthSource::ApiKey("test".to_string()));
+        let first = client.backoff_for_attempt(1).expect("attempt 1 backoff");
+        let second = client.backoff_for_attempt(2).expect("attempt 2 backoff");
+        let third = client.backoff_for_attempt(3).expect("attempt 3 backoff");
+        let minimum_without_jitter = first + second + third;
+
+        assert!(
+            minimum_without_jitter <= Duration::from_secs(3),
+            "provider fallback should not wait through a long retry budget before trying the next provider"
+        );
+    }
+
+    #[test]
     fn retryable_statuses_are_detected() {
         assert!(super::is_retryable_status(
             reqwest::StatusCode::TOO_MANY_REQUESTS

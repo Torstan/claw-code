@@ -1521,6 +1521,147 @@ mod tests {
             .expect("env lock")
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: local OpenAI-compatible endpoints currently require API key"]
+    fn confirms_issue_04_openai_base_url_without_key_builds_unauthenticated_client() {
+        let _guard = env_lock();
+        let _api_key = EnvVarGuard::unset("OPENAI_API_KEY");
+        let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai());
+
+        assert!(
+            client.is_ok(),
+            "local OpenAI-compatible endpoints configured by OPENAI_BASE_URL should not require an API key"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: tool result wire payload currently contains non-standard fields"]
+    fn confirms_issue_05_tool_result_wire_payload_omits_is_error() {
+        let request = MessageRequest {
+            model: "openai/gpt-4o".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: "tool failed".to_string(),
+                    }],
+                    is_error: true,
+                    cache_control: None,
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let serialized = serde_json::to_string(&payload).expect("payload should serialize");
+
+        assert!(
+            !serialized.contains("\"is_error\""),
+            "OpenAI Chat Completions tool messages must not include Anthropic-only is_error"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: orphan tool messages currently survive sanitizer"]
+    fn confirms_issue_05_orphan_tool_messages_are_dropped() {
+        let request = MessageRequest {
+            model: "openai/gpt-4o".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "missing_call".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "orphan".to_string(),
+                        }],
+                        is_error: false,
+                        cache_control: None,
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let tool_messages = payload["messages"]
+            .as_array()
+            .expect("messages should be array")
+            .iter()
+            .filter(|message| message["role"] == json!("tool"))
+            .count();
+
+        assert_eq!(
+            tool_messages, 0,
+            "orphan tool messages should be removed from OpenAI payloads"
+        );
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: non-streaming tool_calls null currently fails deserialization"]
+    fn confirms_issue_06_non_streaming_tool_calls_null_deserializes_as_empty() {
+        let body = r#"{
+            "id": "chatcmpl_null_tools",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            }
+        }"#;
+
+        let parsed = serde_json::from_str::<super::ChatCompletionResponse>(body);
+
+        assert!(
+            parsed.is_ok(),
+            "non-streaming OpenAI responses should tolerate tool_calls:null"
+        );
+    }
+
     #[test]
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
