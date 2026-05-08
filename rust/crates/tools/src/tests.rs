@@ -73,6 +73,24 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
 }
 
+struct CwdGuard {
+    previous: PathBuf,
+}
+
+impl CwdGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(path).expect("set cwd");
+        Self { previous }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.previous).expect("restore cwd");
+    }
+}
+
 fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -2188,6 +2206,130 @@ fn subagent_inherits_active_parent_session_model_when_no_agent_default_is_set() 
         captured_job.manifest.model.as_deref(),
         Some("openai/gpt-5.1")
     );
+}
+
+#[test]
+fn subagent_parent_model_takes_precedence_over_anthropic_model_env() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _agent_model = EnvVarGuard::remove("CLAWD_AGENT_MODEL");
+    let _anthropic_model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-opus-4-6");
+    let config_home = temp_path("parent-model-anthropic-config-home");
+    let agent_store = temp_path("parent-model-anthropic-agent-store");
+    let workspace = temp_path("parent-model-anthropic-workspace");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&agent_store).expect("agent store should exist");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let _config_home = EnvVarGuard::set(
+        "CLAW_CONFIG_HOME",
+        config_home.to_str().expect("config home should be utf8"),
+    );
+    let _agent_store = EnvVarGuard::set(
+        "CLAWD_AGENT_STORE",
+        agent_store.to_str().expect("agent store should be utf8"),
+    );
+    let _cwd = CwdGuard::set(&workspace);
+
+    let parent_session_id = "parent-model-anthropic-session";
+    let session_store = SessionStore::from_cwd(&workspace).expect("session store should build");
+    let parent_handle = session_store.create_handle(parent_session_id);
+    let mut parent_session = Session::new().with_workspace_root(workspace.clone());
+    parent_session.session_id = parent_session_id.to_string();
+    parent_session.model = Some("openai/gpt-5.1".to_string());
+    parent_session
+        .save_to_path(&parent_handle.path)
+        .expect("parent session should save");
+
+    let manifest = with_active_tool_context(Some(parent_session_id), Some(&workspace), || {
+        execute_agent_with_spawn(
+            AgentInput {
+                description: "Audit the active model".to_string(),
+                prompt: "Confirm inherited model.".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_| Ok(()),
+        )
+    })
+    .expect("agent should spawn");
+
+    assert_eq!(manifest.model.as_deref(), Some("openai/gpt-5.1"));
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&agent_store);
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+#[test]
+fn subagent_configured_model_uses_active_workspace_root_not_process_cwd() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _agent_model = EnvVarGuard::remove("CLAWD_AGENT_MODEL");
+    let _anthropic_model = EnvVarGuard::remove("ANTHROPIC_MODEL");
+    let config_home = temp_path("agent-model-active-config-home");
+    let agent_store = temp_path("agent-model-active-agent-store");
+    let workspace = temp_path("agent-model-active-workspace");
+    let process_cwd = temp_path("agent-model-process-cwd");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&agent_store).expect("agent store should exist");
+    fs::create_dir_all(workspace.join(".claw")).expect("active workspace config dir");
+    fs::create_dir_all(process_cwd.join(".claw")).expect("process cwd config dir");
+    fs::write(
+        workspace.join(".claw").join("settings.json"),
+        r#"{"model":"openai/active-workspace-model"}"#,
+    )
+    .expect("write active workspace settings");
+    fs::write(
+        process_cwd.join(".claw").join("settings.json"),
+        r#"{"model":"claude-process-cwd-model"}"#,
+    )
+    .expect("write process cwd settings");
+    let _config_home = EnvVarGuard::set(
+        "CLAW_CONFIG_HOME",
+        config_home.to_str().expect("config home should be utf8"),
+    );
+    let _agent_store = EnvVarGuard::set(
+        "CLAWD_AGENT_STORE",
+        agent_store.to_str().expect("agent store should be utf8"),
+    );
+    let _cwd = CwdGuard::set(&process_cwd);
+
+    let parent_session_id = "agent-model-active-workspace-session";
+    let session_store = SessionStore::from_cwd(&workspace).expect("session store should build");
+    let parent_handle = session_store.create_handle(parent_session_id);
+    let mut parent_session = Session::new().with_workspace_root(workspace.clone());
+    parent_session.session_id = parent_session_id.to_string();
+    parent_session.model = Some("openai/parent-session-model".to_string());
+    parent_session
+        .save_to_path(&parent_handle.path)
+        .expect("parent session should save");
+
+    let manifest = with_active_tool_context(Some(parent_session_id), Some(&workspace), || {
+        execute_agent_with_spawn(
+            AgentInput {
+                description: "Audit the active workspace config".to_string(),
+                prompt: "Confirm configured model.".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_| Ok(()),
+        )
+    })
+    .expect("agent should spawn");
+
+    assert_eq!(
+        manifest.model.as_deref(),
+        Some("openai/active-workspace-model")
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&process_cwd);
+    let _ = std::fs::remove_dir_all(&agent_store);
+    let _ = std::fs::remove_dir_all(&config_home);
 }
 
 #[test]

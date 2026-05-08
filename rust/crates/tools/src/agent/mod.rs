@@ -621,30 +621,34 @@ pub(crate) fn resolve_agent_model(model: Option<&str>) -> String {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(agent_model_env)
         .or_else(configured_agent_model)
         .or_else(active_parent_session_model)
+        .or_else(anthropic_model_env)
         .unwrap_or_else(|| FALLBACK_AGENT_MODEL.to_string())
 }
 
-fn configured_agent_model() -> Option<String> {
+fn agent_model_env() -> Option<String> {
     std::env::var(AGENT_MODEL_ENV_VAR)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let cwd = std::env::current_dir().ok()?;
-            ConfigLoader::default_for(cwd)
-                .load()
-                .ok()?
-                .model()
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            std::env::var("ANTHROPIC_MODEL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+}
+
+fn configured_agent_model() -> Option<String> {
+    let workspace_root = active_tool_workspace_root().or_else(|| std::env::current_dir().ok())?;
+    ConfigLoader::default_for(workspace_root)
+        .load()
+        .ok()?
+        .model()
+        .map(ToOwned::to_owned)
+}
+
+fn anthropic_model_env() -> Option<String> {
+    std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn active_parent_session_model() -> Option<String> {
