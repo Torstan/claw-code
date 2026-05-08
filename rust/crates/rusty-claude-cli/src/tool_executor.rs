@@ -383,3 +383,70 @@ impl ToolExecutor for CliToolExecutor {
         tool_name == "Agent"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value.as_os_str());
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn debug_temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawd-cli-tool-executor-{name}-{unique}"))
+    }
+
+    #[test]
+    #[ignore = "known issue confirmation: tool debug logs currently include full input/output"]
+    fn confirms_issue_16_tool_debug_log_redacts_secret_shaped_values() {
+        let _lock = env_lock();
+        let debug_dir = debug_temp_dir("issue-16");
+        std::fs::create_dir_all(&debug_dir).expect("debug dir should create");
+        let _debug_env = EnvVarGuard::set("CLAWD_AGENT_DEBUG", &debug_dir);
+        cli_agent_debug_log(
+            "tool.execute.done",
+            "tool_name=bash\nok=true\noutput=ANTHROPIC_API_KEY=sk-ant-secret-value",
+        );
+
+        let log_path = debug_dir.join("clawd-agent-debug.log");
+        let log = std::fs::read_to_string(&log_path).expect("debug log should exist");
+        let leaked_secret = log.contains("sk-ant-secret-value");
+        let _ = std::fs::remove_dir_all(&debug_dir);
+
+        assert!(
+            !leaked_secret,
+            "debug logs must redact secret-shaped values before writing to disk"
+        );
+    }
+}

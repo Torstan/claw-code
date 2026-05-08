@@ -1149,3 +1149,22 @@ fn apply_tool_cache_controls(tools: &mut Option<Vec<ToolDefinition>>) {
         last_tool.cache_control = Some(CacheControl::ephemeral());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "known issue confirmation: CLI provider currently hardcodes max_tokens to 64000"]
+    fn confirms_issue_07_cli_uses_model_specific_max_tokens() {
+        let gpt_max = super::max_tokens_for_model("openai/gpt-4o-mini");
+        let unknown_local_max = super::max_tokens_for_model("local-small-model");
+
+        assert_ne!(
+            gpt_max, 64_000,
+            "OpenAI-compatible models should not all request Anthropic-sized output budgets"
+        );
+        assert!(
+            unknown_local_max <= 16_384,
+            "unknown local models should use a conservative output budget"
+        );
+    }
+}
