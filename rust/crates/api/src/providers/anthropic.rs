@@ -25,9 +25,9 @@ use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEve
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
-const DEFAULT_MAX_RETRIES: u32 = 8;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -1756,24 +1756,23 @@ mod tests {
         let client = AnthropicClient::new("test-key");
         assert_eq!(
             client.backoff_for_attempt(1).expect("attempt 1"),
-            Duration::from_secs(1)
+            Duration::from_millis(250)
         );
         assert_eq!(
             client.backoff_for_attempt(2).expect("attempt 2"),
-            Duration::from_secs(2)
+            Duration::from_millis(500)
         );
         assert_eq!(
             client.backoff_for_attempt(3).expect("attempt 3"),
-            Duration::from_secs(4)
+            Duration::from_secs(1)
         );
         assert_eq!(
             client.backoff_for_attempt(8).expect("attempt 8"),
-            Duration::from_secs(128)
+            Duration::from_secs(1)
         );
     }
 
     #[test]
-    #[ignore = "known issue confirmation: default retry budget is too long for fast fallback"]
     fn confirms_issue_17_default_retry_budget_exceeds_fast_fallback_window() {
         let client = AnthropicClient::from_auth(AuthSource::ApiKey("test".to_string()));
         let first = client.backoff_for_attempt(1).expect("attempt 1 backoff");

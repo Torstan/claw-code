@@ -86,7 +86,7 @@ impl OpenAiCompatConfig {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
     config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
@@ -105,9 +105,13 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        Self::new_with_optional_api_key(Some(api_key.into()), config)
+    }
+
+    fn new_with_optional_api_key(api_key: Option<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: build_http_client_or_default(),
-            api_key: api_key.into(),
+            api_key,
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -117,13 +121,17 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
-        };
-        Ok(Self::new(api_key, config))
+        let api_key = read_env_non_empty(config.api_key_env)?;
+        if api_key.is_none() {
+            let base_url = read_base_url(config);
+            if !is_local_openai_compatible_base_url(&base_url) {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            }
+        }
+        Ok(Self::new_with_optional_api_key(api_key, config))
     }
 
     #[must_use]
@@ -250,14 +258,17 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let request_builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        let request_builder = if let Some(api_key) = &self.api_key {
+            request_builder.bearer_auth(api_key)
+        } else {
+            request_builder
+        };
+        request_builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -672,7 +683,7 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -923,13 +934,11 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error,
                     ..
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
             })
@@ -965,25 +974,8 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
             .iter()
             .rev()
             .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
-        // A tool message is considered paired when:
-        // (a) the nearest preceding non-tool message is an assistant message
-        //     whose `tool_calls` array contains an entry with the matching id, OR
-        // (b) there's no clear preceding context (e.g. the message comes right
-        //     after a user turn — this can happen with translated mixed-content
-        //     user messages). In case (b) we allow the message through rather
-        //     than silently dropping potentially valid history.
-        let preceding_role = preceding
-            .and_then(|m| m.get("role"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        // Only apply sanitization when the preceding message is an assistant
-        // turn (the invariant is: assistant-with-tool_calls must precede tool).
-        // If the preceding is something else (user, system) don't drop — it
-        // may be a valid translation artifact or a path we don't understand.
-        if preceding_role != "assistant" {
-            continue;
-        }
         let paired = preceding
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
             .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
             .is_some_and(|tool_calls| {
                 tool_calls
@@ -1227,6 +1219,15 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
 }
 
+fn is_local_openai_compatible_base_url(base_url: &str) -> bool {
+    let normalized = base_url.trim().to_ascii_lowercase();
+    normalized.starts_with("http://localhost:")
+        || normalized == "http://localhost"
+        || normalized.starts_with("http://localhost/")
+        || normalized.starts_with("http://127.")
+        || normalized.starts_with("http://[::1]")
+}
+
 fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
@@ -1317,23 +1318,34 @@ mod tests {
             &MessageRequest {
                 model: "grok-3".to_string(),
                 max_tokens: 64,
-                messages: vec![InputMessage {
-                    role: "user".to_string(),
-                    content: vec![
-                        InputContentBlock::Text {
+                messages: vec![
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::Text {
                             text: "hello".to_string(),
                             cache_control: None,
-                        },
-                        InputContentBlock::ToolResult {
+                        }],
+                    },
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "tool_1".to_string(),
+                            name: "weather".to_string(),
+                            input: json!({"city": "Berlin"}),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
                             content: vec![ToolResultContentBlock::Json {
                                 value: json!({"ok": true}),
                             }],
                             is_error: false,
                             cache_control: None,
-                        },
-                    ],
-                }],
+                        }],
+                    },
+                ],
                 system: Some(vec![SystemContentBlock::text("be helpful")]),
                 tools: Some(vec![ToolDefinition {
                     name: "weather".to_string(),
@@ -1350,7 +1362,13 @@ mod tests {
 
         assert_eq!(payload["messages"][0]["role"], json!("system"));
         assert_eq!(payload["messages"][1]["role"], json!("user"));
-        assert_eq!(payload["messages"][2]["role"], json!("tool"));
+        assert_eq!(payload["messages"][2]["role"], json!("assistant"));
+        assert_eq!(
+            payload["messages"][2]["tool_calls"][0]["id"],
+            json!("tool_1")
+        );
+        assert_eq!(payload["messages"][3]["role"], json!("tool"));
+        assert_eq!(payload["messages"][3]["tool_call_id"], json!("tool_1"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
     }
@@ -1550,7 +1568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: local OpenAI-compatible endpoints currently require API key"]
     fn confirms_issue_04_openai_base_url_without_key_builds_unauthenticated_client() {
         let _guard = env_lock();
         let _api_key = EnvVarGuard::unset("OPENAI_API_KEY");
@@ -1565,7 +1582,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: tool result wire payload currently contains non-standard fields"]
     fn confirms_issue_05_tool_result_wire_payload_omits_is_error() {
         let request = MessageRequest {
             model: "openai/gpt-4o".to_string(),
@@ -1594,7 +1610,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: orphan tool messages currently survive sanitizer"]
     fn confirms_issue_05_orphan_tool_messages_are_dropped() {
         let request = MessageRequest {
             model: "openai/gpt-4o".to_string(),
@@ -1631,7 +1646,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known issue confirmation: non-streaming tool_calls null currently fails deserialization"]
     fn confirms_issue_06_non_streaming_tool_calls_null_deserializes_as_empty() {
         let body = r#"{
             "id": "chatcmpl_null_tools",
