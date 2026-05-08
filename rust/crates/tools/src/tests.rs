@@ -2798,7 +2798,11 @@ fn subagent_runtime_executes_tool_loop_with_isolated_session() {
     let _guard = env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let path = temp_path("subagent-input.txt");
+    let root = temp_path("subagent-runtime");
+    fs::create_dir_all(&root).expect("create subagent workspace");
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&root).expect("set subagent workspace cwd");
+    let path = root.join("subagent-input.txt");
     std::fs::write(&path, "hello from child").expect("write input file");
 
     let mut runtime = ConversationRuntime::new(
@@ -2815,6 +2819,7 @@ fn subagent_runtime_executes_tool_loop_with_isolated_session() {
     let summary = runtime
         .run_turn("Inspect the delegated file", None)
         .expect("subagent loop should succeed");
+    std::env::set_current_dir(original_dir).expect("restore cwd");
 
     assert_eq!(
         final_assistant_text(&summary),
@@ -2831,7 +2836,7 @@ fn subagent_runtime_executes_tool_loop_with_isolated_session() {
                 if output.contains("hello from child")
         )));
 
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
