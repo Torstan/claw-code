@@ -573,6 +573,49 @@ fn apply_limit<T>(
     )
 }
 
+const PATCH_CONTEXT_LINES: usize = 2;
+const MAX_LCS_PATCH_CELLS: usize = 4_000_000;
+
+#[derive(Clone, Copy)]
+enum PatchLine<'a> {
+    Equal(&'a str),
+    Delete(&'a str),
+    Insert(&'a str),
+}
+
+#[derive(Clone, Copy)]
+struct PatchOp<'a> {
+    line: PatchLine<'a>,
+    old_index: usize,
+    new_index: usize,
+}
+
+impl PatchOp<'_> {
+    fn is_equal(self) -> bool {
+        matches!(self.line, PatchLine::Equal(_))
+    }
+
+    fn is_change(self) -> bool {
+        !self.is_equal()
+    }
+
+    fn consumes_old(self) -> bool {
+        matches!(self.line, PatchLine::Equal(_) | PatchLine::Delete(_))
+    }
+
+    fn consumes_new(self) -> bool {
+        matches!(self.line, PatchLine::Equal(_) | PatchLine::Insert(_))
+    }
+
+    fn serialized_line(self) -> String {
+        match self.line {
+            PatchLine::Equal(line) => format!(" {line}"),
+            PatchLine::Delete(line) => format!("-{line}"),
+            PatchLine::Insert(line) => format!("+{line}"),
+        }
+    }
+}
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     if original == updated {
         return Vec::new();
@@ -592,6 +635,10 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
         }
     }
 
+    if let Some(hunks) = make_lcs_patch(&original_lines, &updated_lines) {
+        return hunks;
+    }
+
     make_single_hunk_patch(&original_lines, &updated_lines)
 }
 
@@ -600,15 +647,13 @@ fn make_line_aligned_patch(
     updated_lines: &[&str],
     changed_indices: &[usize],
 ) -> Vec<StructuredPatchHunk> {
-    const CONTEXT_LINES: usize = 2;
-
     let mut hunks = Vec::new();
-    let mut hunk_start = changed_indices[0].saturating_sub(CONTEXT_LINES);
-    let mut hunk_end = (changed_indices[0] + CONTEXT_LINES + 1).min(original_lines.len());
+    let mut hunk_start = changed_indices[0].saturating_sub(PATCH_CONTEXT_LINES);
+    let mut hunk_end = (changed_indices[0] + PATCH_CONTEXT_LINES + 1).min(original_lines.len());
 
     for &index in &changed_indices[1..] {
-        let next_start = index.saturating_sub(CONTEXT_LINES);
-        let next_end = (index + CONTEXT_LINES + 1).min(original_lines.len());
+        let next_start = index.saturating_sub(PATCH_CONTEXT_LINES);
+        let next_end = (index + PATCH_CONTEXT_LINES + 1).min(original_lines.len());
         if next_start <= hunk_end {
             hunk_end = hunk_end.max(next_end);
         } else {
@@ -630,6 +675,156 @@ fn make_line_aligned_patch(
         hunk_end,
     ));
     hunks
+}
+
+fn make_lcs_patch<'a>(
+    original_lines: &[&'a str],
+    updated_lines: &[&'a str],
+) -> Option<Vec<StructuredPatchHunk>> {
+    let row_count = original_lines.len().checked_add(1)?;
+    let column_count = updated_lines.len().checked_add(1)?;
+    if row_count.checked_mul(column_count)? > MAX_LCS_PATCH_CELLS {
+        return None;
+    }
+
+    let mut lcs = vec![0usize; row_count * column_count];
+    for old_index in (0..original_lines.len()).rev() {
+        for new_index in (0..updated_lines.len()).rev() {
+            let index = old_index * column_count + new_index;
+            lcs[index] = if original_lines[old_index] == updated_lines[new_index] {
+                lcs[(old_index + 1) * column_count + new_index + 1] + 1
+            } else {
+                lcs[(old_index + 1) * column_count + new_index]
+                    .max(lcs[old_index * column_count + new_index + 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::with_capacity(original_lines.len() + updated_lines.len());
+    let mut old_index = 0usize;
+    let mut new_index = 0usize;
+    while old_index < original_lines.len() && new_index < updated_lines.len() {
+        if original_lines[old_index] == updated_lines[new_index] {
+            ops.push(PatchOp {
+                line: PatchLine::Equal(original_lines[old_index]),
+                old_index,
+                new_index,
+            });
+            old_index += 1;
+            new_index += 1;
+        } else if lcs[(old_index + 1) * column_count + new_index]
+            >= lcs[old_index * column_count + new_index + 1]
+        {
+            ops.push(PatchOp {
+                line: PatchLine::Delete(original_lines[old_index]),
+                old_index,
+                new_index,
+            });
+            old_index += 1;
+        } else {
+            ops.push(PatchOp {
+                line: PatchLine::Insert(updated_lines[new_index]),
+                old_index,
+                new_index,
+            });
+            new_index += 1;
+        }
+    }
+
+    while old_index < original_lines.len() {
+        ops.push(PatchOp {
+            line: PatchLine::Delete(original_lines[old_index]),
+            old_index,
+            new_index,
+        });
+        old_index += 1;
+    }
+    while new_index < updated_lines.len() {
+        ops.push(PatchOp {
+            line: PatchLine::Insert(updated_lines[new_index]),
+            old_index,
+            new_index,
+        });
+        new_index += 1;
+    }
+
+    Some(make_hunks_from_ops(&ops))
+}
+
+fn make_hunks_from_ops(ops: &[PatchOp<'_>]) -> Vec<StructuredPatchHunk> {
+    let mut windows = Vec::<(usize, usize)>::new();
+
+    for (index, op) in ops.iter().enumerate() {
+        if !op.is_change() {
+            continue;
+        }
+
+        let start = hunk_start_for_change(ops, index);
+        let end = hunk_end_for_change(ops, index);
+        if let Some((_, last_end)) = windows.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        windows.push((start, end));
+    }
+
+    windows
+        .into_iter()
+        .map(|(start, end)| make_hunk_from_ops(&ops[start..end]))
+        .collect()
+}
+
+fn hunk_start_for_change(ops: &[PatchOp<'_>], change_index: usize) -> usize {
+    let mut start = change_index;
+    let mut context_lines = 0usize;
+    while start > 0 && context_lines < PATCH_CONTEXT_LINES {
+        start -= 1;
+        if ops[start].is_equal() {
+            context_lines += 1;
+        }
+    }
+    start
+}
+
+fn hunk_end_for_change(ops: &[PatchOp<'_>], change_index: usize) -> usize {
+    let mut end = change_index + 1;
+    let mut context_lines = 0usize;
+    while end < ops.len() && context_lines < PATCH_CONTEXT_LINES {
+        if ops[end].is_equal() {
+            context_lines += 1;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn make_hunk_from_ops(ops: &[PatchOp<'_>]) -> StructuredPatchHunk {
+    let first = ops
+        .first()
+        .expect("patch hunk should contain at least one operation");
+    let mut old_lines = 0usize;
+    let mut new_lines = 0usize;
+    let mut lines = Vec::new();
+
+    for op in ops {
+        if op.consumes_old() {
+            old_lines += 1;
+        }
+        if op.consumes_new() {
+            new_lines += 1;
+        }
+        lines.push(op.serialized_line());
+    }
+
+    StructuredPatchHunk {
+        old_start: first.old_index.saturating_add(1),
+        old_lines,
+        new_start: first.new_index.saturating_add(1),
+        new_lines,
+        lines,
+    }
 }
 
 fn make_line_aligned_hunk(
@@ -1065,6 +1260,79 @@ mod tests {
                 .iter()
                 .any(|line| line.as_str() == "-line 20" || line.as_str() == "+line 20"),
             "unchanged middle lines should not be represented as removals/additions"
+        );
+    }
+
+    #[test]
+    fn confirms_issue_14_replace_all_multiline_insert_delete_uses_local_hunks() {
+        let assert_localized_patch =
+            |name: &str, old_string: &str, new_string: &str, expected_change_line: &str| {
+                let path = temp_path(name);
+                let mut lines = (1..=50)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>();
+                lines.splice(
+                    4..4,
+                    [
+                        "target".to_string(),
+                        "middle".to_string(),
+                        "tail".to_string(),
+                    ],
+                );
+                lines.splice(
+                    34..34,
+                    [
+                        "target".to_string(),
+                        "middle".to_string(),
+                        "tail".to_string(),
+                    ],
+                );
+                let original = format!("{}\n", lines.join("\n"));
+                write_file(path.to_string_lossy().as_ref(), &original)
+                    .expect("initial file should write");
+
+                let output = edit_file(
+                    path.to_string_lossy().as_ref(),
+                    old_string,
+                    new_string,
+                    true,
+                )
+                .expect("replace_all edit should execute");
+                let serialized_lines = output
+                    .structured_patch
+                    .iter()
+                    .flat_map(|hunk| hunk.lines.iter())
+                    .collect::<Vec<_>>();
+
+                assert!(
+                    output.structured_patch.len() >= 2,
+                    "{name}: separated multiline edits should emit multiple localized hunks"
+                );
+                assert!(
+                    !serialized_lines
+                        .iter()
+                        .any(|line| line.as_str() == "-line 25" || line.as_str() == "+line 25"),
+                    "{name}: unchanged middle lines should not be removed or re-added"
+                );
+                assert!(
+                    serialized_lines
+                        .iter()
+                        .any(|line| line.as_str() == expected_change_line),
+                    "{name}: expected changed line should appear in the structured patch"
+                );
+            };
+
+        assert_localized_patch(
+            "issue-14-multiline-insert-patch.txt",
+            "target\nmiddle",
+            "target\ninserted\nmiddle",
+            "+inserted",
+        );
+        assert_localized_patch(
+            "issue-14-multiline-delete-patch.txt",
+            "target\nmiddle\ntail",
+            "target\ntail",
+            "-middle",
         );
     }
 
