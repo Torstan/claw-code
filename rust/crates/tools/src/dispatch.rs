@@ -59,31 +59,17 @@ pub(crate) fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    if is_builtin_tool(name) {
+        maybe_enforce_permission_check(enforcer, name, input)?;
+    }
+
     match name {
-        "bash" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<BashCommandInput>(input).and_then(run_bash)
-        }
-        "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadFileInput>(input).and_then(run_read_file)
-        }
-        "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
-        }
-        "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
-        }
-        "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
-        }
-        "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
-        }
+        "bash" => from_value::<BashCommandInput>(input).and_then(run_bash),
+        "read_file" => from_value::<ReadFileInput>(input).and_then(run_read_file),
+        "write_file" => from_value::<WriteFileInput>(input).and_then(run_write_file),
+        "edit_file" => from_value::<EditFileInput>(input).and_then(run_edit_file),
+        "glob_search" => from_value::<GlobSearchInputValue>(input).and_then(run_glob_search),
+        "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -145,6 +131,62 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
+}
+
+fn is_builtin_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "glob_search"
+            | "grep_search"
+            | "WebFetch"
+            | "WebSearch"
+            | "TodoWrite"
+            | "Skill"
+            | "Agent"
+            | "ToolSearch"
+            | "NotebookEdit"
+            | "Sleep"
+            | "SendUserMessage"
+            | "Config"
+            | "EnterPlanMode"
+            | "ExitPlanMode"
+            | "StructuredOutput"
+            | "REPL"
+            | "PowerShell"
+            | "AskUserQuestion"
+            | "TaskCreate"
+            | "RunTaskPacket"
+            | "TaskGet"
+            | "TaskList"
+            | "TaskStop"
+            | "TaskUpdate"
+            | "TaskOutput"
+            | "WorkerCreate"
+            | "WorkerGet"
+            | "WorkerObserve"
+            | "WorkerResolveTrust"
+            | "WorkerAwaitReady"
+            | "WorkerSendPrompt"
+            | "WorkerRestart"
+            | "WorkerTerminate"
+            | "WorkerObserveCompletion"
+            | "TeamCreate"
+            | "TeamDelete"
+            | "CronCreate"
+            | "CronDelete"
+            | "CronList"
+            | "LSP"
+            | "ListMcpResources"
+            | "ReadMcpResource"
+            | "McpAuth"
+            | "RemoteTrigger"
+            | "MCP"
+            | "TestingPermission"
+    )
 }
 
 fn maybe_enforce_permission_check(

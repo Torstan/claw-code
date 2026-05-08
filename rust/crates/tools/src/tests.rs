@@ -977,6 +977,24 @@ fn global_tool_registry_denies_prompt_mode_without_prompter_before_dispatch() {
 }
 
 #[test]
+fn global_tool_registry_denies_non_bash_dangerous_builtin_without_prompter_before_dispatch() {
+    let policy = PermissionPolicy::new(PermissionMode::Prompt)
+        .with_tool_requirement("RemoteTrigger", PermissionMode::DangerFullAccess);
+    let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+    let error = registry
+        .execute(
+            "RemoteTrigger",
+            &json!({
+                "url": "not-a-url"
+            }),
+        )
+        .expect_err("prompt mode should deny dangerous built-ins before dispatch");
+
+    assert!(error.contains("requires approval to escalate from prompt to danger-full-access"));
+}
+
+#[test]
 fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
     // given
     let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
@@ -3725,11 +3743,14 @@ fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = temp_path("perm-read");
     fs::create_dir_all(&root).expect("create root");
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&root).expect("set test workspace cwd");
     let file = root.join("readable.txt");
     fs::write(&file, "content\n").expect("write test file");
 
     let registry = read_only_registry();
     let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+    std::env::set_current_dir(original_dir).expect("restore cwd");
     assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
     let _ = fs::remove_dir_all(root);
