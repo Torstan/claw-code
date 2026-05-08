@@ -316,10 +316,10 @@ fn execute_parallel_invocation(
 
 fn execute_parallel_chunk(
     invocations: &[ToolInvocation],
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    session_id: Option<String>,
+    allowed_tools: Option<&AllowedToolSet>,
+    tool_registry: &GlobalToolRegistry,
+    mcp_state: Option<&Arc<Mutex<RuntimeMcpState>>>,
+    session_id: Option<&str>,
 ) -> Vec<Result<String, ToolError>> {
     #[cfg(test)]
     if let Some(observer) = test_parallel_chunk_observer()
@@ -334,10 +334,10 @@ fn execute_parallel_chunk(
         .iter()
         .map(|invocation| {
             let invocation = invocation.clone();
-            let allowed_tools = allowed_tools.clone();
+            let allowed_tools = allowed_tools.cloned();
             let tool_registry = tool_registry.clone();
-            let mcp_state = mcp_state.clone();
-            let session_id = session_id.clone();
+            let mcp_state = mcp_state.cloned();
+            let session_id = session_id.map(str::to_string);
             std::thread::spawn(move || {
                 let invocation_started_at = Instant::now();
                 cli_agent_debug_log(
@@ -424,10 +424,10 @@ impl ToolExecutor for CliToolExecutor {
         for chunk in invocations.chunks(parallel_limit) {
             results.extend(execute_parallel_chunk(
                 chunk,
-                allowed_tools.clone(),
-                tool_registry.clone(),
-                mcp_state.clone(),
-                session_id.clone(),
+                allowed_tools.as_ref(),
+                &tool_registry,
+                mcp_state.as_ref(),
+                session_id.as_deref(),
             ));
         }
 

@@ -329,7 +329,7 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         .ok()
                         .and_then(|m| m.result)
                         .unwrap_or_default();
-                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    with_active_tool_session(job.parent_session_id.as_deref(), || {
                         registry.append_output(&job.manifest.agent_id, &output).ok();
                         registry
                             .set_status(&job.manifest.agent_id, TaskStatus::Completed)
@@ -352,7 +352,7 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         None,
                         Some(error.clone()),
                     );
-                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    with_active_tool_session(job.parent_session_id.as_deref(), || {
                         registry.append_output(&job.manifest.agent_id, &error).ok();
                         registry
                             .set_status(&job.manifest.agent_id, TaskStatus::Failed)
@@ -376,7 +376,7 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         None,
                         Some(msg.clone()),
                     );
-                    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+                    with_active_tool_session(job.parent_session_id.as_deref(), || {
                         registry.append_output(&job.manifest.agent_id, &msg).ok();
                         registry
                             .set_status(&job.manifest.agent_id, TaskStatus::Failed)
@@ -404,7 +404,7 @@ pub(crate) fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 fn mark_registered_background_agent_failed(job: &AgentJob, error: &str) {
     let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.to_string()));
     let registry = global_task_registry();
-    let _ = with_active_tool_session(job.parent_session_id.as_deref(), || {
+    with_active_tool_session(job.parent_session_id.as_deref(), || {
         registry.append_output(&job.manifest.agent_id, error).ok();
         registry
             .set_status(&job.manifest.agent_id, TaskStatus::Failed)

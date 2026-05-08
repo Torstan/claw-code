@@ -978,7 +978,7 @@ fn normalize_missing_path_with_existing_parent(path: &str) -> io::Result<(PathBu
             Some(Component::ParentDir) => {
                 missing_contains_parent_dir = true;
             }
-            Some(Component::RootDir) | Some(Component::Prefix(_)) | None => {
+            Some(Component::RootDir | Component::Prefix(_)) | None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no existing parent found for {}", candidate.display()),

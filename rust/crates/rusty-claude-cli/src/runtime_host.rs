@@ -319,7 +319,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         session,
         AnthropicRuntimeClient::new(
             session_id,
-            model,
+            &model,
             enable_tools,
             emit_output,
             allowed_tools.clone(),

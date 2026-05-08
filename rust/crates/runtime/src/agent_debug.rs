@@ -102,9 +102,10 @@ fn bound_debug_detail(detail: &str) -> String {
         .take(DEBUG_DETAIL_MAX_CHARS)
         .collect::<String>();
     let original_chars = redacted.chars().count();
-    bounded.push_str(&format!(
-        "\n{DEBUG_DETAIL_TRUNCATION_MARKER} original_chars={original_chars}"
-    ));
+    let _ = std::fmt::Write::write_fmt(
+        &mut bounded,
+        format_args!("\n{DEBUG_DETAIL_TRUNCATION_MARKER} original_chars={original_chars}"),
+    );
     bounded
 }
 

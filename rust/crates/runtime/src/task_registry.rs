@@ -150,8 +150,9 @@ impl TaskRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ts = now_secs();
+        let key = Self::scoped_key(&task_id);
         let task = Task {
-            task_id: task_id.clone(),
+            task_id,
             prompt,
             description,
             task_packet,
@@ -162,7 +163,7 @@ impl TaskRegistry {
             output: String::new(),
             team_id: None,
         };
-        inner.tasks.insert(Self::scoped_key(&task_id), task.clone());
+        inner.tasks.insert(key, task.clone());
         task
     }
 

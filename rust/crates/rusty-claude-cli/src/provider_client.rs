@@ -62,7 +62,7 @@ pub(crate) struct AnthropicRuntimeClient {
 impl AnthropicRuntimeClient {
     pub(crate) fn new(
         session_id: &str,
-        model: String,
+        model: &str,
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
@@ -88,7 +88,7 @@ impl AnthropicRuntimeClient {
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
+        let resolved_model = api::resolve_model_alias(model);
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
@@ -1311,7 +1311,7 @@ mod tests {
 
         let mut client = AnthropicRuntimeClient::new(
             "test-session",
-            "grok".to_string(),
+            "grok",
             false,
             false,
             None,
